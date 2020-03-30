@@ -1,4 +1,4 @@
-# Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+# Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,18 +13,18 @@
   sudo: yes
 
 - name: move zookeeper
-  shell: cp -r zookeeper-3.5.1-alpha /opt/zk/
+  shell: cp -r /root/zookeeper-3.5.1-alpha /opt/zk/
   sudo: yes
 
 - name: Untar bk
-  shell: tar -xvf bookkeeper-server-4.4.0-bin.tar.gz
+  shell: tar -xvf /bookkeeper-server-4.4.0-bin.tar.gz
 
 - name: Create bk work dir
   shell: mkdir -p /opt/bk_all
   sudo: yes
 
 - name: Move bk under bk_all folder
-  shell: mv bookkeeper-server-4.4.0/ /opt/bk_all/
+  shell: mv /root/bookkeeper-server-4.4.0/ /opt/bk_all/
   sudo: yes
 
 - name: Copy install script

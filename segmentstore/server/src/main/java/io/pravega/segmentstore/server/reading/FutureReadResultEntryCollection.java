@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,22 +9,22 @@
  */
 package io.pravega.segmentstore.server.reading;
 
+import com.google.common.annotations.VisibleForTesting;
 import io.pravega.common.Exceptions;
-
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.PriorityQueue;
-import java.util.concurrent.CancellationException;
 import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.ThreadSafe;
 
 /**
- * Organizes PlaceholderReadResultEntries by their starting offset and provides efficient methods for retrieving those
+ * Organizes {@link FutureReadResultEntry} by their starting offset and provides efficient methods for retrieving those
  * whose offsets are below certain values.
  */
 @ThreadSafe
-class FutureReadResultEntryCollection implements AutoCloseable {
+class FutureReadResultEntryCollection {
     //region Members
 
     @GuardedBy("reads")
@@ -45,24 +45,26 @@ class FutureReadResultEntryCollection implements AutoCloseable {
 
     //endregion
 
-    //region AutoCloseable Implementation
-
-    @Override
-    public void close() {
+    /**
+     * Closes this instance of the FutureReadResultEntryCollection class.
+     *
+     * @return A List containing all currently registered FutureReadResultEntries.
+     */
+    public List<FutureReadResultEntry> close() {
+        List<FutureReadResultEntry> result;
         synchronized (this.reads) {
             if (this.closed) {
-                return;
+                result = Collections.emptyList();
+            } else {
+                result = new ArrayList<>(this.reads);
+                this.reads.clear();
+                this.closed = true;
             }
-
-            this.closed = true;
         }
 
-        cancelAll();
+        result.forEach(r -> r.setOnCompleteOrFail(null)); // Detach any callbacks pointing to this instance.
+        return result;
     }
-
-    //endregion
-
-    //region Operations
 
     /**
      * Adds a new Result Entry.
@@ -70,6 +72,9 @@ class FutureReadResultEntryCollection implements AutoCloseable {
      * @param entry The entry to add.
      */
     public void add(FutureReadResultEntry entry) {
+        // Attach a callback that will unregister this entry if it gets completed externally, without being polled from
+        // this collection first.
+        entry.setOnCompleteOrFail(this::onCompleted);
         synchronized (this.reads) {
             Exceptions.checkNotClosed(this.closed, this);
             this.reads.add(entry);
@@ -90,7 +95,9 @@ class FutureReadResultEntryCollection implements AutoCloseable {
             // 'reads' is sorted by Starting Offset, in ascending order. As long as it is not empty and the
             // first entry overlaps the given offset by at least one byte, extract and return it.
             while (this.reads.size() > 0 && this.reads.peek().getStreamSegmentOffset() <= maxOffset) {
-                result.add(this.reads.poll());
+                FutureReadResultEntry e = this.reads.poll();
+                e.setOnCompleteOrFail(null); // We no longer have a reference to it; detach the unregistration callback.
+                result.add(e);
             }
         }
 
@@ -105,19 +112,32 @@ class FutureReadResultEntryCollection implements AutoCloseable {
     }
 
     /**
-     * Cancels all Reads in this collection..
+     * Gets a value indicating the number of registered Result Entries.
+     *
+     * @return The count.
      */
-    void cancelAll() {
-        List<FutureReadResultEntry> toCancel;
+    int size() {
         synchronized (this.reads) {
-            toCancel = new ArrayList<>(this.reads);
-            this.reads.clear();
+            return this.reads.size();
         }
-
-        CancellationException ce = new CancellationException();
-        toCancel.forEach(e -> e.fail(ce));
     }
 
+    /**
+     * Callback that unregisters the given {@link FutureReadResultEntry} from this collection when invoked.
+     *
+     * @param entry The {@link FutureReadResultEntry} to unregister.
+     */
+    private void onCompleted(FutureReadResultEntry entry) {
+        if (entry == null) {
+            return;
+        }
+
+        synchronized (this.reads) {
+            this.reads.remove(entry);
+        }
+    }
+
+    @VisibleForTesting
     static int entryComparator(FutureReadResultEntry e1, FutureReadResultEntry e2) {
         if (e1.getStreamSegmentOffset() < e2.getStreamSegmentOffset()) {
             return -1;

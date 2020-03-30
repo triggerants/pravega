@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,5 +23,22 @@ public interface Revision extends Comparable<Revision> {
      * @return Implementation of the revision interface
      */
     RevisionImpl asImpl();
+    
+    /**
+     * Serializes the Revision to a human readable string.
+     * @return A string representation of the Revision.
+     */
+    @Override
+    String toString();
+    
+    /**
+     * Deserializes the revision from its serialized from obtained from calling {@link #toString()}.
+     * 
+     * @param revision A serialized revision.
+     * @return The Revision object.
+     */
+    static Revision fromString(String revision) {
+        return RevisionImpl.fromString(revision);
+    }
 
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,155 +9,101 @@
  */
 package io.pravega.shared.metrics;
 
-import com.codahale.metrics.ConsoleReporter;
-import com.codahale.metrics.CsvReporter;
-import com.codahale.metrics.JmxReporter;
-import com.codahale.metrics.MetricFilter;
-import com.codahale.metrics.MetricRegistry;
-import com.codahale.metrics.ScheduledReporter;
-import com.codahale.metrics.ganglia.GangliaReporter;
-import com.codahale.metrics.graphite.Graphite;
-import com.codahale.metrics.graphite.GraphiteReporter;
-import com.codahale.metrics.jvm.GarbageCollectorMetricSet;
-import com.codahale.metrics.jvm.MemoryUsageGaugeSet;
-import com.google.common.base.Strings;
-import com.readytalk.metrics.StatsDReporter;
-import info.ganglia.gmetric4j.gmetric.GMetric;
-import java.io.File;
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
-import javax.annotation.concurrent.GuardedBy;
-import lombok.RequiredArgsConstructor;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+
+import io.micrometer.core.instrument.Clock;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Metrics;
+import io.micrometer.core.instrument.binder.jvm.JvmGcMetrics;
+import io.micrometer.core.instrument.binder.jvm.JvmMemoryMetrics;
+import io.micrometer.core.instrument.binder.jvm.JvmThreadMetrics;
+import io.micrometer.core.instrument.binder.system.ProcessorMetrics;
+import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.micrometer.influx.InfluxMeterRegistry;
+import io.micrometer.statsd.StatsdMeterRegistry;
+import lombok.Getter;
 import lombok.Synchronized;
 import lombok.extern.slf4j.Slf4j;
 
+import java.util.ArrayList;
+
+import static io.pravega.shared.MetricsTags.DEFAULT_HOSTNAME_KEY;
+import static io.pravega.shared.MetricsTags.createHostTag;
+
 @Slf4j
-@RequiredArgsConstructor
-public class StatsProviderImpl implements StatsProvider {
-    @GuardedBy("$lock")
-    private MetricRegistry metrics = MetricsProvider.METRIC_REGISTRY;
-    private final List<ScheduledReporter> reporters = new ArrayList<ScheduledReporter>();
+class StatsProviderImpl implements StatsProvider {
+    @Getter
+    private final CompositeMeterRegistry metrics;
     private final MetricsConfig conf;
 
-    @Synchronized
-    void init() {
-        // I'm not entirely sure that re-inserting is necessary, but given that
-        // at this point we are preserving the registry, it seems safer to remove
-        // and re-insert.
-        MemoryUsageGaugeSet memoryGaugeNames = new MemoryUsageGaugeSet();
-        GarbageCollectorMetricSet gcMetricSet = new GarbageCollectorMetricSet();
+    StatsProviderImpl(MetricsConfig conf) {
+        this(conf, Metrics.globalRegistry);
+    }
 
-        memoryGaugeNames.getMetrics().forEach((key, value) -> {
-            metrics.remove(key);
-        });
-
-        gcMetricSet.getMetrics().forEach((key, value) -> {
-           metrics.remove(key);
-        });
-
-        metrics.registerAll(new MemoryUsageGaugeSet());
-        metrics.registerAll(new GarbageCollectorMetricSet());
+    @VisibleForTesting
+    StatsProviderImpl(MetricsConfig conf, CompositeMeterRegistry registry) {
+        this.conf = Preconditions.checkNotNull(conf, "conf");
+        this.metrics = registry;
     }
 
     @Synchronized
-    public MetricRegistry getMetrics() {
-        return metrics;
+    private void init() {
+        new JvmMemoryMetrics().bindTo(metrics);
+        new JvmGcMetrics().bindTo(metrics);
+        new ProcessorMetrics().bindTo(metrics);
+        new JvmThreadMetrics().bindTo(metrics);
     }
 
     @Synchronized
     @Override
     public void start() {
         init();
+        log.info("Metrics prefix: {}", conf.getMetricsPrefix());
 
-        if (conf.isEnableCSVReporter()) {
-            // NOTE:  metrics output files are exclusive to a given process
-            File outdir;
-            if (!Strings.isNullOrEmpty(conf.getMetricsPrefix())) {
-                outdir = new File(conf.getCsvEndpoint(), conf.getMetricsPrefix());
-            } else {
-                outdir = new File(conf.getCsvEndpoint());
-            }
-            outdir.mkdirs();
-            log.info("Configuring stats with csv output to directory [{}]", outdir.getAbsolutePath());
-            reporters.add(CsvReporter.forRegistry(getMetrics())
-                          .convertRatesTo(TimeUnit.SECONDS)
-                          .convertDurationsTo(TimeUnit.MILLISECONDS)
-                          .build(outdir));
+        if (conf.isEnableStatsDReporter()) {
+            metrics.add(new StatsdMeterRegistry(RegistryConfigUtil.createStatsDConfig(conf), Clock.SYSTEM));
         }
-        if (conf.isEnableStatsdReporter()) {
-            log.info("Configuring stats with statsD at {}:{}", conf.getStatsDHost(), conf.getStatsDPort());
-            reporters.add(StatsDReporter.forRegistry(getMetrics())
-                          .build(conf.getStatsDHost(), conf.getStatsDPort()));
+
+        if (conf.isEnableInfluxDBReporter()) {
+            metrics.add(new InfluxMeterRegistry(RegistryConfigUtil.createInfluxConfig(conf), Clock.SYSTEM));
         }
-        if (conf.isEnableGraphiteReporter()) {
-            log.info("Configuring stats with graphite at {}:{}", conf.getGraphiteHost(), conf.getGraphitePort());
-            final Graphite graphite = new Graphite(new InetSocketAddress(conf.getGraphiteHost(), conf.getGraphitePort()));
-            reporters.add(GraphiteReporter.forRegistry(getMetrics())
-                .prefixedWith(conf.getMetricsPrefix())
-                .convertRatesTo(TimeUnit.SECONDS)
-                .convertDurationsTo(TimeUnit.MILLISECONDS)
-                .filter(MetricFilter.ALL)
-                .build(graphite));
+        metrics.config().commonTags(createHostTag(DEFAULT_HOSTNAME_KEY));
+        Preconditions.checkArgument(metrics.getRegistries().size() != 0,
+                "No meter register bound hence no storage for metrics!");
+    }
+
+    @Synchronized
+    @Override
+    public void startWithoutExporting() {
+
+        for (MeterRegistry registry : new ArrayList<MeterRegistry>(metrics.getRegistries())) {
+            metrics.remove(registry);
         }
-        if (conf.isEnableJMXReporter()) {
-            log.info("Configuring stats with jmx {}", conf.getJmxDomain());
-            final JmxReporter jmx = JmxReporter.forRegistry(getMetrics())
-                .inDomain(conf.getJmxDomain())
-                .convertRatesTo(TimeUnit.SECONDS)
-                .convertDurationsTo(TimeUnit.MILLISECONDS)
-                .build();
-            jmx.start();
-        }
-        if (conf.isEnableGangliaReporter()) {
-            try {
-                log.info("Configuring stats with ganglia at {}:{}", conf.getGangliaHost(), conf.getGangliaPort());
-                final GMetric ganglia = new GMetric(conf.getGangliaHost(), conf.getGangliaPort(), GMetric.UDPAddressingMode.MULTICAST, 1);
-                reporters.add(GangliaReporter.forRegistry(getMetrics())
-                    .prefixedWith(conf.getMetricsPrefix())
-                    .convertRatesTo(TimeUnit.SECONDS)
-                    .convertDurationsTo(TimeUnit.MILLISECONDS)
-                    .build(ganglia));
-            } catch (IOException e) {
-                log.warn("ganglia create failure: {}", e);
-            }
-        }
-        if (conf.isEnableConsoleReporter()) {
-            log.info("Configuring console reporter");
-            reporters.add(ConsoleReporter.forRegistry(getMetrics())
-                .convertRatesTo(TimeUnit.SECONDS)
-                .convertDurationsTo(TimeUnit.MILLISECONDS)
-                .build());
-        }
-        for (ScheduledReporter r : reporters) {
-            r.start(conf.getStatsOutputFrequencySeconds(), TimeUnit.SECONDS);
-        }
+
+        Metrics.addRegistry(new SimpleMeterRegistry());
+        metrics.config().commonTags(createHostTag(DEFAULT_HOSTNAME_KEY));
     }
 
     @Synchronized
     @Override
     public void close() {
-        for (ScheduledReporter r : reporters) {
-            try {
-                r.report();
-                r.stop();
-            } catch (Exception e) {
-                log.error("Exception report or stop reporter", e);
-            }
+        for (MeterRegistry registry : metrics.getRegistries()) {
+            registry.close();
+            metrics.remove(registry);
         }
     }
 
     @Override
     public StatsLogger createStatsLogger(String name) {
         init();
-        return new StatsLoggerImpl(getMetrics(), name);
+        return new StatsLoggerImpl(getMetrics());
     }
 
     @Override
     public DynamicLogger createDynamicLogger() {
         init();
-        return new DynamicLoggerImpl(conf, metrics, new StatsLoggerImpl(getMetrics(), "DYNAMIC"));
+        return new DynamicLoggerImpl(conf, metrics, new StatsLoggerImpl(getMetrics()));
     }
 }

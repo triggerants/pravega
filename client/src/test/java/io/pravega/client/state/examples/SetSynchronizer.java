@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,7 +9,7 @@
  */
 package io.pravega.client.state.examples;
 
-import io.pravega.client.ClientFactory;
+import io.pravega.client.SynchronizerClientFactory;
 import io.pravega.client.state.InitialUpdate;
 import io.pravega.client.state.Revision;
 import io.pravega.client.state.Revisioned;
@@ -22,7 +22,6 @@ import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
-
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 import lombok.RequiredArgsConstructor;
@@ -189,11 +188,9 @@ public class SetSynchronizer<T extends Serializable> {
      * @param value The value to be added.
      */
     public void add(T value) {
-        stateSynchronizer.updateState(set -> {
-            if (set.impl.contains(value)) {
-                return Collections.emptyList();
-            } else {
-                return Collections.singletonList(new AddToSet<>(value));
+        stateSynchronizer.updateState((set, updates) -> {
+            if (!set.impl.contains(value)) {
+                updates.add(new AddToSet<>(value));
             }
         });
     }
@@ -203,11 +200,9 @@ public class SetSynchronizer<T extends Serializable> {
      * @param value The value to be removed.
      */
     public void remove(T value) {
-        stateSynchronizer.updateState(set -> {
+        stateSynchronizer.updateState((set, updates) -> {
             if (set.impl.contains(value)) {
-                return  Collections.singletonList(new RemoveFromSet<>(value));
-            } else {
-                return Collections.emptyList();
+                updates.add(new RemoveFromSet<>(value));
             }
         });
         if (countdownToCompaction.decrementAndGet() <= 0) {
@@ -224,17 +219,15 @@ public class SetSynchronizer<T extends Serializable> {
      * Clears the set.
      */
     public void clear() {
-        stateSynchronizer.updateState(set -> { 
+        stateSynchronizer.updateState((set, updates) -> { 
             if (set.getCurrentSize() > 0) {
-                return Collections.singletonList(new ClearSet<>());
-            } else {
-                return Collections.emptyList();
+                updates.add(new ClearSet<>());
             }
         });
         compact();
     }
     
-    public static <T extends Serializable> SetSynchronizer<T> createNewSet(String streamName, ClientFactory factory) {
+    public static <T extends Serializable> SetSynchronizer<T> createNewSet(String streamName, SynchronizerClientFactory factory) {
         return new SetSynchronizer<>(streamName,
                 factory.createStateSynchronizer(streamName,
                                                 new JavaSerializer<SetUpdate<T>>(),

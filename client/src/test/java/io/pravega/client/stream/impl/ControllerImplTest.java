@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,15 +9,30 @@
  */
 package io.pravega.client.stream.impl;
 
+import com.google.common.base.Strings;
+import io.grpc.ManagedChannel;
+import io.grpc.Server;
 import io.grpc.Status;
-import io.grpc.inprocess.InProcessChannelBuilder;
-import io.grpc.inprocess.InProcessServerBuilder;
-import io.grpc.internal.ServerImpl;
+import io.grpc.StatusRuntimeException;
+import io.grpc.netty.GrpcSslContexts;
+import io.grpc.netty.NettyChannelBuilder;
+import io.grpc.netty.NettyServerBuilder;
 import io.grpc.stub.StreamObserver;
+import io.pravega.client.ClientConfig;
 import io.pravega.client.segment.impl.Segment;
+import io.pravega.client.stream.InvalidStreamException;
+import io.pravega.client.stream.NoSuchScopeException;
+import io.pravega.client.stream.PingFailedException;
 import io.pravega.client.stream.ScalingPolicy;
+import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
+import io.pravega.client.stream.StreamCut;
 import io.pravega.client.stream.Transaction;
+import io.pravega.client.stream.TxnFailedException;
+import io.pravega.common.Exceptions;
+import io.pravega.common.concurrent.ExecutorServiceHelpers;
+import io.pravega.common.util.AsyncIterator;
+import io.pravega.common.util.RetriesExhaustedException;
 import io.pravega.controller.stream.api.grpc.v1.Controller;
 import io.pravega.controller.stream.api.grpc.v1.Controller.CreateScopeStatus;
 import io.pravega.controller.stream.api.grpc.v1.Controller.CreateStreamStatus;
@@ -30,6 +45,8 @@ import io.pravega.controller.stream.api.grpc.v1.Controller.PingTxnRequest;
 import io.pravega.controller.stream.api.grpc.v1.Controller.PingTxnStatus;
 import io.pravega.controller.stream.api.grpc.v1.Controller.ScaleRequest;
 import io.pravega.controller.stream.api.grpc.v1.Controller.ScaleResponse;
+import io.pravega.controller.stream.api.grpc.v1.Controller.ScaleStatusRequest;
+import io.pravega.controller.stream.api.grpc.v1.Controller.ScaleStatusResponse;
 import io.pravega.controller.stream.api.grpc.v1.Controller.ScopeInfo;
 import io.pravega.controller.stream.api.grpc.v1.Controller.SegmentId;
 import io.pravega.controller.stream.api.grpc.v1.Controller.SegmentRanges;
@@ -44,30 +61,55 @@ import io.pravega.controller.stream.api.grpc.v1.Controller.TxnRequest;
 import io.pravega.controller.stream.api.grpc.v1.Controller.TxnState;
 import io.pravega.controller.stream.api.grpc.v1.Controller.UpdateStreamStatus;
 import io.pravega.controller.stream.api.grpc.v1.ControllerServiceGrpc.ControllerServiceImplBase;
+import io.pravega.shared.NameUtils;
 import io.pravega.shared.protocol.netty.PravegaNodeUri;
 import io.pravega.test.common.AssertExtensions;
+import io.pravega.test.common.SecurityConfigDefaults;
+import io.pravega.test.common.TestUtils;
+import java.io.File;
 import java.io.IOException;
+import java.net.URI;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
+import lombok.Cleanup;
+import lombok.val;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.tuple.Pair;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.Timeout;
 
+import static io.pravega.test.common.AssertExtensions.assertThrows;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 /**
  * Unit tests for ControllerImpl.
@@ -76,25 +118,38 @@ import static org.junit.Assert.assertTrue;
 @Slf4j
 public class ControllerImplTest {
     private static final int SERVICE_PORT = 12345;
+    private static final String NON_EXISTENT = "non-existent";
+    private static final String FAILING = "failing";
 
     @Rule
-    public final Timeout globalTimeout = new Timeout(20, TimeUnit.SECONDS);
+    public final Timeout globalTimeout = new Timeout(120, TimeUnit.SECONDS);
+    boolean testSecure;
+
+    // Global variable to track number of attempts to verify retries.
+    private final AtomicInteger retryAttempts = new AtomicInteger(0);
 
     // Test implementation for simulating the server responses.
-    private ServerImpl fakeServer = null;
+    private ControllerServiceImplBase testServerImpl;
+    private Server testGRPCServer = null;
+
+    private int serverPort;
 
     // The controller RPC client.
     private ControllerImpl controllerClient = null;
+    private ScheduledExecutorService executor;
+    private NettyServerBuilder serverBuilder;
+    private final AtomicReference<Object> lastRequest = new AtomicReference<>();
 
     @Before
     public void setup() throws IOException {
 
-        // Setup fake server generating different success and failure responses.
-        ControllerServiceImplBase fakeServerImpl = new ControllerServiceImplBase() {
+        // Setup test server generating different success and failure responses.
+        testServerImpl = new ControllerServiceImplBase() {
             @Override
             public void createStream(StreamConfig request,
                     StreamObserver<CreateStreamStatus> responseObserver) {
-                if (request.getStreamInfo().getStream().equals("stream1")) {
+                if (request.getStreamInfo().getStream().equals("stream1") ||
+                        request.getStreamInfo().getStream().equals("stream8")) {
                     responseObserver.onNext(CreateStreamStatus.newBuilder()
                                                     .setStatus(CreateStreamStatus.Status.SUCCESS)
                                                     .build());
@@ -122,24 +177,40 @@ public class ControllerImplTest {
                 } else if (request.getStreamInfo().getStream().equals("streamparallel")) {
 
                     // Simulating delay in sending response.
-                    try {
-                        Thread.sleep(500);
-                    } catch (InterruptedException e) {
-                        log.error("Unexpected interrupt");
-                        responseObserver.onError(e);
-                        return;
-                    }
+                    Exceptions.handleInterrupted(() -> Thread.sleep(500));
                     responseObserver.onNext(CreateStreamStatus.newBuilder()
                                                     .setStatus(CreateStreamStatus.Status.SUCCESS)
                                                     .build());
                     responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("streamdelayed")) {
+
+                    // Simulating delay in sending response. This is used for the keepalive test,
+                    // where response time > 30 seconds is required to simulate a failure.
+                    Exceptions.handleInterrupted(() -> Thread.sleep(40000));
+                    responseObserver.onNext(CreateStreamStatus.newBuilder()
+                            .setStatus(CreateStreamStatus.Status.SUCCESS)
+                            .build());
+                    responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("streamretryfailure")) {
+                    responseObserver.onError(Status.UNKNOWN.withDescription("Transport error").asRuntimeException());
+                } else if (request.getStreamInfo().getStream().equals("streamretrysuccess")) {
+                    if (retryAttempts.incrementAndGet() > 3) {
+                        responseObserver.onNext(CreateStreamStatus.newBuilder()
+                                .setStatus(CreateStreamStatus.Status.SUCCESS)
+                                .build());
+                        responseObserver.onCompleted();
+                    } else {
+                        responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
+                    }
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
             }
 
             @Override
-            public void alterStream(StreamConfig request,
+            public void updateStream(StreamConfig request,
                     StreamObserver<UpdateStreamStatus> responseObserver) {
                 if (request.getStreamInfo().getStream().equals("stream1")) {
                     responseObserver.onNext(UpdateStreamStatus.newBuilder()
@@ -161,6 +232,48 @@ public class ControllerImplTest {
                                                     .setStatus(UpdateStreamStatus.Status.STREAM_NOT_FOUND)
                                                     .build());
                     responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("stream5")) {
+                    responseObserver.onNext(UpdateStreamStatus.newBuilder()
+                            .setStatus(UpdateStreamStatus.Status.UNRECOGNIZED)
+                            .build());
+                    responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
+                } else {
+                    responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
+                }
+            }
+
+            @Override
+            public void truncateStream(Controller.StreamCut request,
+                    StreamObserver<UpdateStreamStatus> responseObserver) {
+                if (request.getStreamInfo().getStream().equals("stream1")) {
+                    responseObserver.onNext(UpdateStreamStatus.newBuilder()
+                                                    .setStatus(UpdateStreamStatus.Status.SUCCESS)
+                                                    .build());
+                    responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("stream2")) {
+                    responseObserver.onNext(UpdateStreamStatus.newBuilder()
+                                                    .setStatus(UpdateStreamStatus.Status.FAILURE)
+                                                    .build());
+                    responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("stream3")) {
+                    responseObserver.onNext(UpdateStreamStatus.newBuilder()
+                                                    .setStatus(UpdateStreamStatus.Status.SCOPE_NOT_FOUND)
+                                                    .build());
+                    responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("stream4")) {
+                    responseObserver.onNext(UpdateStreamStatus.newBuilder()
+                                                    .setStatus(UpdateStreamStatus.Status.STREAM_NOT_FOUND)
+                                                    .build());
+                    responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("stream5")) {
+                    responseObserver.onNext(UpdateStreamStatus.newBuilder()
+                            .setStatus(UpdateStreamStatus.Status.UNRECOGNIZED)
+                            .build());
+                    responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
@@ -188,6 +301,8 @@ public class ControllerImplTest {
                                                     .setStatus(UpdateStreamStatus.Status.STREAM_NOT_FOUND)
                                                     .build());
                     responseObserver.onCompleted();
+                } else if (request.getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
@@ -216,6 +331,8 @@ public class ControllerImplTest {
                             .setStatus(DeleteStreamStatus.Status.STREAM_NOT_SEALED)
                             .build());
                     responseObserver.onCompleted();
+                } else if (request.getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
@@ -228,24 +345,32 @@ public class ControllerImplTest {
                     responseObserver.onNext(SegmentRanges.newBuilder()
                                                     .addSegmentRanges(ModelHelper.createSegmentRange("scope1",
                                                                                                      "stream1",
-                                                                                                     0,
+                                                                                                     6,
                                                                                                      0.0,
                                                                                                      0.4))
                                                     .addSegmentRanges(ModelHelper.createSegmentRange("scope1",
                                                                                                      "stream1",
-                                                                                                     1,
+                                                                                                     7,
                                                                                                      0.4,
                                                                                                      1.0))
                                                     .build());
                     responseObserver.onCompleted();
+                } else  if (request.getStream().equals("stream8")) {
+                    responseObserver.onNext(SegmentRanges.newBuilder()
+                                                         .addSegmentRanges(ModelHelper.createSegmentRange("scope1",
+                                                                 "stream8",
+                                                                 9,
+                                                                 0.0,
+                                                                 0.5))
+                                                         .addSegmentRanges(ModelHelper.createSegmentRange("scope1",
+                                                                 "stream8",
+                                                                 10,
+                                                                 0.5,
+                                                                 1.0))
+                                                         .build());
+                    responseObserver.onCompleted();
                 } else if (request.getStream().equals("streamparallel")) {
-                    try {
-                        Thread.sleep(500);
-                    } catch (InterruptedException e) {
-                        log.error("Unexpected interrupt");
-                        responseObserver.onError(e);
-                        return;
-                    }
+                    Exceptions.handleInterrupted(() -> Thread.sleep(500));
                     responseObserver.onNext(SegmentRanges.newBuilder()
                                                     .addSegmentRanges(ModelHelper.createSegmentRange("scope1",
                                                                                                      "streamparallel",
@@ -259,6 +384,8 @@ public class ControllerImplTest {
                                                                                                      1.0))
                                                     .build());
                     responseObserver.onCompleted();
+                } else if (request.getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
@@ -280,38 +407,101 @@ public class ControllerImplTest {
                                                                                       .build())
                                                           .build());
                     responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("stream8")) {
+                    SegmentId segment1 = ModelHelper.createSegmentId("scope1", "stream8", 0);
+                    SegmentId segment2 = ModelHelper.createSegmentId("scope1", "stream8", 1);
+                    SegmentId segment3 = ModelHelper.createSegmentId("scope1", "stream8", 2);
+                    responseObserver.onNext(SegmentsAtTime.newBuilder()
+                                                          .addSegments(SegmentLocation.newBuilder()
+                                                                                      .setSegmentId(segment1)
+                                                                                      .setOffset(10)
+                                                                                      .build())
+                                                          .addSegments(SegmentLocation.newBuilder()
+                                                                                      .setSegmentId(segment2)
+                                                                                      .setOffset(20)
+                                                                                      .build())
+                                                          .build());
+                    responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
             }
 
             @Override
-            public void getSegmentsImmediatlyFollowing(SegmentId request,
-                                                       StreamObserver<SuccessorResponse> responseObserver) {
+            public void getSegmentsImmediatelyFollowing(SegmentId request, StreamObserver<SuccessorResponse> responseObserver) {
                 if (request.getStreamInfo().getStream().equals("stream1")) {
-                    responseObserver.onNext(SuccessorResponse.newBuilder()
-                            .addSegments(SuccessorResponse.SegmentEntry.newBuilder()
-                                    .setSegment(Controller.SegmentRange.newBuilder()
-                                            .setSegmentId(ModelHelper.createSegmentId(
-                                                    "scope1",
-                                                    "stream1",
-                                                    0))
-                                            .setMinKey(0.0)
-                                            .setMaxKey(0.5).build())
-                                    .addValue(10)
-                                    .build())
-                            .addSegments(SuccessorResponse.SegmentEntry.newBuilder()
-                                    .setSegment(Controller.SegmentRange.newBuilder()
-                                            .setSegmentId(ModelHelper.createSegmentId(
-                                                    "scope1",
-                                                    "stream1",
-                                                    1))
-                                            .setMinKey(0.5)
-                                            .setMaxKey(1.0).build())
-                                    .addValue(20)
-                                    .build())
-                            .build());
+                    Map<SegmentId, Pair<Double, Double>> result = new HashMap<>();
+                    if (request.getSegmentId() == 0) {
+                        result.put(ModelHelper.createSegmentId("scope1", "stream1", 2), Pair.of(0.0, 0.25));
+                        result.put(ModelHelper.createSegmentId("scope1", "stream1", 3), Pair.of(0.25, 0.5));
+                    } else if (request.getSegmentId() == 1) {
+                        result.put(ModelHelper.createSegmentId("scope1", "stream1", 4), Pair.of(0.5, 0.75));
+                        result.put(ModelHelper.createSegmentId("scope1", "stream1", 5), Pair.of(0.75, 1.0));
+                    } else if (request.getSegmentId() == 2 || request.getSegmentId() == 3) {
+                        result.put(ModelHelper.createSegmentId("scope1", "stream1", 6), Pair.of(0.0, 0.5));
+                    } else if (request.getSegmentId() == 4 || request.getSegmentId() == 5) {
+                        result.put(ModelHelper.createSegmentId("scope1", "stream1", 7), Pair.of(0.5, 0.25));
+                    }
+                    val builder = SuccessorResponse.newBuilder();
+                    for (Entry<SegmentId, Pair<Double, Double>> entry : result.entrySet()) {
+                        builder.addSegments(SuccessorResponse.SegmentEntry.newBuilder()
+                                            .setSegment(Controller.SegmentRange.newBuilder()
+                                                        .setSegmentId(entry.getKey())
+                                                        .setMinKey(entry.getValue().getLeft())
+                                                        .setMaxKey(entry.getValue().getRight())
+                                                        .build())
+                                            .addValue(10 * entry.getKey().getSegmentId())
+                                            .build());
+                    }
+                    responseObserver.onNext(builder.build());
                     responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("stream8")) {
+                    Map<SegmentId, Pair<Double, Double>> result = new HashMap<>();
+                    if (request.getSegmentId() == 0) {
+                        result.put(ModelHelper.createSegmentId("scope1", "stream8", 3), Pair.of(0.0, 0.2));
+                        result.put(ModelHelper.createSegmentId("scope1", "stream8", 4), Pair.of(0.2, 0.33));
+                    } else if (request.getSegmentId() == 1) {
+                        result.put(ModelHelper.createSegmentId("scope1", "stream8", 5), Pair.of(0.33, 0.5));
+                        result.put(ModelHelper.createSegmentId("scope1", "stream8", 6), Pair.of(0.5, 0.66));
+                    } else if (request.getSegmentId() == 2) {
+                        result.put(ModelHelper.createSegmentId("scope1", "stream8", 7), Pair.of(0.66, 0.8));
+                        result.put(ModelHelper.createSegmentId("scope1", "stream8", 8), Pair.of(0.8, 1.0));
+                    } else if (request.getSegmentId() == 3 || request.getSegmentId() == 4 || request.getSegmentId() == 5) {
+                        result.put(ModelHelper.createSegmentId("scope1", "stream8", 9), Pair.of(0.0, 0.5));
+                    } else if (request.getSegmentId() == 6 || request.getSegmentId() == 7 || request.getSegmentId() == 8) {
+                        result.put(ModelHelper.createSegmentId("scope1", "stream8", 10), Pair.of(0.5, 1.0));
+                    }
+                    val builder = SuccessorResponse.newBuilder();
+                    for (Entry<SegmentId, Pair<Double, Double>> entry : result.entrySet()) {
+                        builder.addSegments(SuccessorResponse.SegmentEntry.newBuilder()
+                                                                          .setSegment(Controller.SegmentRange.newBuilder()
+                                                                                                             .setSegmentId(entry.getKey())
+                                                                                                             .setMinKey(entry.getValue().getLeft())
+                                                                                                             .setMaxKey(entry.getValue().getRight())
+                                                                                                             .build())
+                                                                          .addValue(10 * entry.getKey().getSegmentId())
+                                                                          .build());
+                    }
+                    responseObserver.onNext(builder.build());
+                    responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
+                } else {
+                    responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
+                }
+            }
+
+            @Override
+            public void getSegmentsBetween(Controller.StreamCutRange request, StreamObserver<Controller.StreamCutRangeResponse> responseObserver) {
+                if (request.getStreamInfo().getStream().equals("stream1")) {
+                    SegmentId segment1 = ModelHelper.createSegmentId("scope1", "stream1", 0L);
+                    SegmentId segment2 = ModelHelper.createSegmentId("scope1", "stream1", 1L);
+                    responseObserver.onNext(Controller.StreamCutRangeResponse.newBuilder().addSegments(segment1).addSegments(segment2).build());
+                    responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
@@ -321,7 +511,7 @@ public class ControllerImplTest {
             public void scale(ScaleRequest request, StreamObserver<ScaleResponse> responseObserver) {
                 if (request.getStreamInfo().getStream().equals("stream1")) {
                     responseObserver.onNext(ScaleResponse.newBuilder()
-                                                    .setStatus(ScaleResponse.ScaleStreamStatus.SUCCESS)
+                                                    .setStatus(ScaleResponse.ScaleStreamStatus.STARTED)
                                                     .addSegments(ModelHelper.createSegmentRange("scope1",
                                                                                                 "stream1",
                                                                                                 0,
@@ -332,8 +522,24 @@ public class ControllerImplTest {
                                                                                                 1,
                                                                                                 0.5,
                                                                                                 1.0))
+                                                    .setEpoch(0)
                                                     .build());
                     responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send response
+                } else {
+                    responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
+                }
+            }
+
+            @Override
+            public void checkScale(ScaleStatusRequest request, StreamObserver<ScaleStatusResponse> responseObserver) {
+                if (request.getStreamInfo().getStream().equals("stream1")) {
+                    responseObserver.onNext(ScaleStatusResponse.newBuilder()
+                            .setStatus(ScaleStatusResponse.ScaleStatus.SUCCESS).build());
+                    responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
@@ -345,6 +551,8 @@ public class ControllerImplTest {
                     responseObserver.onNext(NodeUri.newBuilder().setEndpoint("localhost").
                             setPort(SERVICE_PORT).build());
                     responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
@@ -359,6 +567,8 @@ public class ControllerImplTest {
                 } else if (request.getStreamInfo().getStream().equals("stream2")) {
                     responseObserver.onNext(SegmentValidityResponse.newBuilder().setResponse(false).build());
                     responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
@@ -379,6 +589,8 @@ public class ControllerImplTest {
                     builder.setTxnId(TxnId.newBuilder().setHighBits(33L).setLowBits(44L).build());
                     responseObserver.onNext(builder.build());
                     responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
@@ -387,6 +599,8 @@ public class ControllerImplTest {
             @Override
             public void commitTransaction(TxnRequest request,
                     StreamObserver<Controller.TxnStatus> responseObserver) {
+                lastRequest.set(request);
+
                 if (request.getStreamInfo().getStream().equals("stream1")) {
                     responseObserver.onNext(Controller.TxnStatus.newBuilder()
                                                     .setStatus(Controller.TxnStatus.Status.SUCCESS)
@@ -407,6 +621,8 @@ public class ControllerImplTest {
                                                     .setStatus(Controller.TxnStatus.Status.TRANSACTION_NOT_FOUND)
                                                     .build());
                     responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
@@ -435,6 +651,8 @@ public class ControllerImplTest {
                                                     .setStatus(Controller.TxnStatus.Status.TRANSACTION_NOT_FOUND)
                                                     .build());
                     responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
@@ -443,11 +661,40 @@ public class ControllerImplTest {
             @Override
             public void pingTransaction(PingTxnRequest request,
                     StreamObserver<PingTxnStatus> responseObserver) {
-                if (request.getStreamInfo().getStream().equals("stream1")) {
-                    responseObserver.onNext(PingTxnStatus.newBuilder().setStatus(PingTxnStatus.Status.OK).build());
-                    responseObserver.onCompleted();
-                } else {
-                    responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
+                switch (request.getStreamInfo().getStream()) {
+                    case "stream1":
+                        responseObserver.onNext(PingTxnStatus.newBuilder().setStatus(PingTxnStatus.Status.OK).build());
+                        responseObserver.onCompleted();
+                        break;
+                    case "stream2":
+                        responseObserver.onNext(PingTxnStatus.newBuilder().setStatus(PingTxnStatus.Status.LEASE_TOO_LARGE).build());
+                        responseObserver.onCompleted();
+                        break;
+                    case "stream3":
+                        responseObserver.onNext(PingTxnStatus.newBuilder().setStatus(PingTxnStatus.Status.MAX_EXECUTION_TIME_EXCEEDED).build());
+                        responseObserver.onCompleted();
+                        break;
+                    case "stream4":
+                        responseObserver.onNext(PingTxnStatus.newBuilder().setStatus(PingTxnStatus.Status.DISCONNECTED).build());
+                        responseObserver.onCompleted();
+                        break;
+                    case "stream5":
+                        responseObserver.onNext(PingTxnStatus.newBuilder().setStatus(PingTxnStatus.Status.COMMITTED).build());
+                        responseObserver.onCompleted();
+                        break;
+                    case "stream6":
+                        responseObserver.onNext(PingTxnStatus.newBuilder().setStatus(PingTxnStatus.Status.ABORTED).build());
+                        responseObserver.onCompleted();
+                        break;
+                    case "stream8":
+                        responseObserver.onNext(PingTxnStatus.newBuilder().setStatus(PingTxnStatus.Status.UNKNOWN).build());
+                        responseObserver.onCompleted();
+                        break;
+                    case "deadline":
+                        break;
+                    default:
+                        responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
+                        break;
                 }
             }
 
@@ -471,6 +718,8 @@ public class ControllerImplTest {
                 } else if (request.getStreamInfo().getStream().equals("stream6")) {
                     responseObserver.onNext(TxnState.newBuilder().setState(TxnState.State.ABORTED).build());
                     responseObserver.onCompleted();
+                } else if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
@@ -496,8 +745,21 @@ public class ControllerImplTest {
                                                     .setStatus(CreateScopeStatus.Status.SCOPE_EXISTS)
                                                     .build());
                     responseObserver.onCompleted();
+                } else if (request.getScope().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
+                }
+            }
+
+            @Override
+            public void getDelegationToken(StreamInfo request,
+                                           StreamObserver<Controller.DelegationToken> responseObserver) {
+                if (request.getStream().equals("deadline")) {
+                    // dont send any response
+                } else {
+                    responseObserver.onNext(Controller.DelegationToken.newBuilder().setDelegationToken("token").build());
+                    responseObserver.onCompleted();
                 }
             }
 
@@ -521,108 +783,325 @@ public class ControllerImplTest {
                                                     .setStatus(DeleteScopeStatus.Status.SCOPE_NOT_FOUND)
                                                     .build());
                     responseObserver.onCompleted();
+                } else if (request.getScope().equals("deadline")) {
+                    // dont send any response
                 } else {
                     responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
                 }
             }
+
+            @Override
+            public void listStreamsInScope(Controller.StreamsInScopeRequest request, StreamObserver<Controller.StreamsInScopeResponse> responseObserver) {
+                if (request.getScope().getScope().equals(NON_EXISTENT)) {
+                    responseObserver.onNext(Controller.StreamsInScopeResponse
+                            .newBuilder().setStatus(Controller.StreamsInScopeResponse.Status.SCOPE_NOT_FOUND)
+                            .build());
+                    responseObserver.onCompleted();
+                } else if (request.getScope().getScope().equals("deadline")) {
+                    // dont send any response
+                    System.err.println("i am here");
+                } else if (request.getScope().getScope().equals(FAILING)) {
+                    responseObserver.onNext(Controller.StreamsInScopeResponse
+                            .newBuilder().setStatus(Controller.StreamsInScopeResponse.Status.FAILURE)
+                            .build());
+                    responseObserver.onCompleted();
+                } else if (Strings.isNullOrEmpty(request.getContinuationToken().getToken())) {
+                    List<StreamInfo> list1 = new LinkedList<>();
+                    list1.add(StreamInfo.newBuilder().setScope(request.getScope().getScope()).setStream("stream1").build());
+                    list1.add(StreamInfo.newBuilder().setScope(request.getScope().getScope()).setStream("stream2").build());
+                    responseObserver.onNext(Controller.StreamsInScopeResponse
+                            .newBuilder().setStatus(Controller.StreamsInScopeResponse.Status.SUCCESS).addAllStreams(list1)
+                            .setContinuationToken(Controller.ContinuationToken.newBuilder().setToken("myToken").build()).build());
+                    responseObserver.onCompleted();
+                } else if (request.getContinuationToken().getToken().equals("myToken")) {
+                    List<StreamInfo> list2 = new LinkedList<>();
+                    list2.add(StreamInfo.newBuilder().setScope(request.getScope().getScope()).setStream("stream3").build());
+                    responseObserver.onNext(Controller.StreamsInScopeResponse
+                            .newBuilder().addAllStreams(list2).setStatus(Controller.StreamsInScopeResponse.Status.SUCCESS)
+                            .setContinuationToken(Controller.ContinuationToken.newBuilder().setToken("myToken2").build()).build());
+                    responseObserver.onCompleted();
+                } else if (request.getContinuationToken().getToken().equals("myToken2")) {
+                    List<StreamInfo> list3 = new LinkedList<>();
+                    responseObserver.onNext(Controller.StreamsInScopeResponse
+                            .newBuilder().addAllStreams(list3).setStatus(Controller.StreamsInScopeResponse.Status.SUCCESS)
+                            .setContinuationToken(Controller.ContinuationToken.newBuilder().setToken("").build()).build());
+                    responseObserver.onCompleted();
+                } else {
+                    responseObserver.onError(Status.INTERNAL.withDescription("Server error").asRuntimeException());
+                }
+            }
+            
+            @Override
+            public void isStreamCutValid(Controller.StreamCut request, StreamObserver<Controller.StreamCutValidityResponse> responseObserver) {
+                if (request.getStreamInfo().getStream().equals("deadline")) {
+                    // do nothing
+                } else {
+                    responseObserver.onNext(Controller.StreamCutValidityResponse.newBuilder().setResponse(true)
+                                                                                .build());
+                    responseObserver.onCompleted();
+                }
+            }
+
+            @Override
+            public void removeWriter(Controller.RemoveWriterRequest request, StreamObserver<Controller.RemoveWriterResponse> responseObserver) {
+                if (request.getStream().getStream().equals("deadline")) {
+                    // do nothing
+                } else {
+                    responseObserver.onNext(Controller.RemoveWriterResponse
+                            .newBuilder().setResult(Controller.RemoveWriterResponse.Status.SUCCESS).build());
+                    responseObserver.onCompleted();
+                }
+            }
+            
+            @Override
+            public void noteTimestampFromWriter(Controller.TimestampFromWriter request, StreamObserver<Controller.TimestampResponse> responseObserver) {
+                if (request.getWriter().equals("deadline")) {
+                    // do nothing
+                } else {
+                    responseObserver.onNext(Controller.TimestampResponse
+                            .newBuilder().setResult(Controller.TimestampResponse.Status.SUCCESS).build());
+                    responseObserver.onCompleted();
+                }
+            }
         };
 
-        fakeServer = InProcessServerBuilder.forName("fakeserver")
-                .addService(fakeServerImpl)
-                .directExecutor()
+        serverPort = TestUtils.getAvailableListenPort();
+        serverBuilder = NettyServerBuilder.forPort(serverPort)
+                                          .addService(testServerImpl);
+        if (testSecure) {
+         serverBuilder = serverBuilder.useTransportSecurity(new File(SecurityConfigDefaults.TLS_SERVER_CERT_PATH),
+                 new File(SecurityConfigDefaults.TLS_SERVER_PRIVATE_KEY_PATH));
+        }
+        testGRPCServer = serverBuilder
                 .build()
                 .start();
-        controllerClient = new ControllerImpl(InProcessChannelBuilder.forName("fakeserver").directExecutor());
+        executor = Executors.newSingleThreadScheduledExecutor();
+        controllerClient = new ControllerImpl( ControllerImplConfig.builder()
+                .clientConfig(
+                        ClientConfig.builder().controllerURI(URI.create((testSecure ? "tls://" : "tcp://") + "localhost:" + serverPort))
+                                    .credentials(new DefaultCredentials("1111_aaaa", "admin"))
+                                    .trustStore(SecurityConfigDefaults.TLS_CA_CERT_PATH)
+                                    .build())
+                .retryAttempts(1).build(), executor);
     }
 
     @After
     public void tearDown() {
-        fakeServer.shutdown();
+        ExecutorServiceHelpers.shutdown(executor);
+        testGRPCServer.shutdownNow();
     }
 
     @Test
+    public void testCredPluginException() throws Exception {
+        NettyChannelBuilder builder = spy(NettyChannelBuilder.forAddress("localhost", serverPort)
+                .keepAliveTime(10, TimeUnit.SECONDS));
+
+        final NettyChannelBuilder channelBuilder;
+        if (testSecure) {
+            channelBuilder = builder.sslContext(GrpcSslContexts.forClient().trustManager(
+                    new File(SecurityConfigDefaults.TLS_CA_CERT_PATH)).build());
+        } else {
+            channelBuilder = builder.usePlaintext();
+        }
+        // Setup mocks.
+        ClientConfig cfg = spy(ClientConfig.builder()
+                .credentials(new DefaultCredentials("pass", "user"))
+                .trustStore(SecurityConfigDefaults.TLS_CA_CERT_PATH)
+                .controllerURI(URI.create((testSecure ? "tls://" : "tcp://") + "localhost:" + serverPort))
+                .build());
+        doThrow(new IllegalStateException("Exception thrown by cred plugin")).when(cfg).getCredentials();
+        ManagedChannel channel = mock(ManagedChannel.class);
+        doReturn(channel).when(builder).build();
+        ControllerImplConfig controllerCfg = new ControllerImplConfig(1, 1, 1, 1, 1000, cfg);
+        //Verify exception scenario.
+        assertThrows(IllegalStateException.class, () -> new ControllerImpl(channelBuilder, controllerCfg, this.executor));
+        verify(channel, times(1)).shutdownNow();
+        verify(channel, times(1)).awaitTermination(anyLong(), any(TimeUnit.class));
+    }
+
+    @Test
+    public void testKeepAlive() throws IOException, ExecutionException, InterruptedException {
+
+        // Verify that keep-alive timeout less than permissible by the server results in a failure.
+        NettyChannelBuilder builder = NettyChannelBuilder.forAddress("localhost", serverPort)
+                                                         .keepAliveTime(10, TimeUnit.SECONDS);
+        if (testSecure) {
+            builder = builder.sslContext(GrpcSslContexts.forClient().trustManager(
+                    new File(SecurityConfigDefaults.TLS_CA_CERT_PATH)).build());
+        } else {
+            builder = builder.usePlaintext();
+        }
+        @Cleanup
+        final ControllerImpl controller = new ControllerImpl(builder,
+                ControllerImplConfig.builder().clientConfig(ClientConfig.builder()
+                                                                        .trustStore(SecurityConfigDefaults.TLS_CA_CERT_PATH)
+                                                                        .controllerURI(URI.create((testSecure ? "tls://" : "tcp://") + "localhost:" + serverPort))
+                                                                        .build())
+                                    .retryAttempts(1).build(),
+                this.executor);
+        CompletableFuture<Boolean> createStreamStatus = controller.createStream("scope1", "streamdelayed", StreamConfiguration.builder()
+                .scalingPolicy(ScalingPolicy.fixed(1))
+                .build());
+        AssertExtensions.assertFutureThrows("Should throw RetriesExhaustedException", createStreamStatus,
+                throwable -> throwable instanceof RetriesExhaustedException);
+
+        // Verify that the same RPC with permissible keepalive time succeeds.
+        int serverPort2 = TestUtils.getAvailableListenPort();
+        NettyServerBuilder testServerBuilder = NettyServerBuilder.forPort(serverPort2)
+                                                                 .addService(testServerImpl)
+                                                                 .permitKeepAliveTime(5, TimeUnit.SECONDS);
+
+        if (testSecure) {
+           testServerBuilder = testServerBuilder.useTransportSecurity(
+                   new File(SecurityConfigDefaults.TLS_SERVER_CERT_PATH),
+                   new File(SecurityConfigDefaults.TLS_SERVER_PRIVATE_KEY_PATH));
+        }
+
+        Server testServer = testServerBuilder.build()
+                .start();
+
+        builder = NettyChannelBuilder.forAddress("localhost", serverPort2)
+                           .keepAliveTime(10, TimeUnit.SECONDS);
+        if (testSecure) {
+            builder = builder.sslContext(GrpcSslContexts.forClient().trustManager(
+                    new File(SecurityConfigDefaults.TLS_CA_CERT_PATH)).build());
+        } else {
+            builder = builder.usePlaintext();
+        }
+        @Cleanup
+        final ControllerImpl controller1 = new ControllerImpl(builder,
+                ControllerImplConfig.builder().clientConfig(ClientConfig.builder()
+                                                                        .trustStore(SecurityConfigDefaults.TLS_CA_CERT_PATH)
+                                                                        .controllerURI(URI.create((testSecure ? "tls://" : "tcp://") + "localhost:" + serverPort))
+                                                                        .build())
+                                    .retryAttempts(1).build(), this.executor);
+        createStreamStatus = controller1.createStream("scope1", "streamdelayed", StreamConfiguration.builder()
+                .scalingPolicy(ScalingPolicy.fixed(1))
+                .build());
+        assertTrue(createStreamStatus.get());
+        testServer.shutdownNow();
+    }
+
+    @Test
+    public void testRetries() throws IOException, ExecutionException, InterruptedException {
+
+        // Verify retries exhausted error after multiple attempts.
+        @Cleanup
+        final ControllerImpl controller1 = new ControllerImpl( ControllerImplConfig.builder()
+                .clientConfig(ClientConfig.builder()
+                                          .controllerURI(URI.create((testSecure ? "tls://" : "tcp://") + "localhost:" + serverPort))
+                                          .trustStore(SecurityConfigDefaults.TLS_CA_CERT_PATH).build())
+                .retryAttempts(3).build(), this.executor);
+        CompletableFuture<Boolean> createStreamStatus = controller1.createStream("scope1", "streamretryfailure", StreamConfiguration.builder()
+                .scalingPolicy(ScalingPolicy.fixed(1))
+                .build());
+        AssertExtensions.assertFutureThrows("Should throw RetriesExhaustedException", createStreamStatus,
+                throwable -> throwable instanceof RetriesExhaustedException);
+
+        // The following call with retries should fail since number of retries is not sufficient.
+        this.retryAttempts.set(0);
+        createStreamStatus = controller1.createStream("scope1", "streamretrysuccess", StreamConfiguration.builder()
+                .scalingPolicy(ScalingPolicy.fixed(1))
+                .build());
+        AssertExtensions.assertFutureThrows("Should throw RetriesExhaustedException", createStreamStatus,
+                throwable -> throwable instanceof RetriesExhaustedException);
+
+        // The RPC should succeed when internal retry attempts is > 3 which is the hardcoded test value for success.
+        this.retryAttempts.set(0);
+        @Cleanup
+        final ControllerImpl controller2 = new ControllerImpl( ControllerImplConfig.builder()
+                .clientConfig(ClientConfig.builder()
+                                          .controllerURI(URI.create((testSecure ? "tls://" : "tcp://") + "localhost:" + serverPort))
+                                          .trustStore(SecurityConfigDefaults.TLS_CA_CERT_PATH).build())
+                .retryAttempts(4).build(), this.executor);
+        createStreamStatus = controller2.createStream("scope1", "streamretrysuccess", StreamConfiguration.builder()
+                .scalingPolicy(ScalingPolicy.fixed(1))
+                .build());
+        assertTrue(createStreamStatus.get());
+    }
+
+    @Test
+    public void testGetDelegationToken() throws Exception {
+        CompletableFuture<String> delegationTokenFuture;
+        delegationTokenFuture = controllerClient.getOrRefreshDelegationTokenFor("stream1", "scope1");
+        assertEquals(delegationTokenFuture.get(), "token");
+    }
+
+        @Test
     public void testCreateStream() throws Exception {
         CompletableFuture<Boolean> createStreamStatus;
-        createStreamStatus = controllerClient.createStream(StreamConfiguration.builder()
-                                                                   .streamName("stream1")
-                                                                   .scope("scope1")
+        createStreamStatus = controllerClient.createStream("scope1", "stream1", StreamConfiguration.builder()
                                                                    .scalingPolicy(ScalingPolicy.fixed(1))
                                                                    .build());
         assertTrue(createStreamStatus.get());
 
-        createStreamStatus = controllerClient.createStream(StreamConfiguration.builder()
-                                                                   .streamName("stream2")
-                                                                   .scope("scope1")
+        createStreamStatus = controllerClient.createStream("scope1", "stream2", StreamConfiguration.builder()
                                                                    .scalingPolicy(ScalingPolicy.fixed(1))
                                                                    .build());
-        AssertExtensions.assertThrows("Server should throw exception", createStreamStatus, Throwable -> true);
+        AssertExtensions.assertFutureThrows("Server should throw exception",
+                createStreamStatus, Throwable -> true);
 
-        createStreamStatus = controllerClient.createStream(StreamConfiguration.builder()
-                                                                   .streamName("stream3")
-                                                                   .scope("scope1")
+        createStreamStatus = controllerClient.createStream("scope1", "stream3", StreamConfiguration.builder()
                                                                    .scalingPolicy(ScalingPolicy.fixed(1))
                                                                    .build());
-        AssertExtensions.assertThrows("Server should throw exception", createStreamStatus, Throwable -> true);
+        AssertExtensions.assertFutureThrows("Server should throw exception",
+                createStreamStatus, Throwable -> true);
 
-        createStreamStatus = controllerClient.createStream(StreamConfiguration.builder()
-                                                                   .streamName("stream4")
-                                                                   .scope("scope1")
+        createStreamStatus = controllerClient.createStream("scope1", "stream4", StreamConfiguration.builder()
                                                                    .scalingPolicy(ScalingPolicy.fixed(1))
                                                                    .build());
         assertFalse(createStreamStatus.get());
 
-        createStreamStatus = controllerClient.createStream(StreamConfiguration.builder()
-                                                                   .streamName("stream5")
-                                                                   .scope("scope1")
+        createStreamStatus = controllerClient.createStream("scope1", "stream5", StreamConfiguration.builder()
                                                                    .scalingPolicy(ScalingPolicy.fixed(1))
                                                                    .build());
-        AssertExtensions.assertThrows("Server should throw exception", createStreamStatus, Throwable -> true);
+        AssertExtensions.assertFutureThrows("Server should throw exception",
+                createStreamStatus, Throwable -> true);
 
-        createStreamStatus = controllerClient.createStream(StreamConfiguration.builder()
-                                                                   .streamName("stream6")
-                                                                   .scope("scope1")
+        createStreamStatus = controllerClient.createStream("scope1", "stream6", StreamConfiguration.builder()
                                                                    .scalingPolicy(ScalingPolicy.fixed(1))
                                                                    .build());
-        AssertExtensions.assertThrows("Should throw Exception", createStreamStatus, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception",
+                createStreamStatus, throwable -> true);
     }
 
     @Test
-    public void testAlterStream() throws Exception {
+    public void testUpdateStream() throws Exception {
         CompletableFuture<Boolean> updateStreamStatus;
-        updateStreamStatus = controllerClient.alterStream(StreamConfiguration.builder()
-                                                                  .streamName("stream1")
-                                                                  .scope("scope1")
+        updateStreamStatus = controllerClient.updateStream("scope1", "stream1", StreamConfiguration.builder()
                                                                   .scalingPolicy(ScalingPolicy.fixed(1))
                                                                   .build());
         assertTrue(updateStreamStatus.get());
 
-        updateStreamStatus = controllerClient.alterStream(StreamConfiguration.builder()
-                                                                  .streamName("stream2")
-                                                                  .scope("scope1")
+        updateStreamStatus = controllerClient.updateStream("scope1", "stream2", StreamConfiguration.builder()
                                                                   .scalingPolicy(ScalingPolicy.fixed(1))
                                                                   .build());
-        AssertExtensions.assertThrows("Server should throw exception", updateStreamStatus, Throwable -> true);
+        AssertExtensions.assertFutureThrows("Server should throw exception",
+                updateStreamStatus, Throwable -> true);
 
-        updateStreamStatus = controllerClient.alterStream(StreamConfiguration.builder()
-                                                                  .streamName("stream3")
-                                                                  .scope("scope1")
+        updateStreamStatus = controllerClient.updateStream("scope1", "stream3", StreamConfiguration.builder()
                                                                   .scalingPolicy(ScalingPolicy.fixed(1))
                                                                   .build());
-        AssertExtensions.assertThrows("Server should throw exception", updateStreamStatus, Throwable -> true);
+        AssertExtensions.assertFutureThrows("Server should throw exception",
+                updateStreamStatus, Throwable -> true);
 
-        updateStreamStatus = controllerClient.alterStream(StreamConfiguration.builder()
-                                                                  .streamName("stream4")
-                                                                  .scope("scope1")
+        updateStreamStatus = controllerClient.updateStream("scope1", "stream4", StreamConfiguration.builder()
                                                                   .scalingPolicy(ScalingPolicy.fixed(1))
                                                                   .build());
-        AssertExtensions.assertThrows("Server should throw exception", updateStreamStatus, Throwable -> true);
+        AssertExtensions.assertFutureThrows("Server should throw exception",
+                updateStreamStatus, Throwable -> true);
 
-        updateStreamStatus = controllerClient.alterStream(StreamConfiguration.builder()
-                                                                  .streamName("stream5")
-                                                                  .scope("scope1")
+        updateStreamStatus = controllerClient.updateStream("scope1", "stream5", StreamConfiguration.builder()
                                                                   .scalingPolicy(ScalingPolicy.fixed(1))
                                                                   .build());
-        AssertExtensions.assertThrows("Should throw Exception", updateStreamStatus, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception",
+                updateStreamStatus, throwable -> true);
+
+        updateStreamStatus = controllerClient.updateStream("scope1", "stream6", StreamConfiguration.builder()
+                                                                  .scalingPolicy(ScalingPolicy.fixed(1))
+                                                                  .build());
+        AssertExtensions.assertFutureThrows("Should throw Exception",
+                updateStreamStatus, throwable -> true);
     }
 
     @Test
@@ -632,16 +1111,20 @@ public class ControllerImplTest {
         assertTrue(updateStreamStatus.get());
 
         updateStreamStatus = controllerClient.sealStream("scope1", "stream2");
-        AssertExtensions.assertThrows("Should throw exception", updateStreamStatus, Throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw exception",
+                updateStreamStatus, Throwable -> true);
 
         updateStreamStatus = controllerClient.sealStream("scope1", "stream3");
-        AssertExtensions.assertThrows("Should throw Exception", updateStreamStatus, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception",
+                updateStreamStatus, throwable -> true);
 
         updateStreamStatus = controllerClient.sealStream("scope1", "stream4");
-        AssertExtensions.assertThrows("Should throw Exception", updateStreamStatus, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception",
+                updateStreamStatus, throwable -> true);
 
         updateStreamStatus = controllerClient.sealStream("scope1", "stream5");
-        AssertExtensions.assertThrows("Should throw Exception", updateStreamStatus, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception",
+                updateStreamStatus, throwable -> true);
     }
 
     @Test
@@ -651,16 +1134,19 @@ public class ControllerImplTest {
         assertTrue(deleteStreamStatus.join());
 
         deleteStreamStatus = controllerClient.deleteStream("scope1", "stream2");
-        AssertExtensions.assertThrows("Should throw Exception", deleteStreamStatus, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception",
+                deleteStreamStatus, throwable -> true);
 
         deleteStreamStatus = controllerClient.deleteStream("scope1", "stream3");
         assertFalse(deleteStreamStatus.join());
 
         deleteStreamStatus = controllerClient.deleteStream("scope1", "stream4");
-        AssertExtensions.assertThrows("Should throw Exception", deleteStreamStatus, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception",
+                deleteStreamStatus, throwable -> true);
 
         deleteStreamStatus = controllerClient.deleteStream("scope1", "stream5");
-        AssertExtensions.assertThrows("Should throw Exception", deleteStreamStatus, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception",
+                deleteStreamStatus, throwable -> true);
     }
 
     @Test
@@ -668,11 +1154,11 @@ public class ControllerImplTest {
         CompletableFuture<StreamSegments> streamSegments;
         streamSegments = controllerClient.getCurrentSegments("scope1", "stream1");
         assertTrue(streamSegments.get().getSegments().size() == 2);
-        assertEquals(new Segment("scope1", "stream1", 0), streamSegments.get().getSegmentForKey(0.2));
-        assertEquals(new Segment("scope1", "stream1", 1), streamSegments.get().getSegmentForKey(0.6));
+        assertEquals(new Segment("scope1", "stream1", 6), streamSegments.get().getSegmentForKey(0.2));
+        assertEquals(new Segment("scope1", "stream1", 7), streamSegments.get().getSegmentForKey(0.6));
 
         streamSegments = controllerClient.getCurrentSegments("scope1", "stream2");
-        AssertExtensions.assertThrows("Should throw Exception", streamSegments, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", streamSegments, throwable -> true);
     }
 
     @Test
@@ -683,39 +1169,54 @@ public class ControllerImplTest {
         assertEquals(10, positions.get().get(new Segment("scope1", "stream1", 0)).longValue());
         assertEquals(20, positions.get().get(new Segment("scope1", "stream1", 1)).longValue());
         positions = controllerClient.getSegmentsAtTime(new StreamImpl("scope1", "stream2"), 0);
-        AssertExtensions.assertThrows("Should throw Exception", positions, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", positions, throwable -> true);
     }
 
     @Test
     public void testGetSegmentsImmediatlyFollowing() throws Exception {
-        CompletableFuture<Map<Segment, List<Integer>>> successors;
-        successors = controllerClient.getSuccessors(new Segment("scope1", "stream1", 0))
+        CompletableFuture<Map<SegmentWithRange, List<Long>>> successors;
+        successors = controllerClient.getSuccessors(new Segment("scope1", "stream1", 0L))
                 .thenApply(StreamSegmentsWithPredecessors::getSegmentToPredecessor);
         assertEquals(2, successors.get().size());
-        assertEquals(10, successors.get().get(new Segment("scope1", "stream1", 0))
+        assertEquals(20, successors.get().get(new SegmentWithRange(new Segment("scope1", "stream1", 2L), 0.0, 0.25))
                 .get(0).longValue());
-        assertEquals(20, successors.get().get(new Segment("scope1", "stream1", 1))
+        assertEquals(30, successors.get().get(new SegmentWithRange(new Segment("scope1", "stream1", 3L), 0.25, 0.5))
                 .get(0).longValue());
 
-        successors = controllerClient.getSuccessors(new Segment("scope1", "stream2", 0))
+        successors = controllerClient.getSuccessors(new Segment("scope1", "stream2", 0L))
                 .thenApply(StreamSegmentsWithPredecessors::getSegmentToPredecessor);
-        AssertExtensions.assertThrows("Should throw Exception", successors, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", successors, throwable -> true);
+    }
+
+    @Test
+    public void testGetStreamCutSuccessors() throws Exception {
+        StreamCut from = new StreamCutImpl(new StreamImpl("scope1", "stream1"), Collections.emptyMap());
+        CompletableFuture<StreamSegmentSuccessors> successors = controllerClient.getSuccessors(from);
+        assertEquals(2, successors.get().getSegments().size());
     }
 
     @Test
     public void testScale() throws Exception {
         CompletableFuture<Boolean> scaleStream;
-        scaleStream = controllerClient.scaleStream(new StreamImpl("scope1", "stream1"), new ArrayList<>(),
-                                                   new HashMap<>());
+        StreamImpl stream = new StreamImpl("scope1", "stream1");
+        scaleStream = controllerClient.scaleStream(stream, new ArrayList<>(), new HashMap<>(), executor).getFuture();
         assertTrue(scaleStream.get());
         CompletableFuture<StreamSegments> segments = controllerClient.getCurrentSegments("scope1", "stream1");
         assertEquals(2, segments.get().getSegments().size());
-        assertEquals(new Segment("scope1", "stream1", 0), segments.get().getSegmentForKey(0.25));
-        assertEquals(new Segment("scope1", "stream1", 1), segments.get().getSegmentForKey(0.75));
+        assertEquals(new Segment("scope1", "stream1", 6), segments.get().getSegmentForKey(0.25));
+        assertEquals(new Segment("scope1", "stream1", 7), segments.get().getSegmentForKey(0.75));
 
         scaleStream = controllerClient.scaleStream(new StreamImpl("scope1", "stream2"), new ArrayList<>(),
-                                                   new HashMap<>());
-        AssertExtensions.assertThrows("Should throw Exception", scaleStream, throwable -> true);
+                                                   new HashMap<>(), executor).getFuture();
+        AssertExtensions.assertFutureThrows("Should throw Exception", scaleStream, throwable -> true);
+
+        scaleStream = controllerClient.scaleStream(new StreamImpl("UNKNOWN", "stream2"), new ArrayList<>(),
+                new HashMap<>(), executor).getFuture();
+        AssertExtensions.assertFutureThrows("Should throw Exception", scaleStream, throwable -> true);
+
+        scaleStream = controllerClient.scaleStream(new StreamImpl("scope1", "UNKNOWN"), new ArrayList<>(),
+                new HashMap<>(), executor).getFuture();
+        AssertExtensions.assertFutureThrows("Should throw Exception", scaleStream, throwable -> true);
     }
 
     @Test
@@ -725,7 +1226,7 @@ public class ControllerImplTest {
         assertEquals(new PravegaNodeUri("localhost", SERVICE_PORT), endpointForSegment.get());
 
         endpointForSegment = controllerClient.getEndpointForSegment("scope1/stream2/0");
-        AssertExtensions.assertThrows("Should throw Exception", endpointForSegment, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", endpointForSegment, throwable -> true);
     }
 
     @Test
@@ -738,45 +1239,53 @@ public class ControllerImplTest {
         assertFalse(segmentOpen.get());
 
         segmentOpen = controllerClient.isSegmentOpen(new Segment("scope1", "stream3", 0));
-        AssertExtensions.assertThrows("Should throw Exception", segmentOpen, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", segmentOpen, throwable -> true);
     }
 
     @Test
     public void testCreateTransaction() throws Exception {
         CompletableFuture<TxnSegments> transaction;
-        transaction = controllerClient.createTransaction(new StreamImpl("scope1", "stream1"), 0, 0, 0);
+        transaction = controllerClient.createTransaction(new StreamImpl("scope1", "stream1"), 0);
         assertEquals(new UUID(11L, 22L), transaction.get().getTxnId());
-        assertEquals(2, transaction.get().getSteamSegments().getSegments().size());
-        assertEquals(new Segment("scope1", "stream1", 0), transaction.get().getSteamSegments().getSegmentForKey(.2));
-        assertEquals(new Segment("scope1", "stream1", 1), transaction.get().getSteamSegments().getSegmentForKey(.8));
+        assertEquals(2, transaction.get().getStreamSegments().getSegments().size());
+        assertEquals(new Segment("scope1", "stream1", 0), transaction.get().getStreamSegments().getSegmentForKey(.2));
+        assertEquals(new Segment("scope1", "stream1", 1), transaction.get().getStreamSegments().getSegmentForKey(.8));
         
-        transaction = controllerClient.createTransaction(new StreamImpl("scope1", "stream2"), 0, 0, 0);
+        transaction = controllerClient.createTransaction(new StreamImpl("scope1", "stream2"), 0);
         assertEquals(new UUID(33L, 44L), transaction.get().getTxnId());
-        assertEquals(1, transaction.get().getSteamSegments().getSegments().size());
-        assertEquals(new Segment("scope1", "stream2", 0), transaction.get().getSteamSegments().getSegmentForKey(.2));
-        assertEquals(new Segment("scope1", "stream2", 0), transaction.get().getSteamSegments().getSegmentForKey(.8));
+        assertEquals(1, transaction.get().getStreamSegments().getSegments().size());
+        assertEquals(new Segment("scope1", "stream2", 0), transaction.get().getStreamSegments().getSegmentForKey(.2));
+        assertEquals(new Segment("scope1", "stream2", 0), transaction.get().getStreamSegments().getSegmentForKey(.8));
         
-        transaction = controllerClient.createTransaction(new StreamImpl("scope1", "stream3"), 0, 0, 0);
-        AssertExtensions.assertThrows("Should throw Exception", transaction, throwable -> true);
+        transaction = controllerClient.createTransaction(new StreamImpl("scope1", "stream3"), 0);
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, throwable -> true);
     }
 
     @Test
     public void testCommitTransaction() throws Exception {
         CompletableFuture<Void> transaction;
-        transaction = controllerClient.commitTransaction(new StreamImpl("scope1", "stream1"), UUID.randomUUID());
+        transaction = controllerClient.commitTransaction(new StreamImpl("scope1", "stream1"), "writer", null, UUID.randomUUID());
         assertTrue(transaction.get() == null);
+        assertTrue(lastRequest.get() instanceof TxnRequest);
+        assertEquals(((TxnRequest) (lastRequest.get())).getTimestamp(), Long.MIN_VALUE);
+        
+        transaction = controllerClient.commitTransaction(new StreamImpl("scope1", "stream1"), "writer", 100L, UUID.randomUUID());
+        assertTrue(transaction.get() == null);
+        assertTrue(lastRequest.get() instanceof TxnRequest);
+        assertEquals(((TxnRequest) (lastRequest.get())).getTimestamp(), 100L);
 
-        transaction = controllerClient.commitTransaction(new StreamImpl("scope1", "stream2"), UUID.randomUUID());
-        AssertExtensions.assertThrows("Should throw Exception", transaction, throwable -> true);
+        transaction = controllerClient.commitTransaction(new StreamImpl("scope1", "stream2"), "writer", null, UUID.randomUUID());
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, throwable -> throwable instanceof TxnFailedException);
 
-        transaction = controllerClient.commitTransaction(new StreamImpl("scope1", "stream3"), UUID.randomUUID());
-        AssertExtensions.assertThrows("Should throw Exception", transaction, throwable -> true);
+        transaction = controllerClient.commitTransaction(new StreamImpl("scope1", "stream3"), "writer", null, UUID.randomUUID());
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, throwable -> throwable instanceof InvalidStreamException);
 
-        transaction = controllerClient.commitTransaction(new StreamImpl("scope1", "stream4"), UUID.randomUUID());
-        AssertExtensions.assertThrows("Should throw Exception", transaction, throwable -> true);
+        transaction = controllerClient.commitTransaction(new StreamImpl("scope1", "stream4"), "writer", null, UUID.randomUUID());
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, throwable -> true);
 
-        transaction = controllerClient.commitTransaction(new StreamImpl("scope1", "stream5"), UUID.randomUUID());
-        AssertExtensions.assertThrows("Should throw Exception", transaction, throwable -> true);
+        transaction = controllerClient.commitTransaction(new StreamImpl("scope1", "stream5"), "writer", null, UUID.randomUUID());
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, throwable -> true);
+           
     }
 
     @Test
@@ -786,26 +1295,56 @@ public class ControllerImplTest {
         assertTrue(transaction.get() == null);
 
         transaction = controllerClient.abortTransaction(new StreamImpl("scope1", "stream2"), UUID.randomUUID());
-        AssertExtensions.assertThrows("Should throw Exception", transaction, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, throwable -> true);
 
         transaction = controllerClient.abortTransaction(new StreamImpl("scope1", "stream3"), UUID.randomUUID());
-        AssertExtensions.assertThrows("Should throw Exception", transaction, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, throwable -> throwable instanceof InvalidStreamException);
 
         transaction = controllerClient.abortTransaction(new StreamImpl("scope1", "stream4"), UUID.randomUUID());
-        AssertExtensions.assertThrows("Should throw Exception", transaction, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, throwable -> true);
 
         transaction = controllerClient.abortTransaction(new StreamImpl("scope1", "stream5"), UUID.randomUUID());
-        AssertExtensions.assertThrows("Should throw Exception", transaction, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, throwable -> true);
     }
 
     @Test
     public void testPingTransaction() throws Exception {
-        CompletableFuture<Void> transaction;
-        transaction = controllerClient.pingTransaction(new StreamImpl("scope1", "stream1"), UUID.randomUUID(), 0);
-        assertTrue(transaction.get() == null);
 
+        Predicate<Throwable> isPingFailedException = t -> t instanceof PingFailedException;
+
+        CompletableFuture<Transaction.PingStatus> transaction;
+        transaction = controllerClient.pingTransaction(new StreamImpl("scope1", "stream1"), UUID.randomUUID(), 0);
+        assertEquals(transaction.get(), Transaction.PingStatus.OPEN);
+
+        // controller returns error with status LEASE_TOO_LARGE
         transaction = controllerClient.pingTransaction(new StreamImpl("scope1", "stream2"), UUID.randomUUID(), 0);
-        AssertExtensions.assertThrows("Should throw Exception", transaction, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, isPingFailedException);
+
+        // controller returns error with status MAX_EXECUTION_TIME_EXCEEDED
+        transaction = controllerClient.pingTransaction(new StreamImpl("scope1", "stream3"), UUID.randomUUID(), 0);
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, isPingFailedException);
+
+        // controller returns error with status DISCONNECTED
+        transaction = controllerClient.pingTransaction(new StreamImpl("scope1", "stream4"), UUID.randomUUID(), 0);
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction,  isPingFailedException);
+
+        // controller returns error with status COMMITTED
+        transaction = controllerClient.pingTransaction(new StreamImpl("scope1", "stream5"), UUID.randomUUID(), 0);
+        assertEquals(transaction.get(), Transaction.PingStatus.COMMITTED);
+
+        // controller returns error with status ABORTED
+        transaction = controllerClient.pingTransaction(new StreamImpl("scope1", "stream6"), UUID.randomUUID(), 0);
+        assertEquals(transaction.get(), Transaction.PingStatus.ABORTED);
+
+        // controller fails with internal exception causing the controller client to retry.
+        transaction = controllerClient.pingTransaction(new StreamImpl("scope1", "stream7"), UUID.randomUUID(), 0);
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, t -> t instanceof RetriesExhaustedException);
+
+        // controller returns error with status UNKNOWN
+        transaction = controllerClient.pingTransaction(new StreamImpl("scope1", "stream8"), UUID.randomUUID(), 0);
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, 
+                t -> Exceptions.unwrap(t) instanceof StatusRuntimeException 
+                        && ((StatusRuntimeException) Exceptions.unwrap(t)).getStatus().equals(Status.NOT_FOUND));
     }
 
     @Test
@@ -815,7 +1354,7 @@ public class ControllerImplTest {
         assertEquals(Transaction.Status.OPEN, transaction.get());
 
         transaction = controllerClient.checkTransactionStatus(new StreamImpl("scope1", "stream2"), UUID.randomUUID());
-        AssertExtensions.assertThrows("Should throw Exception", transaction, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, throwable -> true);
 
         transaction = controllerClient.checkTransactionStatus(new StreamImpl("scope1", "stream3"), UUID.randomUUID());
         assertEquals(Transaction.Status.COMMITTING, transaction.get());
@@ -830,7 +1369,7 @@ public class ControllerImplTest {
         assertEquals(Transaction.Status.ABORTED, transaction.get());
 
         transaction = controllerClient.checkTransactionStatus(new StreamImpl("scope1", "stream7"), UUID.randomUUID());
-        AssertExtensions.assertThrows("Should throw Exception", transaction, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", transaction, throwable -> true);
     }
 
     @Test
@@ -840,16 +1379,37 @@ public class ControllerImplTest {
         assertTrue(scopeStatus.get());
 
         scopeStatus = controllerClient.createScope("scope2");
-        AssertExtensions.assertThrows("Server should throw exception", scopeStatus, Throwable -> true);
+        AssertExtensions.assertFutureThrows("Server should throw exception", scopeStatus, Throwable -> true);
 
         scopeStatus = controllerClient.createScope("scope3");
-        AssertExtensions.assertThrows("Server should throw exception", scopeStatus, Throwable -> true);
+        AssertExtensions.assertFutureThrows("Server should throw exception", scopeStatus, Throwable -> true);
 
         scopeStatus = controllerClient.createScope("scope4");
         assertFalse(scopeStatus.get());
 
         scopeStatus = controllerClient.createScope("scope5");
-        AssertExtensions.assertThrows("Should throw Exception", scopeStatus, throwable -> true);
+        AssertExtensions.assertFutureThrows("Should throw Exception", scopeStatus, throwable -> true);
+    }
+    
+    @Test
+    public void testStreamsInScope() {
+        String scope = "scopeList";
+        AsyncIterator<Stream> iterator = controllerClient.listStreams(scope);
+
+        Stream m = iterator.getNext().join();
+        assertEquals("stream1", m.getStreamName());
+        m = iterator.getNext().join();
+        assertEquals("stream2", m.getStreamName());
+        m = iterator.getNext().join();
+        assertEquals("stream3", m.getStreamName());
+
+        AssertExtensions.assertFutureThrows("Non existent scope",
+                controllerClient.listStreams(NON_EXISTENT).getNext(),
+                e -> Exceptions.unwrap(e) instanceof NoSuchScopeException);
+
+        AssertExtensions.assertFutureThrows("failing request",
+                controllerClient.listStreams(FAILING).getNext(),
+                e -> Exceptions.unwrap(e) instanceof RuntimeException);
     }
 
     @Test
@@ -865,21 +1425,21 @@ public class ControllerImplTest {
         assertTrue(deleteStatus.join());
 
         deleteStatus = controllerClient.deleteScope(scope2);
-        AssertExtensions.assertThrows("Server should throw exception", deleteStatus, Throwable -> true);
+        AssertExtensions.assertFutureThrows("Server should throw exception", deleteStatus, Throwable -> true);
 
         deleteStatus = controllerClient.deleteScope(scope3);
-        AssertExtensions.assertThrows("Server should throw exception", deleteStatus, Throwable -> true);
+        AssertExtensions.assertFutureThrows("Server should throw exception", deleteStatus, Throwable -> true);
 
         deleteStatus = controllerClient.deleteScope(scope4);
         assertFalse(deleteStatus.join());
 
         deleteStatus = controllerClient.deleteScope(scope5);
-        AssertExtensions.assertThrows("Server should throw exception", deleteStatus, Throwable -> true);
+        AssertExtensions.assertFutureThrows("Server should throw exception", deleteStatus, Throwable -> true);
     }
 
     @Test
     public void testParallelCreateStream() throws Exception {
-        final ExecutorService executorService = Executors.newFixedThreadPool(10);
+        final ExecutorService executorService = ExecutorServiceHelpers.newScheduledThreadPool(10, "testParallelCreateStream");
         Semaphore createCount = new Semaphore(-19);
         AtomicBoolean success = new AtomicBoolean(true);
         for (int i = 0; i < 10; i++) {
@@ -887,10 +1447,8 @@ public class ControllerImplTest {
                 for (int j = 0; j < 2; j++) {
                     try {
                         CompletableFuture<Boolean> createStreamStatus;
-                        createStreamStatus = controllerClient.createStream(
+                        createStreamStatus = controllerClient.createStream("scope1", "streamparallel",
                                 StreamConfiguration.builder()
-                                        .streamName("streamparallel")
-                                        .scope("scope1")
                                         .scalingPolicy(ScalingPolicy.fixed(1))
                                         .build());
                         log.info("{}", createStreamStatus.get());
@@ -907,13 +1465,13 @@ public class ControllerImplTest {
             });
         }
         createCount.acquire();
-        executorService.shutdownNow();
+        ExecutorServiceHelpers.shutdown(executorService);
         assertTrue(success.get());
     }
 
     @Test
     public void testParallelGetCurrentSegments() throws Exception {
-        final ExecutorService executorService = Executors.newFixedThreadPool(10);
+        final ExecutorService executorService = ExecutorServiceHelpers.newScheduledThreadPool(10, "testParallelGetCurrentSegments");
         Semaphore createCount = new Semaphore(-19);
         AtomicBoolean success = new AtomicBoolean(true);
         for (int i = 0; i < 10; i++) {
@@ -939,7 +1497,136 @@ public class ControllerImplTest {
             });
         }
         createCount.acquire();
-        executorService.shutdownNow();
+        ExecutorServiceHelpers.shutdown(executorService);
         assertTrue(success.get());
+    }
+
+    @Test
+    public void testDeadline() {
+        @Cleanup
+        final ControllerImpl controller = new ControllerImpl( ControllerImplConfig.builder()
+                                                                   .clientConfig(
+                                                                           ClientConfig.builder()
+                                                                                       .controllerURI(URI.create((testSecure ? "tls://" : "tcp://") + "localhost:" + serverPort))
+                                                                                       .credentials(new DefaultCredentials("1111_aaaa", "admin"))
+                                                                                       .trustStore(SecurityConfigDefaults.TLS_CA_CERT_PATH)
+                                                                                       .build())
+                                                                                  .timeoutMillis(200)
+                                                                   .retryAttempts(1).build(), executor);
+        Predicate<Throwable> deadlinePredicate = e -> {
+            Throwable unwrapped = Exceptions.unwrap(e);
+            if (unwrapped instanceof RetriesExhaustedException) {
+                unwrapped = Exceptions.unwrap(unwrapped.getCause());
+            }
+            StatusRuntimeException exception = (StatusRuntimeException) unwrapped;
+            Status.Code code = exception.getStatus().getCode();
+            return code.equals(Status.Code.DEADLINE_EXCEEDED);
+        };
+
+        String deadline = "deadline";
+        
+        // region scope
+        CompletableFuture<Boolean> scopeFuture = controller.createScope(deadline);
+        AssertExtensions.assertFutureThrows("", scopeFuture, deadlinePredicate);
+
+        CompletableFuture<Boolean> deleteScopeFuture = controller.deleteScope(deadline);
+        AssertExtensions.assertFutureThrows("", deleteScopeFuture, deadlinePredicate);
+
+        CompletableFuture<Void> listFuture = controller.listStreams(deadline).collectRemaining(x -> true);
+        AssertExtensions.assertFutureThrows("", listFuture, deadlinePredicate);
+        // endregion
+
+        CompletableFuture<String> tokenFuture = controller.getOrRefreshDelegationTokenFor(deadline, deadline);
+        AssertExtensions.assertFutureThrows("", tokenFuture, deadlinePredicate);
+
+        // region stream
+        CompletableFuture<Boolean> createStreamFuture = controller.createStream(deadline, deadline,
+                StreamConfiguration.builder().scalingPolicy(ScalingPolicy.fixed(1)).build());
+        AssertExtensions.assertFutureThrows("", createStreamFuture, deadlinePredicate);
+        
+        Stream stream = Stream.of(deadline, deadline);
+
+        CompletableFuture<PravegaNodeUri> getEndpointFuture = controller.getEndpointForSegment(
+                NameUtils.getQualifiedStreamSegmentName(deadline, deadline, 0L));
+        AssertExtensions.assertFutureThrows("", getEndpointFuture, deadlinePredicate);
+
+        CompletableFuture<StreamSegments> getSegmentFuture = controller.getCurrentSegments(deadline, deadline);
+        AssertExtensions.assertFutureThrows("", getSegmentFuture, deadlinePredicate);
+
+        CompletableFuture<Map<Segment, Long>> getSegmentsAtTimeFuture = controller.getSegmentsAtTime(stream, 0L);
+        AssertExtensions.assertFutureThrows("", getSegmentsAtTimeFuture, deadlinePredicate);
+        
+        CompletableFuture<StreamSegments> currentSegmentsFuture = controller.getCurrentSegments(deadline, deadline);
+        AssertExtensions.assertFutureThrows("", currentSegmentsFuture, deadlinePredicate);
+
+        Segment segment = new Segment(deadline, deadline, 0L);
+
+        CompletableFuture<Boolean> isSegmentOpenFuture = controller.isSegmentOpen(segment);
+        AssertExtensions.assertFutureThrows("", isSegmentOpenFuture, deadlinePredicate);
+
+        CompletableFuture<StreamSegmentsWithPredecessors> successorFuture = controller.getSuccessors(segment);
+        AssertExtensions.assertFutureThrows("", successorFuture, deadlinePredicate);
+
+        StreamCut streamCut = new StreamCutImpl(stream, Collections.emptyMap());
+
+        CompletableFuture<StreamSegmentSuccessors> streamCutFuture = controller.getSegments(streamCut, streamCut);
+        AssertExtensions.assertFutureThrows("", streamCutFuture, deadlinePredicate);
+
+        CompletableFuture<StreamSegmentSuccessors> streamcutSuccessorsFuture = controller.getSuccessors(streamCut);
+        AssertExtensions.assertFutureThrows("", streamcutSuccessorsFuture, deadlinePredicate);
+
+        CompletableFuture<Boolean> updateFuture = controller.updateStream(deadline, deadline, 
+                StreamConfiguration.builder().build());
+        AssertExtensions.assertFutureThrows("", updateFuture, deadlinePredicate);
+        
+        CompletableFuture<Boolean> scaleFuture = controller.scaleStream(stream,
+                Collections.emptyList(), Collections.emptyMap(), executor).getFuture();
+        AssertExtensions.assertFutureThrows("", scaleFuture, deadlinePredicate);
+
+        CompletableFuture<Boolean> scaleStatusFuture = controller.checkScaleStatus(stream, 0);
+        AssertExtensions.assertFutureThrows("", scaleStatusFuture, deadlinePredicate);
+        
+        CompletableFuture<Boolean> truncateFuture = controller.truncateStream(deadline, deadline, 
+                new StreamCutImpl(Stream.of(deadline, deadline), Collections.emptyMap()));
+        AssertExtensions.assertFutureThrows("", truncateFuture, deadlinePredicate);
+        
+        CompletableFuture<Boolean> sealFuture = controller.sealStream(deadline, deadline);
+        AssertExtensions.assertFutureThrows("", sealFuture, deadlinePredicate);
+        
+        CompletableFuture<Boolean> deleteFuture = controller.deleteStream(deadline, deadline);
+        AssertExtensions.assertFutureThrows("", deleteFuture, deadlinePredicate);
+
+        // endregion
+        
+        // region transaction
+        CompletableFuture<TxnSegments> createtxnFuture = controller.createTransaction(stream, 100L);
+        AssertExtensions.assertFutureThrows("", createtxnFuture, deadlinePredicate);
+
+        CompletableFuture<Transaction.PingStatus> pingTxnFuture = controller.pingTransaction(stream, UUID.randomUUID(), 100L);
+        AssertExtensions.assertFutureThrows("", pingTxnFuture, deadlinePredicate);
+
+        CompletableFuture<Void> abortFuture = controller.abortTransaction(stream, UUID.randomUUID());
+        AssertExtensions.assertFutureThrows("", abortFuture, deadlinePredicate);
+
+        CompletableFuture<Void> commitFuture = controller.commitTransaction(stream, "", 0L, UUID.randomUUID());
+        AssertExtensions.assertFutureThrows("", commitFuture, deadlinePredicate);
+
+        CompletableFuture<Transaction.Status> txnStatusFuture = controller.checkTransactionStatus(stream, UUID.randomUUID());
+        AssertExtensions.assertFutureThrows("", txnStatusFuture, deadlinePredicate);
+        
+        // endregion
+        
+        // region writer mark
+        CompletableFuture<Void> writerPosFuture = controller.noteTimestampFromWriter("deadline", stream, 0L, 
+                mock(WriterPosition.class));
+        AssertExtensions.assertFutureThrows("", writerPosFuture, deadlinePredicate);
+
+        CompletableFuture<Void> removeWriterFuture = controller.removeWriter("deadline", stream);
+        AssertExtensions.assertFutureThrows("", removeWriterFuture, deadlinePredicate);
+        // endregion
+        
+        // verify that a stub level deadline is not set and that the stub can still make successful calls for which we 
+        // have mocked successful responses.
+        controller.createScope("scope1").join();
     }
 }

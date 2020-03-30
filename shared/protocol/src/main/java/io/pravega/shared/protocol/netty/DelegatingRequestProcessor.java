@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,18 +9,16 @@
  */
 package io.pravega.shared.protocol.netty;
 
-import io.pravega.shared.protocol.netty.WireCommands.AbortTransaction;
-import io.pravega.shared.protocol.netty.WireCommands.CommitTransaction;
+import io.pravega.shared.protocol.netty.WireCommands.MergeSegments;
 import io.pravega.shared.protocol.netty.WireCommands.CreateSegment;
-import io.pravega.shared.protocol.netty.WireCommands.CreateTransaction;
 import io.pravega.shared.protocol.netty.WireCommands.DeleteSegment;
 import io.pravega.shared.protocol.netty.WireCommands.GetSegmentAttribute;
 import io.pravega.shared.protocol.netty.WireCommands.GetStreamSegmentInfo;
-import io.pravega.shared.protocol.netty.WireCommands.GetTransactionInfo;
 import io.pravega.shared.protocol.netty.WireCommands.KeepAlive;
 import io.pravega.shared.protocol.netty.WireCommands.ReadSegment;
 import io.pravega.shared.protocol.netty.WireCommands.SealSegment;
 import io.pravega.shared.protocol.netty.WireCommands.SetupAppend;
+import io.pravega.shared.protocol.netty.WireCommands.TruncateSegment;
 import io.pravega.shared.protocol.netty.WireCommands.UpdateSegmentAttribute;
 import io.pravega.shared.protocol.netty.WireCommands.UpdateSegmentPolicy;
 
@@ -61,12 +59,7 @@ public abstract class DelegatingRequestProcessor implements RequestProcessor {
     public void getStreamSegmentInfo(GetStreamSegmentInfo getStreamInfo) {
         getNextRequestProcessor().getStreamSegmentInfo(getStreamInfo);
     }
-    
-    @Override
-    public void getTransactionInfo(GetTransactionInfo getTransactionInfo) {
-        getNextRequestProcessor().getTransactionInfo(getTransactionInfo);
-    }
-    
+
     @Override
     public void createSegment(CreateSegment createStreamsSegment) {
         getNextRequestProcessor().createSegment(createStreamsSegment);
@@ -77,25 +70,19 @@ public abstract class DelegatingRequestProcessor implements RequestProcessor {
         getNextRequestProcessor().updateSegmentPolicy(updateSegmentPolicy);
     }
 
-
     @Override
-    public void createTransaction(CreateTransaction createTransaction) {
-        getNextRequestProcessor().createTransaction(createTransaction);
+    public void mergeSegments(MergeSegments mergeSegments) {
+        getNextRequestProcessor().mergeSegments(mergeSegments);
     }
 
-    @Override
-    public void commitTransaction(CommitTransaction commitTransaction) {
-        getNextRequestProcessor().commitTransaction(commitTransaction);
-    }
-
-    @Override
-    public void abortTransaction(AbortTransaction abortTransaction) {
-        getNextRequestProcessor().abortTransaction(abortTransaction);
-    }
-    
     @Override
     public void sealSegment(SealSegment sealSegment) {
         getNextRequestProcessor().sealSegment(sealSegment);
+    }
+
+    @Override
+    public void truncateSegment(TruncateSegment truncateSegment) {
+        getNextRequestProcessor().truncateSegment(truncateSegment);
     }
 
     @Override
@@ -106,6 +93,51 @@ public abstract class DelegatingRequestProcessor implements RequestProcessor {
     @Override
     public void keepAlive(KeepAlive keepAlive) {
         getNextRequestProcessor().keepAlive(keepAlive);
+    }
+
+    @Override
+    public void mergeTableSegments(WireCommands.MergeTableSegments mergeSegments) {
+       getNextRequestProcessor().mergeTableSegments(mergeSegments);
+    }
+
+    @Override
+    public void sealTableSegment(WireCommands.SealTableSegment sealTableSegment) {
+        getNextRequestProcessor().sealTableSegment(sealTableSegment);
+    }
+
+    @Override
+    public void createTableSegment(WireCommands.CreateTableSegment createTableSegment) {
+        getNextRequestProcessor().createTableSegment(createTableSegment);
+    }
+
+    @Override
+    public void deleteTableSegment(WireCommands.DeleteTableSegment deleteSegment) {
+        getNextRequestProcessor().deleteTableSegment(deleteSegment);
+    }
+
+    @Override
+    public void updateTableEntries(WireCommands.UpdateTableEntries tableEntries) {
+        getNextRequestProcessor().updateTableEntries(tableEntries);
+    }
+
+    @Override
+    public void removeTableKeys(WireCommands.RemoveTableKeys tableKeys) {
+        getNextRequestProcessor().removeTableKeys(tableKeys);
+    }
+
+    @Override
+    public void readTable(WireCommands.ReadTable readTable) {
+        getNextRequestProcessor().readTable(readTable);
+    }
+
+    @Override
+    public void readTableKeys(WireCommands.ReadTableKeys readTableKeys) {
+        getNextRequestProcessor().readTableKeys(readTableKeys);
+    }
+
+    @Override
+    public void readTableEntries(WireCommands.ReadTableEntries readTableEntries) {
+        getNextRequestProcessor().readTableEntries(readTableEntries);
     }
 
 }

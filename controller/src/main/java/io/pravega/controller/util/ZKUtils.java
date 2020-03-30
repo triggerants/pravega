@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,6 @@ import lombok.extern.slf4j.Slf4j;
 
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.zookeeper.KeeperException;
-import org.apache.zookeeper.Watcher;
-import org.apache.zookeeper.ZooKeeper;
-
-import java.util.concurrent.CountDownLatch;
 
 /**
  * Helper ZK functions.
@@ -50,28 +46,4 @@ public final class ZKUtils {
             throw new RuntimeException("Exception while creating znode: " + basePath, e);
         }
     }
-
-    /**
-     * Simulates ZK session expiry. Refer https://wiki.apache.org/hadoop/ZooKeeper/FAQ#A4
-     *
-     * @param curatorClient Curator client object
-     * @throws Exception Error fetching sessionId or sessionPassword from curator client
-     */
-    public static void simulateZkSessionExpiry(CuratorFramework curatorClient) throws Exception {
-        final long sessionId = curatorClient.getZookeeperClient().getZooKeeper().getSessionId();
-        final byte[] sessionPwd = curatorClient.getZookeeperClient().getZooKeeper().getSessionPasswd();
-        CountDownLatch connectedLatch = new CountDownLatch(1);
-        // Create a new ZK client with the same sessionId an sessionPwd as original one.
-        ZooKeeper zk2 = new ZooKeeper(curatorClient.getZookeeperClient().getCurrentConnectionString(),
-                5000, event -> {
-            if (event.getState() == Watcher.Event.KeeperState.SyncConnected) {
-                connectedLatch.countDown();
-            }
-        }, sessionId, sessionPwd);
-        // Await its connection.
-        connectedLatch.await();
-        // Close connection. This will cause original session to expire.
-        zk2.close();
-    }
-
 }

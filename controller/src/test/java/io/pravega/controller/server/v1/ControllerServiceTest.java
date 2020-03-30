@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,28 +9,48 @@
  */
 package io.pravega.controller.server.v1;
 
-import io.pravega.test.common.TestingServerStarter;
-import io.pravega.controller.mocks.SegmentHelperMock;
-import io.pravega.controller.server.ControllerService;
-import io.pravega.controller.server.SegmentHelper;
-import io.pravega.controller.store.host.HostControllerStore;
-import io.pravega.controller.store.host.HostStoreFactory;
-import io.pravega.controller.store.host.impl.HostMonitorConfigImpl;
-import io.pravega.controller.store.stream.Segment;
-import io.pravega.controller.store.stream.StreamMetadataStore;
-import io.pravega.controller.store.stream.StreamStoreFactory;
-import io.pravega.controller.store.task.TaskMetadataStore;
-import io.pravega.controller.store.task.TaskStoreFactory;
-import io.pravega.controller.stream.api.grpc.v1.Controller.SegmentId;
-import io.pravega.controller.task.Stream.StreamMetadataTasks;
-import io.pravega.controller.task.Stream.StreamTransactionMetadataTasks;
-import io.pravega.controller.timeout.TimeoutService;
-import io.pravega.controller.timeout.TimeoutServiceConfig;
-import io.pravega.controller.timeout.TimerWheelTimeoutService;
+import io.pravega.client.ClientConfig;
 import io.pravega.client.netty.impl.ConnectionFactoryImpl;
 import io.pravega.client.stream.ScalingPolicy;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.impl.ModelHelper;
+import io.pravega.common.Exceptions;
+import io.pravega.common.concurrent.ExecutorServiceHelpers;
+import io.pravega.common.tracing.RequestTracker;
+import io.pravega.controller.metrics.TransactionMetrics;
+import io.pravega.controller.mocks.SegmentHelperMock;
+import io.pravega.controller.server.ControllerService;
+import io.pravega.controller.server.SegmentHelper;
+import io.pravega.controller.server.rpc.auth.GrpcAuthHelper;
+import io.pravega.controller.store.host.HostControllerStore;
+import io.pravega.controller.store.host.HostStoreFactory;
+import io.pravega.controller.store.host.impl.HostMonitorConfigImpl;
+import io.pravega.controller.store.stream.BucketStore;
+import io.pravega.controller.store.stream.OperationContext;
+import io.pravega.controller.store.stream.StoreException;
+import io.pravega.controller.store.stream.StreamMetadataStore;
+import io.pravega.controller.store.stream.StreamStoreFactory;
+import io.pravega.controller.store.stream.VersionedMetadata;
+import io.pravega.controller.store.stream.State;
+import io.pravega.controller.store.stream.records.EpochTransitionRecord;
+import io.pravega.controller.store.task.TaskMetadataStore;
+import io.pravega.controller.store.task.TaskStoreFactory;
+import io.pravega.controller.stream.api.grpc.v1.Controller;
+import io.pravega.controller.stream.api.grpc.v1.Controller.SegmentId;
+import io.pravega.controller.task.Stream.StreamMetadataTasks;
+import io.pravega.controller.task.Stream.StreamTransactionMetadataTasks;
+import io.pravega.test.common.AssertExtensions;
+import io.pravega.test.common.TestingServerStarter;
+import java.util.AbstractMap.SimpleEntry;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.stream.Collectors;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.retry.ExponentialBackoffRetry;
@@ -39,16 +59,9 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.util.AbstractMap.SimpleEntry;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-
 import static org.junit.Assert.assertEquals;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
 
 /**
  * Controller service implementation test.
@@ -60,20 +73,23 @@ public class ControllerServiceTest {
     private final String stream2 = "stream2";
     private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(10);
 
-    private final StreamMetadataStore streamStore = StreamStoreFactory.createInMemoryStore(executor);
+    private final StreamMetadataStore streamStore = spy(StreamStoreFactory.createInMemoryStore(executor));
 
-    private final TimeoutService timeoutService;
-    private final StreamMetadataTasks streamMetadataTasks;
-    private final StreamTransactionMetadataTasks streamTransactionMetadataTasks;
-    private final ConnectionFactoryImpl connectionFactory;
-    private final ControllerService consumer;
+    private StreamMetadataTasks streamMetadataTasks;
+    private StreamTransactionMetadataTasks streamTransactionMetadataTasks;
+    private ConnectionFactoryImpl connectionFactory;
+    private ControllerService consumer;
 
-    private final CuratorFramework zkClient;
-    private final TestingServer zkServer;
+    private CuratorFramework zkClient;
+    private TestingServer zkServer;
 
     private long startTs;
+    private long scaleTs;
 
-    public ControllerServiceTest() throws Exception {
+    private RequestTracker requestTracker = new RequestTracker(true);
+    
+    @Before
+    public void setup() throws Exception {
         zkServer = new TestingServerStarter().start();
         zkServer.start();
         zkClient = CuratorFrameworkFactory.newClient(zkServer.getConnectString(),
@@ -82,94 +98,148 @@ public class ControllerServiceTest {
 
         final TaskMetadataStore taskMetadataStore = TaskStoreFactory.createZKStore(zkClient, executor);
         final HostControllerStore hostStore = HostStoreFactory.createInMemoryStore(HostMonitorConfigImpl.dummyConfig());
+        BucketStore bucketStore = StreamStoreFactory.createInMemoryBucketStore();
+        connectionFactory = new ConnectionFactoryImpl(ClientConfig.builder().build());
 
         SegmentHelper segmentHelper = SegmentHelperMock.getSegmentHelperMock();
-        connectionFactory = new ConnectionFactoryImpl(false);
-        streamMetadataTasks = new StreamMetadataTasks(streamStore, hostStore,
-                taskMetadataStore, segmentHelper, executor, "host", connectionFactory);
+        streamMetadataTasks = new StreamMetadataTasks(streamStore, bucketStore, taskMetadataStore,
+                segmentHelper, executor, "host", GrpcAuthHelper.getDisabledAuthHelper(), requestTracker);
         streamTransactionMetadataTasks = new StreamTransactionMetadataTasks(streamStore,
-                hostStore, taskMetadataStore, segmentHelper, executor, "host", connectionFactory);
-        timeoutService = new TimerWheelTimeoutService(streamTransactionMetadataTasks,
-                TimeoutServiceConfig.defaultConfig());
+                segmentHelper, executor, "host", GrpcAuthHelper.getDisabledAuthHelper());
 
-        consumer = new ControllerService(streamStore, hostStore, streamMetadataTasks, streamTransactionMetadataTasks,
-                timeoutService, new SegmentHelper(), executor, null);
-    }
-
-    @Before
-    public void setup() throws ExecutionException, InterruptedException {
+        consumer = new ControllerService(streamStore, bucketStore, streamMetadataTasks, streamTransactionMetadataTasks,
+                new SegmentHelper(connectionFactory, hostStore), executor, null);
 
         final ScalingPolicy policy1 = ScalingPolicy.fixed(2);
         final ScalingPolicy policy2 = ScalingPolicy.fixed(3);
-        final StreamConfiguration configuration1 = StreamConfiguration.builder().scope(SCOPE).streamName(stream1).scalingPolicy(policy1).build();
-        final StreamConfiguration configuration2 = StreamConfiguration.builder().scope(SCOPE).streamName(stream2).scalingPolicy(policy2).build();
+        final StreamConfiguration configuration1 = StreamConfiguration.builder().scalingPolicy(policy1).build();
+        final StreamConfiguration configuration2 = StreamConfiguration.builder().scalingPolicy(policy2).build();
 
         // createScope
         streamStore.createScope(SCOPE).get();
 
         // region createStream
         startTs = System.currentTimeMillis();
-        streamStore.createStream(SCOPE, stream1, configuration1, startTs, null, executor).get();
-        streamStore.createStream(SCOPE, stream2, configuration2, startTs, null, executor).get();
+        OperationContext context = streamStore.createContext(SCOPE, stream1);
+        streamStore.createStream(SCOPE, stream1, configuration1, startTs, context, executor).get();
+        streamStore.setState(SCOPE, stream1, State.ACTIVE, context, executor);
+
+        OperationContext context2 = streamStore.createContext(SCOPE, stream2);
+        streamStore.createStream(SCOPE, stream2, configuration2, startTs, context2, executor).get();
+        streamStore.setState(SCOPE, stream2, State.ACTIVE, context2, executor);
+
         // endregion
 
         // region scaleSegments
 
         SimpleEntry<Double, Double> segment1 = new SimpleEntry<>(0.5, 0.75);
         SimpleEntry<Double, Double> segment2 = new SimpleEntry<>(0.75, 1.0);
-        List<Integer> sealedSegments = Collections.singletonList(1);
-
-        List<Segment> segmentCreated = streamStore.startScale(SCOPE, stream1, sealedSegments, Arrays.asList(segment1, segment2), startTs + 20, null, executor).get();
-        streamStore.scaleNewSegmentsCreated(SCOPE, stream1, sealedSegments, segmentCreated, startTs + 20, null, executor).get();
-        streamStore.scaleSegmentsSealed(SCOPE, stream1, sealedSegments, segmentCreated, startTs + 20, null, executor).get();
+        List<Long> sealedSegments = Collections.singletonList(1L);
+        scaleTs = System.currentTimeMillis();
+        VersionedMetadata<EpochTransitionRecord> record = streamStore.submitScale(SCOPE, stream1, sealedSegments, Arrays.asList(segment1, segment2), startTs,
+                null, null, executor).get();
+        VersionedMetadata<State> state = streamStore.getVersionedState(SCOPE, stream1, null, executor).get();
+        state = streamStore.updateVersionedState(SCOPE, stream1, State.SCALING, state, null, executor).get();
+        record = streamStore.startScale(SCOPE, stream1, false, record, state, null, executor).get();
+        streamStore.scaleCreateNewEpochs(SCOPE, stream1, record, null, executor).get();
+        streamStore.scaleSegmentsSealed(SCOPE, stream1, sealedSegments.stream().collect(Collectors.toMap(x -> x, x -> 0L)), record,
+                null, executor).get();
+        streamStore.completeScale(SCOPE, stream1, record, null, executor).get();
+        streamStore.setState(SCOPE, stream1, State.ACTIVE, null, executor).get();
 
         SimpleEntry<Double, Double> segment3 = new SimpleEntry<>(0.0, 0.5);
         SimpleEntry<Double, Double> segment4 = new SimpleEntry<>(0.5, 0.75);
         SimpleEntry<Double, Double> segment5 = new SimpleEntry<>(0.75, 1.0);
-        sealedSegments = Arrays.asList(0, 1, 2);
-        segmentCreated = streamStore.startScale(SCOPE, stream2, sealedSegments, Arrays.asList(segment3, segment4, segment5), startTs + 20, null, executor).get();
-        streamStore.scaleNewSegmentsCreated(SCOPE, stream2, sealedSegments, segmentCreated, startTs + 20, null, executor).get();
-        streamStore.scaleSegmentsSealed(SCOPE, stream2, sealedSegments, segmentCreated, startTs + 20, null, executor).get();
+        sealedSegments = Arrays.asList(0L, 1L, 2L);
+        record = streamStore.submitScale(SCOPE, stream2, sealedSegments, Arrays.asList(segment3, segment4, segment5),
+                scaleTs, null, null, executor).get();
+        state = streamStore.getVersionedState(SCOPE, stream2, null, executor).get();
+        state = streamStore.updateVersionedState(SCOPE, stream2, State.SCALING, state, null, executor).get();
+        record = streamStore.startScale(SCOPE, stream2, false, record, state, null, executor).get();
+        streamStore.scaleCreateNewEpochs(SCOPE, stream2, record, null, executor).get();
+        streamStore.scaleSegmentsSealed(SCOPE, stream2, sealedSegments.stream().collect(Collectors.toMap(x -> x, x -> 0L)), record,
+                null, executor).get();
+        streamStore.completeScale(SCOPE, stream2, record, null, executor).get();
+        streamStore.setState(SCOPE, stream2, State.ACTIVE, null, executor).get();
+
         // endregion
     }
 
     @After
     public void tearDown() throws Exception {
-        timeoutService.stopAsync();
-        timeoutService.awaitTerminated();
         streamTransactionMetadataTasks.close();
         streamMetadataTasks.close();
         connectionFactory.close();
+        streamStore.close();
         zkClient.close();
         zkServer.close();
-        executor.shutdown();
+        ExecutorServiceHelpers.shutdown(executor);
     }
 
-    @Test
+    @Test(timeout = 10000L)
     public void testMethods() throws InterruptedException, ExecutionException {
         Map<SegmentId, Long> segments;
 
-        segments = consumer.getSegmentsAtTime(SCOPE, stream1, startTs + 10).get();
+        segments = consumer.getSegmentsAtHead(SCOPE, stream1).get();
         assertEquals(2, segments.size());
         assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream1, 0)));
         assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream1, 1)));
 
-        segments = consumer.getSegmentsAtTime(SCOPE, stream2, startTs + 10).get();
+        segments = consumer.getSegmentsAtHead(SCOPE, stream1).get();
+        assertEquals(2, segments.size());
+        assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream1, 0)));
+        assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream1, 1)));
+
+        segments = consumer.getSegmentsAtHead(SCOPE, stream2).get();
         assertEquals(3, segments.size());
         assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream2, 0)));
         assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream2, 1)));
         assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream2, 2)));
 
-        segments = consumer.getSegmentsAtTime(SCOPE, stream1, startTs + 25).get();
+        segments = consumer.getSegmentsAtHead(SCOPE, stream2).get();
         assertEquals(3, segments.size());
-        assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream1, 0)));
-        assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream1, 2)));
-        assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream1, 3)));
+        assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream2, 0)));
+        assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream2, 1)));
+        assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream2, 2)));
+    }
+    
+    @Test(timeout = 10000L)
+    public void testTransactions() {
+        TransactionMetrics.initialize();
+        UUID txnId = consumer.createTransaction(SCOPE, stream1, 10000L).join().getKey();
+        doThrow(StoreException.create(StoreException.Type.WRITE_CONFLICT, "Write conflict"))
+                .when(streamStore).sealTransaction(eq(SCOPE), eq(stream1), eq(txnId), anyBoolean(), any(), anyString(), anyLong(), 
+                any(), any());
 
-        segments = consumer.getSegmentsAtTime(SCOPE, stream2, startTs + 25).get();
-        assertEquals(3, segments.size());
-        assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream2, 3)));
-        assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream2, 4)));
-        assertEquals(Long.valueOf(0), segments.get(ModelHelper.createSegmentId(SCOPE, stream2, 5)));
+        AssertExtensions.assertFutureThrows("Write conflict should have been thrown", 
+                consumer.commitTransaction(SCOPE, stream1, txnId, "", 0L),
+                e -> Exceptions.unwrap(e) instanceof StoreException.WriteConflictException);
+
+        AssertExtensions.assertFutureThrows("Write conflict should have been thrown", 
+                consumer.abortTransaction(SCOPE, stream1, txnId),
+                e -> Exceptions.unwrap(e) instanceof StoreException.WriteConflictException);
+
+        doThrow(StoreException.create(StoreException.Type.CONNECTION_ERROR, "Connection failed"))
+                .when(streamStore).sealTransaction(eq(SCOPE), eq(stream1), eq(txnId), anyBoolean(), any(), anyString(), anyLong(), 
+                any(), any());
+
+        AssertExtensions.assertFutureThrows("Store connection exception should have been thrown",
+                consumer.commitTransaction(SCOPE, stream1, txnId, "", 0L),
+                e -> Exceptions.unwrap(e) instanceof StoreException.StoreConnectionException);
+
+        AssertExtensions.assertFutureThrows("Store connection exception should have been thrown",
+                consumer.abortTransaction(SCOPE, stream1, txnId),
+                e -> Exceptions.unwrap(e) instanceof StoreException.StoreConnectionException);
+
+        doThrow(StoreException.create(StoreException.Type.UNKNOWN, "Connection failed"))
+                .when(streamStore).sealTransaction(eq(SCOPE), eq(stream1), eq(txnId), anyBoolean(), any(), anyString(), anyLong(), 
+                any(), any());
+
+        Controller.TxnStatus status = consumer.commitTransaction(SCOPE, stream1, txnId, "", 0L).join();
+        assertEquals(status.getStatus(), Controller.TxnStatus.Status.FAILURE);
+        
+        status = consumer.abortTransaction(SCOPE, stream1, txnId).join();
+        assertEquals(status.getStatus(), Controller.TxnStatus.Status.FAILURE);
+        reset(streamStore);
     }
 }

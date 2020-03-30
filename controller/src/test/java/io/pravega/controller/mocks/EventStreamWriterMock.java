@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,19 +9,15 @@
  */
 package io.pravega.controller.mocks;
 
-import io.pravega.client.stream.AckFuture;
 import io.pravega.client.stream.EventStreamReader;
 import io.pravega.client.stream.EventStreamWriter;
 import io.pravega.client.stream.EventWriterConfig;
-import io.pravega.client.stream.Transaction;
-import org.apache.commons.lang.NotImplementedException;
-
 import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
+import org.apache.commons.lang3.NotImplementedException;
 
 /**
  * Mock EventStreamWriter.
@@ -30,35 +26,25 @@ public class EventStreamWriterMock<T> implements EventStreamWriter<T> {
     BlockingQueue<T> eventList = new LinkedBlockingQueue<>();
 
     @Override
-    public AckFuture writeEvent(T event) {
+    public CompletableFuture<Void> writeEvent(T event) {
         eventList.add(event);
-        return new AckFutureMock(CompletableFuture.completedFuture(true));
+        return CompletableFuture.completedFuture(null);
     }
 
     @Override
-    public AckFuture writeEvent(String routingKey, T event) {
+    public CompletableFuture<Void> writeEvent(String routingKey, T event) {
         eventList.add(event);
-        return new AckFutureMock(CompletableFuture.completedFuture(true));
-    }
-
-    @Override
-    public Transaction<T> beginTxn(long transactionTimeout, long maxExecutionTime, long scaleGracePeriod) {
-        throw new NotImplementedException();
-    }
-
-    @Override
-    public Transaction<T> getTxn(UUID transactionId) {
-        throw new NotImplementedException();
+        return CompletableFuture.completedFuture(null);
     }
 
     @Override
     public EventWriterConfig getConfig() {
-        throw new NotImplementedException();
+        throw new NotImplementedException("getClientConfig");
     }
 
     @Override
     public void flush() {
-        throw new NotImplementedException();
+        throw new NotImplementedException("flush");
     }
 
     @Override
@@ -74,5 +60,10 @@ public class EventStreamWriterMock<T> implements EventStreamWriter<T> {
 
     public EventStreamReader<T> getReader() {
         return new EventStreamReaderMock<>(eventList);
+    }
+
+    @Override
+    public void noteTime(long timestamp) {
+        throw new NotImplementedException("noteTime");
     }
 }

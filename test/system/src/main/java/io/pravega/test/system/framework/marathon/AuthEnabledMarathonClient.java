@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,7 +9,6 @@
  */
 package io.pravega.test.system.framework.marathon;
 
-import io.pravega.test.system.framework.LoginClient;
 import feign.Feign;
 import feign.Logger;
 import feign.RequestInterceptor;
@@ -20,12 +19,12 @@ import feign.Retryer;
 import feign.codec.ErrorDecoder;
 import feign.gson.GsonDecoder;
 import feign.gson.GsonEncoder;
+import io.pravega.test.system.framework.LoginClient;
+import java.util.Calendar;
+import mesosphere.client.common.ModelUtils;
 import mesosphere.marathon.client.Marathon;
 import mesosphere.marathon.client.auth.TokenAuthRequestInterceptor;
-import mesosphere.marathon.client.utils.MarathonException;
-import mesosphere.marathon.client.utils.ModelUtils;
-
-import java.util.Calendar;
+import mesosphere.marathon.client.MarathonException;
 
 import static io.netty.handler.codec.http.HttpResponseStatus.INTERNAL_SERVER_ERROR;
 import static io.netty.handler.codec.http.HttpResponseStatus.SERVICE_UNAVAILABLE;
@@ -71,7 +70,7 @@ public class AuthEnabledMarathonClient {
     }
 
     private static Marathon createMarathonClient() {
-        String token = LoginClient.getAuthToken(LOGIN_URL, LoginClient.getAuthenticationRequestInterceptor());
+        String token = LoginClient.getAuthToken(LOGIN_URL);
         return getInstance(ENDPOINT, new TokenAuthRequestInterceptor(token));
     }
 

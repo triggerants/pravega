@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,7 +10,6 @@
 package io.pravega.segmentstore.server;
 
 import io.pravega.common.util.ImmutableDate;
-
 import java.util.Map;
 import java.util.UUID;
 
@@ -27,12 +26,21 @@ public interface UpdateableSegmentMetadata extends SegmentMetadata {
     void setStorageLength(long value);
 
     /**
-     * Sets the current DurableLog Length for this StreamSegment.
+     * Sets the first offset available for reading for this StreamSegment. This essentially marks the Segment as truncated
+     * at this offset.
      *
-     * @param value The new DurableLog length.
+     * @param value The new first available offset.
      * @throws IllegalArgumentException If the value is invalid.
      */
-    void setDurableLogLength(long value);
+    void setStartOffset(long value);
+
+    /**
+     * Sets the current Length for this StreamSegment.
+     *
+     * @param value The new length.
+     * @throws IllegalArgumentException If the value is invalid.
+     */
+    void setLength(long value);
 
     /**
      * Marks this StreamSegment as sealed for modifications.
@@ -41,8 +49,8 @@ public interface UpdateableSegmentMetadata extends SegmentMetadata {
 
     /**
      * Marks this StreamSegment as sealed in Storage.
-     * This is different from markSealed() in that markSealed() indicates it was sealed in DurableLog, which this indicates
-     * this fact has been persisted in Storage.
+     * This is different from {@link #markSealed()} in that {@link #markSealed()} indicates it was sealed in the Metadata,
+     * while this indicates this fact has been persisted in Storage.
      */
     void markSealedInStorage();
 
@@ -52,9 +60,21 @@ public interface UpdateableSegmentMetadata extends SegmentMetadata {
     void markDeleted();
 
     /**
+     * Marks this StreamSegment as deleted in Storage.
+     * This is different from markDeleted() in that markDeleted() indicates it was deleted in the Metadata, while this
+     * indicates the Segment has been deleted from Storage.
+     */
+    void markDeletedInStorage();
+
+    /**
      * Marks this StreamSegment as merged.
      */
     void markMerged();
+
+    /**
+     * Marks this StreamSegment as pinned to memory. See {@link SegmentMetadata#isPinned()} for more details.
+     */
+    void markPinned();
 
     /**
      * Sets/Updates the attributes for this StreamSegment to the exact values provided.
@@ -71,10 +91,10 @@ public interface UpdateableSegmentMetadata extends SegmentMetadata {
     void setLastModified(ImmutableDate date);
 
     /**
-     * Updates this instance of the UpdateableSegmentMetadata to have the same information as the other one.
+     * Updates this instance of the {@link UpdateableSegmentMetadata} to have the same information as the other one.
      *
      * @param other The SegmentMetadata to copy from.
-     * @throws IllegalArgumentException If the other SegmentMetadata refers to a different StreamSegment.
+     * @throws IllegalArgumentException If the other {@link SegmentMetadata} refers to a different StreamSegment.
      */
     void copyFrom(SegmentMetadata other);
 

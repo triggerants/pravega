@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,10 +9,8 @@
  */
 package io.pravega.shared.metrics;
 
-import com.codahale.metrics.MetricRegistry;
-
 public class MetricsProvider {
-    static final MetricRegistry METRIC_REGISTRY = new MetricRegistry();
+
     private static final StatsProviderProxy STATS_PROVIDER = new StatsProviderProxy();
     private static final DynamicLoggerProxy DYNAMIC_LOGGER = new DynamicLoggerProxy(STATS_PROVIDER.createDynamicLogger());
 

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,32 +9,38 @@
  */
 package io.pravega.segmentstore.server.host;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 import io.pravega.common.Exceptions;
+import io.pravega.common.auth.JKSHelper;
+import io.pravega.common.auth.ZKTLSUtils;
 import io.pravega.common.cluster.Host;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
+import io.pravega.segmentstore.contracts.tables.TableStore;
+import io.pravega.segmentstore.server.host.delegationtoken.TokenVerifierImpl;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
-import io.pravega.segmentstore.server.host.stat.SegmentStatsRecorder;
+import io.pravega.segmentstore.server.host.stat.AutoScaleMonitor;
 import io.pravega.segmentstore.server.host.stat.AutoScalerConfig;
-import io.pravega.segmentstore.server.host.stat.SegmentStatsFactory;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.segmentstore.server.store.ServiceConfig;
 import io.pravega.segmentstore.storage.impl.bookkeeper.BookKeeperConfig;
 import io.pravega.segmentstore.storage.impl.bookkeeper.BookKeeperLogFactory;
-import io.pravega.segmentstore.storage.impl.hdfs.HDFSStorageConfig;
-import io.pravega.segmentstore.storage.impl.hdfs.HDFSStorageFactory;
-import io.pravega.segmentstore.storage.impl.rocksdb.RocksDBCacheFactory;
-import io.pravega.segmentstore.storage.impl.rocksdb.RocksDBConfig;
+import io.pravega.segmentstore.storage.mocks.InMemoryDurableDataLogFactory;
 import io.pravega.shared.metrics.MetricsConfig;
 import io.pravega.shared.metrics.MetricsProvider;
 import io.pravega.shared.metrics.StatsProvider;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicReference;
-import lombok.Builder;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.retry.ExponentialBackoffRetry;
+import org.apache.curator.utils.ZookeeperFactory;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.ZooKeeper;
+
+import javax.annotation.concurrent.GuardedBy;
+import javax.annotation.concurrent.ThreadSafe;
 
 /**
  * Starts the Pravega Service.
@@ -48,7 +54,7 @@ public final class ServiceStarter {
     private final ServiceBuilder serviceBuilder;
     private StatsProvider statsProvider;
     private PravegaConnectionListener listener;
-    private SegmentStatsFactory segmentStatsFactory;
+    private AutoScaleMonitor autoScaleMonitor;
     private CuratorFramework zkClient;
     private boolean closed;
 
@@ -56,30 +62,17 @@ public final class ServiceStarter {
 
     //region Constructor
 
-    public ServiceStarter(ServiceBuilderConfig config, Options options) {
+    public ServiceStarter(ServiceBuilderConfig config) {
         this.builderConfig = config;
         this.serviceConfig = this.builderConfig.getConfig(ServiceConfig::builder);
-        this.serviceBuilder = createServiceBuilder(options);
+        this.serviceBuilder = createServiceBuilder();
     }
 
-    private ServiceBuilder createServiceBuilder(Options options) {
+    private ServiceBuilder createServiceBuilder() {
         ServiceBuilder builder = ServiceBuilder.newInMemoryBuilder(this.builderConfig);
-        if (options.bookKeeper) {
-            attachBookKeeper(builder);
-        }
-
-        if (options.rocksDb) {
-            attachRocksDB(builder);
-        }
-
-        if (options.hdfs) {
-            attachHDFS(builder);
-        }
-
-        if (options.zkSegmentManager) {
-            attachZKSegmentManager(builder);
-        }
-
+        attachDataLogFactory(builder);
+        attachStorage(builder);
+        attachZKSegmentManager(builder);
         return builder;
     }
 
@@ -104,13 +97,25 @@ public final class ServiceStarter {
         log.info("Creating StreamSegmentService ...");
         StreamSegmentStore service = this.serviceBuilder.createStreamSegmentService();
 
-        log.info("Creating Segment Stats recorder ...");
-        segmentStatsFactory = new SegmentStatsFactory();
-        SegmentStatsRecorder statsRecorder = segmentStatsFactory
-                .createSegmentStatsRecorder(service, builderConfig.getConfig(AutoScalerConfig::builder));
+        log.info("Creating TableStoreService ...");
+        TableStore tableStoreService = this.serviceBuilder.createTableStoreService();
 
-        this.listener = new PravegaConnectionListener(false, this.serviceConfig.getListeningIPAddress(),
-                this.serviceConfig.getListeningPort(), service, statsRecorder);
+        log.info("Creating Segment Stats recorder ...");
+        autoScaleMonitor = new AutoScaleMonitor(service, builderConfig.getConfig(AutoScalerConfig::builder));
+
+        TokenVerifierImpl tokenVerifier = new TokenVerifierImpl(builderConfig.getConfig(AutoScalerConfig::builder));
+
+        // Log the configuration
+        log.info(serviceConfig.toString());
+        log.info(builderConfig.getConfig(AutoScalerConfig::builder).toString());
+
+        this.listener = new PravegaConnectionListener(this.serviceConfig.isEnableTls(), this.serviceConfig.isEnableTlsReload(),
+                                                      this.serviceConfig.getListeningIPAddress(),
+                                                      this.serviceConfig.getListeningPort(), service, tableStoreService,
+                                                      autoScaleMonitor.getStatsRecorder(), autoScaleMonitor.getTableSegmentStatsRecorder(),
+                                                      tokenVerifier, this.serviceConfig.getCertFile(), this.serviceConfig.getKeyFile(),
+                                                      this.serviceConfig.isReplyWithStackTraceOnError());
+
         this.listener.startListening();
         log.info("PravegaConnectionListener started successfully.");
         log.info("StreamSegmentService started.");
@@ -138,31 +143,37 @@ public final class ServiceStarter {
                 log.info("ZooKeeper Client shut down.");
             }
 
-            if (this.segmentStatsFactory != null) {
-                segmentStatsFactory.close();
+            if (this.autoScaleMonitor != null) {
+                autoScaleMonitor.close();
+                autoScaleMonitor = null;
+                log.info("AutoScaleMonitor shut down.");
             }
 
+            if (this.serviceConfig.isSecureZK()) {
+                ZKTLSUtils.unsetSecureZKClientProperties();
+            }
             this.closed = true;
         }
     }
 
-    private void attachBookKeeper(ServiceBuilder builder) {
-        builder.withDataLogFactory(setup ->
-                new BookKeeperLogFactory(setup.getConfig(BookKeeperConfig::builder), this.zkClient, setup.getExecutor()));
-    }
-
-    private void attachRocksDB(ServiceBuilder builder) {
-        builder.withCacheFactory(setup -> new RocksDBCacheFactory(setup.getConfig(RocksDBConfig::builder)));
-    }
-
-    private void attachHDFS(ServiceBuilder builder) {
-        builder.withStorageFactory(setup -> {
-            try {
-                HDFSStorageConfig hdfsConfig = setup.getConfig(HDFSStorageConfig::builder);
-                return new HDFSStorageFactory(hdfsConfig, setup.getExecutor());
-            } catch (Exception ex) {
-                throw new CompletionException(ex);
+    private void attachDataLogFactory(ServiceBuilder builder) {
+        builder.withDataLogFactory(setup -> {
+            switch (this.serviceConfig.getDataLogTypeImplementation()) {
+                case BOOKKEEPER:
+                    return new BookKeeperLogFactory(setup.getConfig(BookKeeperConfig::builder), this.zkClient, setup.getCoreExecutor());
+                case INMEMORY:
+                    return new InMemoryDurableDataLogFactory(setup.getCoreExecutor());
+                default:
+                    throw new IllegalStateException("Unsupported storage implementation: " + this.serviceConfig.getDataLogTypeImplementation());
             }
+        });
+    }
+
+    private void attachStorage(ServiceBuilder builder) {
+        builder.withStorageFactory(setup -> {
+            StorageLoader loader = new StorageLoader();
+            return loader.load(setup, this.serviceConfig.getStorageImplementation().toString(), setup.getStorageExecutor());
+
         });
     }
 
@@ -170,19 +181,60 @@ public final class ServiceStarter {
         builder.withContainerManager(setup ->
                 new ZKSegmentContainerManager(setup.getContainerRegistry(),
                         this.zkClient,
-                        new Host(this.serviceConfig.getPublishedIPAddress(), this.serviceConfig.getPublishedPort(), null),
-                        setup.getExecutor()));
+                        new Host(this.serviceConfig.getPublishedIPAddress(),
+                                this.serviceConfig.getPublishedPort(), null),
+                        setup.getCoreExecutor()));
     }
 
-    private CuratorFramework createZKClient() {
+    @VisibleForTesting
+    public CuratorFramework createZKClient() {
+        if (this.serviceConfig.isSecureZK()) {
+            ZKTLSUtils.setSecureZKClientProperties(this.serviceConfig.getZkTrustStore(),
+                    JKSHelper.loadPasswordFrom(this.serviceConfig.getZkTrustStorePasswordPath()));
+        }
         CuratorFramework zkClient = CuratorFrameworkFactory
                 .builder()
                 .connectString(this.serviceConfig.getZkURL())
                 .namespace("pravega/" + this.serviceConfig.getClusterName())
+                .zookeeperFactory(new ZKClientFactory())
                 .retryPolicy(new ExponentialBackoffRetry(this.serviceConfig.getZkRetrySleepMs(), this.serviceConfig.getZkRetryCount()))
+                .sessionTimeoutMs(this.serviceConfig.getZkSessionTimeoutMs())
                 .build();
         zkClient.start();
         return zkClient;
+    }
+
+    /**
+     * This custom factory is used to ensure that Zookeeper clients in Curator are always created using the Zookeeper
+     * hostname, so it can be resolved to a new IP in the case of a Zookeeper instance restart.
+     */
+    @ThreadSafe
+    static class ZKClientFactory implements ZookeeperFactory {
+        @GuardedBy("this")
+        private ZooKeeper client;
+        @GuardedBy("this")
+        private String connectString;
+        @GuardedBy("this")
+        private int sessionTimeout;
+        @GuardedBy("this")
+        private boolean canBeReadOnly;
+
+        @Override
+        public ZooKeeper newZooKeeper(String connectString, int sessionTimeout, Watcher watcher, boolean canBeReadOnly) throws Exception {
+            Exceptions.checkNotNullOrEmpty(connectString, "connectString");
+            Preconditions.checkArgument(sessionTimeout > 0, "sessionTimeout should be a positive integer");
+            synchronized (this) {
+                if (client == null) {
+                    this.connectString = connectString;
+                    this.sessionTimeout = sessionTimeout;
+                    this.canBeReadOnly = canBeReadOnly;
+                }
+                log.info("Creating new Zookeeper client with arguments: {}, {}, {}.", this.connectString, this.sessionTimeout,
+                        this.canBeReadOnly);
+                this.client = new ZooKeeper(this.connectString, this.sessionTimeout, watcher, this.canBeReadOnly);
+                return this.client;
+            }
+        }
     }
 
     //endregion
@@ -192,16 +244,21 @@ public final class ServiceStarter {
     public static void main(String[] args) throws Exception {
         AtomicReference<ServiceStarter> serviceStarter = new AtomicReference<>();
         try {
-            // Load up the ServiceBuilderConfig, using this priority order:
-            // 1. Configuration file
+            System.err.println(System.getProperty(ServiceBuilderConfig.CONFIG_FILE_PROPERTY_NAME, "config.properties"));
+            // Load up the ServiceBuilderConfig, using this priority order (lowest to highest):
+            // 1. Configuration file (either default or specified via SystemProperties)
             // 2. System Properties overrides (these will be passed in via the command line or inherited from the JVM)
             ServiceBuilderConfig config = ServiceBuilderConfig
                     .builder()
-                    .include(System.getProperty("pravega.configurationFile", "config.properties"))
+                    .include(System.getProperty(ServiceBuilderConfig.CONFIG_FILE_PROPERTY_NAME, "config.properties"))
                     .include(System.getProperties())
                     .build();
-            serviceStarter.set(new ServiceStarter(config, Options.builder()
-                                                                 .bookKeeper(true).hdfs(true).rocksDb(true).zkSegmentManager(true).build()));
+
+            // For debugging purposes, it may be useful to know the non-default values for configurations being used.
+            // This will unfortunately include all System Properties as well, but knowing those can be useful too sometimes.
+            log.info("Segment store configuration:");
+            config.forEach((key, value) -> log.info("{} = {}", key, value));
+            serviceStarter.set(new ServiceStarter(config));
         } catch (Throwable e) {
             log.error("Could not create a Service with default config, Aborting.", e);
             System.exit(1);
@@ -209,35 +266,24 @@ public final class ServiceStarter {
 
         try {
             serviceStarter.get().start();
-            Runtime.getRuntime().addShutdownHook(new Thread() {
-                @Override
-                public void run() {
-                    try {
-                        log.info("Caught interrupt signal...");
-                        serviceStarter.get().shutdown();
-                    } catch (Exception e) {
-                        // do nothing
-                    }
-                }
-            });
+        } catch (Throwable e) {
+            log.error("Could not start the Service, Aborting.", e);
+            System.exit(1);
+        }
+
+        try {
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                log.info("Caught interrupt signal...");
+                serviceStarter.get().shutdown();
+            }));
 
             Thread.sleep(Long.MAX_VALUE);
         } catch (InterruptedException ex) {
             log.info("Caught interrupt signal...");
         } finally {
             serviceStarter.get().shutdown();
+            System.exit(0);
         }
-    }
-
-    //endregion
-
-    //region Options
-    @Builder
-    public static class Options {
-        final boolean bookKeeper;
-        final boolean hdfs;
-        final boolean rocksDb;
-        final boolean zkSegmentManager;
     }
 
     //endregion

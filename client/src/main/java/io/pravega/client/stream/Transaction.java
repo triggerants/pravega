@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +26,12 @@ public interface Transaction<Type> {
         COMMITTING,
         COMMITTED,
         ABORTING,
+        ABORTED
+    }
+
+    enum PingStatus {
+        OPEN,
+        COMMITTED,
         ABORTED
     }
 
@@ -67,14 +73,6 @@ public interface Transaction<Type> {
     void flush() throws TxnFailedException;
 
     /**
-     * Send a transaction heartbeat and increase transaction's timeout by lease amount of milliseconds.
-     *
-     * @param lease Additional amount of time in milliseconds by which to increase transaction's timeout.
-     * @throws PingFailedException Ping failed.
-     */
-    void ping(long lease) throws PingFailedException;
-
-    /**
      * Causes all messages previously written to the transaction to go into the stream contiguously.
      * This operation will either fully succeed making all events consumable or fully fail such that none of them are.
      * There may be some time delay before readers see the events after this call has returned.
@@ -82,6 +80,15 @@ public interface Transaction<Type> {
      * @throws TxnFailedException The Transaction is no longer in state {@link Status#OPEN}
      */
     void commit() throws TxnFailedException;
+    
+    /**
+     * Commits the transaction similar to {@link #commit()}, but also notes an associated timestamp.
+     * Similar to {@link EventStreamWriter#noteTime(long)}.
+     * 
+     * @param timestamp A timestamp associated with this transaction.
+     * @throws TxnFailedException The Transaction is no longer in state {@link Status#OPEN}
+     */
+    void commit(long timestamp) throws TxnFailedException;
 
     /**
      * Drops the transaction, causing all events written to it to be deleted.

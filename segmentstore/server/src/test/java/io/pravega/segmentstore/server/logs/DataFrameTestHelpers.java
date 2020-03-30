@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,18 +9,19 @@
  */
 package io.pravega.segmentstore.server.logs;
 
+import io.pravega.common.io.StreamHelpers;
 import io.pravega.common.util.ByteArraySegment;
-import io.pravega.common.util.CloseableIterator;
 import io.pravega.test.common.AssertExtensions;
-
-import org.junit.Assert;
-
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
+import java.util.function.Consumer;
 import java.util.function.Function;
+import lombok.val;
+import org.junit.Assert;
 
 /**
  * Helper methods for testing DataFrames.
@@ -66,15 +67,15 @@ class DataFrameTestHelpers {
     /**
      * Checks that the given data frame contains the given collection of records.
      */
-    static <T> void checkReadRecords(Collection<DataFrame> dataFrames, List<T> records, Function<T, ByteArraySegment> recordConverter) throws Exception {
+    static <T> void checkReadRecords(Collection<DataFrame.DataFrameEntryIterator> dataFrames, List<T> records, Function<T, ByteArraySegment> recordConverter) throws Exception {
         checkReadRecords(dataFrames, records, new HashSet<>(), recordConverter);
     }
 
     /**
      * Checks that the given data frame contains the given collection of records.
      */
-    static <T> void checkReadRecords(DataFrame dataFrame, List<T> records, Function<T, ByteArraySegment> recordConverter) throws Exception {
-        ArrayList<DataFrame> frames = new ArrayList<>();
+    static <T> void checkReadRecords(DataFrame.DataFrameEntryIterator dataFrame, List<T> records, Function<T, ByteArraySegment> recordConverter) throws Exception {
+        ArrayList<DataFrame.DataFrameEntryIterator> frames = new ArrayList<>();
         frames.add(dataFrame);
         checkReadRecords(frames, records, recordConverter);
     }
@@ -82,21 +83,20 @@ class DataFrameTestHelpers {
     /**
      * Checks that the given collection of DataFrames contain the given collection of records.
      */
-    static <T> void checkReadRecords(Collection<DataFrame> dataFrames, List<T> records, Collection<Integer> knownBadRecordIndices, Function<T, ByteArraySegment> recordConverter) throws Exception {
+    static <T> void checkReadRecords(Collection<DataFrame.DataFrameEntryIterator> dataFrames, List<T> records, Collection<Integer> knownBadRecordIndices, Function<T, ByteArraySegment> recordConverter) throws Exception {
         ReadState state = new ReadState(records.size(), knownBadRecordIndices);
 
-        for (DataFrame dataFrame : dataFrames) {
-            CloseableIterator<DataFrame.DataFrameEntry, SerializationException> reader = dataFrame.getEntries();
+        for (val reader : dataFrames) {
             DataFrame.DataFrameEntry entry;
             boolean isLastEntryInFrame = true;
             while ((entry = reader.getNext()) != null) {
 
-                // General DataFrameEntry validation.
+                // General DataFrameRecord validation.
                 Assert.assertNotNull("Received a null entry even though hasNext() returned true." + state.getPosition(), entry);
                 Assert.assertEquals(
-                        "Unexpected value returned by getDataFrameAddress(). " + state.getPosition(),
-                        dataFrame.getAddress(),
-                        entry.getDataFrameAddress());
+                        "Unexpected value returned by getFrameAddress(). " + state.getPosition(),
+                        reader.getFrameAddress(),
+                        entry.getFrameAddress());
 
                 if (entry.isFirstRecordEntry()) {
                     state.clearCurrentRecordEntries();
@@ -105,7 +105,9 @@ class DataFrameTestHelpers {
                 isLastEntryInFrame = entry.isLastEntryInDataFrame();
 
                 // Record the current entry
-                state.getCurrentRecordEntries().add(entry);
+                if (entry.getLength() > 0) {
+                    state.getCurrentRecordEntries().add(StreamHelpers.readAll(entry.getData(), entry.getLength()));
+                }
                 if (entry.isLastRecordEntry()) {
                     // We have reached the LastEntry for a Record. We are now ready to compare it to the current record.
                     Assert.assertFalse("Unexpected entry with isLastRecordEntry flag (when current record is bad).", state.isCurrentRecordBad());
@@ -119,10 +121,9 @@ class DataFrameTestHelpers {
                             state.getCurrentRecordEntriesSize());
 
                     int recordOffset = 0;
-                    for (DataFrame.DataFrameEntry recordEntry : state.getCurrentRecordEntries()) {
-                        ByteArraySegment entryData = recordEntry.getData();
-                        for (int i = 0; i < entryData.getLength(); i++) {
-                            if (currentRecord.get(recordOffset) != entryData.get(i)) {
+                    for (byte[] data : state.getCurrentRecordEntries()) {
+                        for (int i = 0; i < data.length; i++) {
+                            if (currentRecord.get(recordOffset) != data[i]) {
                                 Assert.fail(String.format("Unexpected entry contents. FrameIndex = %d, RecordIndex = %d, EntryNumberInRecord = %d.", state.getFrameIndex(), state.getNextGoodRecordIndex(), i));
                             }
 
@@ -143,15 +144,20 @@ class DataFrameTestHelpers {
 
             state.moveToNextFrame();
         }
+    }
 
-        //Assert.assertEquals("Reached the end of the DataFrames but there are still records to be expected.", records.size(), state.getNextGoodRecordIndex());
+    /**
+     * Returns a Consumer that, given an item, inserts that item into the given map in the order in which they were encountered.
+     */
+    static <T> Consumer<T> appendOrder(HashMap<T, Integer> map) {
+        return item -> map.put(item, map.size());
     }
 
     //region ReadState
 
     private static class ReadState {
         private final Collection<Integer> knownBadRecordIndices;
-        private final ArrayList<DataFrame.DataFrameEntry> currentRecordEntries;
+        private final ArrayList<byte[]> currentRecordEntries;
         private final int recordCount;
         private int recordIndex;
         private int currentRecordEntriesSize;
@@ -178,7 +184,7 @@ class DataFrameTestHelpers {
             return this.knownBadRecordIndices.contains(this.recordIndex);
         }
 
-        List<DataFrame.DataFrameEntry> getCurrentRecordEntries() {
+        List<byte[]> getCurrentRecordEntries() {
             return this.currentRecordEntries;
         }
 

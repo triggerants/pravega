@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ import org.junit.Test;
 abstract class SortedIndexTestBase {
     private static final int ITEM_COUNT = 100 * 1000;
     private static final Comparator<Long> KEY_COMPARATOR = Long::compare;
-    private static final Comparator<Long> KEY_REVERSE_COMPARATOR = (n1, n2) -> -Long.compare(n1, n2);
+    private static final Comparator<Long> KEY_REVERSE_COMPARATOR = (n1, n2) -> Long.compare(n2, n1);
 
     //region Test Targets
 

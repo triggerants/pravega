@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,23 +9,24 @@
  */
 package io.pravega.test.integration;
 
+import io.pravega.client.ClientConfig;
 import io.pravega.client.admin.StreamManager;
-import io.pravega.test.common.TestingServerStarter;
-import io.pravega.test.integration.demo.ControllerWrapper;
+import io.pravega.client.stream.ScalingPolicy;
+import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
+import io.pravega.segmentstore.contracts.tables.TableStore;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
-import io.pravega.client.stream.ScalingPolicy;
-import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.test.common.TestUtils;
+import io.pravega.test.common.TestingServerStarter;
+import io.pravega.test.integration.demo.ControllerWrapper;
+import java.net.URI;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.curator.test.TestingServer;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
-
-import java.net.URI;
 
 /**
  * Tests for validating controller fail over behaviour.
@@ -48,7 +49,9 @@ public class ControllerFailoverTest {
         ServiceBuilder serviceBuilder = ServiceBuilder.newInMemoryBuilder(ServiceBuilderConfig.getDefaultConfig());
         serviceBuilder.initialize();
         StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
-        server = new PravegaConnectionListener(false, servicePort, store);
+        TableStore tableStore = serviceBuilder.createTableStoreService();
+
+        server = new PravegaConnectionListener(false, servicePort, store, tableStore);
         server.startListening();
     }
 
@@ -95,15 +98,13 @@ public class ControllerFailoverTest {
         controllerWrapper.awaitRunning();
 
         URI controllerURI = URI.create("tcp://localhost:" + controllerPort);
-        StreamManager streamManager = StreamManager.create(controllerURI);
+        StreamManager streamManager = StreamManager.create( ClientConfig.builder().controllerURI(controllerURI).build());
 
         // Create scope
         streamManager.createScope(SCOPE);
 
         // Create stream
         StreamConfiguration streamConfiguration = StreamConfiguration.builder()
-                .scope(SCOPE)
-                .streamName(STREAM)
                 .scalingPolicy(ScalingPolicy.fixed(1))
                 .build();
         streamManager.createStream(SCOPE, STREAM, streamConfiguration);

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,35 +9,42 @@
  */
 package io.pravega.test.integration.utils;
 
-import io.pravega.client.ClientFactory;
+import com.google.common.base.Preconditions;
+import io.pravega.client.ClientConfig;
+import io.pravega.client.EventStreamClientFactory;
 import io.pravega.client.admin.ReaderGroupManager;
 import io.pravega.client.admin.StreamManager;
-import io.pravega.controller.util.Config;
-import io.pravega.test.integration.demo.ControllerWrapper;
-import io.pravega.segmentstore.contracts.StreamSegmentStore;
-import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
-import io.pravega.segmentstore.server.store.ServiceBuilder;
-import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
+import io.pravega.client.netty.impl.ConnectionFactory;
+import io.pravega.client.netty.impl.ConnectionFactoryImpl;
+import io.pravega.client.netty.impl.ConnectionPoolImpl;
 import io.pravega.client.stream.EventStreamReader;
 import io.pravega.client.stream.EventStreamWriter;
 import io.pravega.client.stream.EventWriterConfig;
 import io.pravega.client.stream.ReaderConfig;
 import io.pravega.client.stream.ReaderGroupConfig;
 import io.pravega.client.stream.ScalingPolicy;
+import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
+import io.pravega.client.stream.impl.ClientFactoryImpl;
+import io.pravega.client.stream.impl.Controller;
+import io.pravega.client.stream.impl.ControllerImpl;
+import io.pravega.client.stream.impl.ControllerImplConfig;
+import io.pravega.controller.util.Config;
+import io.pravega.segmentstore.contracts.StreamSegmentStore;
+import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
+import io.pravega.segmentstore.server.store.ServiceBuilder;
+import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.test.common.TestUtils;
 import io.pravega.test.common.TestingServerStarter;
-import com.google.common.base.Preconditions;
+import io.pravega.test.integration.demo.ControllerWrapper;
+import java.net.URI;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import javax.annotation.concurrent.NotThreadSafe;
 import lombok.Cleanup;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.curator.test.TestingServer;
-
-import javax.annotation.concurrent.NotThreadSafe;
-import java.net.URI;
-import java.util.Collections;
-import java.util.UUID;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Utility functions for creating the test setup.
@@ -45,11 +52,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Slf4j
 @NotThreadSafe
 public final class SetupUtils {
-    // The controller endpoint.
-    @Getter
-    private URI controllerUri = null;
-
+    
     // The different services.
+    @Getter
+    private ConnectionFactory connectionFactory = null;
+    @Getter
+    private Controller controller = null;
+    @Getter
+    private EventStreamClientFactory clientFactory = null;
     private ControllerWrapper controllerWrapper = null;
     private PravegaConnectionListener server = null;
     private TestingServer zkTestServer = null;
@@ -60,18 +70,36 @@ public final class SetupUtils {
     // The test Scope name.
     @Getter
     private final String scope = "scope";
-
+    private final int controllerRPCPort = TestUtils.getAvailableListenPort();
+    private final int controllerRESTPort = TestUtils.getAvailableListenPort();
+    private final int servicePort = TestUtils.getAvailableListenPort();
+    private final ClientConfig clientConfig = ClientConfig.builder().controllerURI(URI.create("tcp://localhost:" + String.valueOf(controllerRPCPort))).build();
+    
     /**
      * Start all pravega related services required for the test deployment.
      *
      * @throws Exception on any errors.
      */
     public void startAllServices() throws Exception {
+        startAllServices(null);
+    }
+    
+    /**
+     * Start all pravega related services required for the test deployment.
+     *
+     * @param numThreads the number of threads for the internal client threadpool.
+     * @throws Exception on any errors.
+     */
+    public void startAllServices(Integer numThreads) throws Exception {
         if (!this.started.compareAndSet(false, true)) {
             log.warn("Services already started, not attempting to start again");
             return;
         }
-
+        this.connectionFactory = new ConnectionFactoryImpl(clientConfig, new ConnectionPoolImpl(clientConfig), numThreads);
+        this.controller = new ControllerImpl(ControllerImplConfig.builder().clientConfig(clientConfig).build(),
+                                             connectionFactory.getInternalExecutor());
+        this.clientFactory = new ClientFactoryImpl(scope, controller, connectionFactory);
+        
         // Start zookeeper.
         this.zkTestServer = new TestingServerStarter().start();
         this.zkTestServer.start();
@@ -81,19 +109,16 @@ public final class SetupUtils {
 
         serviceBuilder.initialize();
         StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
-        int servicePort = TestUtils.getAvailableListenPort();
-        this.server = new PravegaConnectionListener(false, servicePort, store);
+        this.server = new PravegaConnectionListener(false, servicePort, store, serviceBuilder.createTableStoreService());
         this.server.startListening();
         log.info("Started Pravega Service");
 
         // Start Controller.
-        int controllerPort = TestUtils.getAvailableListenPort();
         this.controllerWrapper = new ControllerWrapper(
-                this.zkTestServer.getConnectString(), true, controllerPort, "localhost", servicePort,
-                Config.HOST_STORE_CONTAINER_COUNT);
+                this.zkTestServer.getConnectString(), false, true, controllerRPCPort, "localhost", servicePort,
+                Config.HOST_STORE_CONTAINER_COUNT, controllerRESTPort);
         this.controllerWrapper.awaitRunning();
-        this.controllerWrapper.getController().createScope(this.scope).get();
-        this.controllerUri = URI.create("tcp://localhost:" + String.valueOf(controllerPort));
+        this.controllerWrapper.getController().createScope(scope).get();
         log.info("Initialized Pravega Controller");
     }
 
@@ -111,6 +136,9 @@ public final class SetupUtils {
         this.controllerWrapper.close();
         this.server.close();
         this.zkTestServer.close();
+        this.clientFactory.close();
+        this.controller.close();
+        this.connectionFactory.close();
     }
 
     /**
@@ -128,14 +156,12 @@ public final class SetupUtils {
         Preconditions.checkArgument(numSegments > 0);
 
         @Cleanup
-        StreamManager streamManager = StreamManager.create(this.controllerUri);
-        streamManager.createScope(this.scope);
-        streamManager.createStream(this.scope, streamName,
-                StreamConfiguration.builder()
-                        .scope(this.scope)
-                        .streamName(streamName)
-                        .scalingPolicy(ScalingPolicy.fixed(numSegments))
-                        .build());
+        StreamManager streamManager = StreamManager.create(clientConfig);
+        streamManager.createScope(scope);
+        streamManager.createStream(scope, streamName,
+                                   StreamConfiguration.builder()
+                                                      .scalingPolicy(ScalingPolicy.fixed(numSegments))
+                                                      .build());
         log.info("Created stream: " + streamName);
     }
 
@@ -150,11 +176,8 @@ public final class SetupUtils {
         Preconditions.checkState(this.started.get(), "Services not yet started");
         Preconditions.checkNotNull(streamName);
 
-        ClientFactory clientFactory = ClientFactory.withScope(this.scope, this.controllerUri);
-        return clientFactory.createEventWriter(
-                streamName,
-                new IntegerSerializer(),
-                EventWriterConfig.builder().build());
+        return clientFactory.createEventWriter(streamName, new IntegerSerializer(),
+                                               EventWriterConfig.builder().build());
     }
 
     /**
@@ -168,19 +191,22 @@ public final class SetupUtils {
         Preconditions.checkState(this.started.get(), "Services not yet started");
         Preconditions.checkNotNull(streamName);
 
-        ReaderGroupManager readerGroupManager = ReaderGroupManager.withScope(this.scope, this.controllerUri);
-        final String readerGroup = "testReaderGroup" + this.scope + streamName;
+        ReaderGroupManager readerGroupManager = ReaderGroupManager.withScope(scope, clientConfig);
+        final String readerGroup = "testReaderGroup" + scope + streamName;
         readerGroupManager.createReaderGroup(
                 readerGroup,
-                ReaderGroupConfig.builder().startingTime(0).build(),
-                Collections.singleton(streamName));
+                ReaderGroupConfig.builder().stream(Stream.of(scope, streamName)).build());
 
-        ClientFactory clientFactory = ClientFactory.withScope(this.scope, this.controllerUri);
         final String readerGroupId = UUID.randomUUID().toString();
-        return clientFactory.createReader(
-                readerGroupId,
-                readerGroup,
-                new IntegerSerializer(),
-                ReaderConfig.builder().build());
+        return clientFactory.createReader(readerGroupId, readerGroup, new IntegerSerializer(),
+                                          ReaderConfig.builder().build());
+    }
+    
+    public URI getControllerUri() {
+        return clientConfig.getControllerURI();
+    }
+    
+    public URI getControllerRestUri() {
+        return URI.create("http://localhost:" + String.valueOf(controllerRESTPort));
     }
 }

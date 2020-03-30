@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,31 +9,29 @@
  */
 package io.pravega.segmentstore.server.logs;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.util.concurrent.AbstractService;
-import com.google.common.util.concurrent.Runnables;
-import io.pravega.common.ExceptionHelpers;
 import io.pravega.common.Exceptions;
 import io.pravega.common.LoggerHelpers;
+import io.pravega.common.ObjectClosedException;
 import io.pravega.common.TimeoutTimer;
-import io.pravega.common.concurrent.ExecutorServiceHelpers;
-import io.pravega.common.concurrent.FutureHelpers;
-import io.pravega.common.concurrent.ServiceShutdownListener;
+import io.pravega.common.Timer;
+import io.pravega.common.concurrent.Futures;
+import io.pravega.common.concurrent.Services;
+import io.pravega.common.util.Retry;
 import io.pravega.common.util.SequencedItemList;
-import io.pravega.segmentstore.contracts.ContainerException;
-import io.pravega.segmentstore.contracts.StreamSegmentException;
 import io.pravega.segmentstore.contracts.StreamingException;
-import io.pravega.segmentstore.server.logs.operations.OperationFactory;
+import io.pravega.segmentstore.server.ContainerOfflineException;
 import io.pravega.segmentstore.server.DataCorruptionException;
 import io.pravega.segmentstore.server.IllegalContainerStateException;
-import io.pravega.segmentstore.server.LogItemFactory;
 import io.pravega.segmentstore.server.OperationLog;
 import io.pravega.segmentstore.server.ReadIndex;
 import io.pravega.segmentstore.server.UpdateableContainerMetadata;
 import io.pravega.segmentstore.server.logs.operations.MetadataCheckpointOperation;
 import io.pravega.segmentstore.server.logs.operations.Operation;
-import io.pravega.segmentstore.server.logs.operations.ProbeOperation;
 import io.pravega.segmentstore.server.logs.operations.StorageMetadataCheckpointOperation;
+import io.pravega.segmentstore.storage.DataLogDisabledException;
 import io.pravega.segmentstore.storage.DurableDataLog;
 import io.pravega.segmentstore.storage.DurableDataLogFactory;
 import io.pravega.segmentstore.storage.LogAddress;
@@ -45,13 +43,14 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.ThreadSafe;
+import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -64,8 +63,6 @@ public class DurableLog extends AbstractService implements OperationLog {
 
     private static final Duration RECOVERY_TIMEOUT = Duration.ofSeconds(30);
     private final String traceObjectId;
-    private final DurableLogConfig config;
-    private final LogItemFactory<Operation> operationFactory;
     private final SequencedItemList<Operation> inMemoryOperationLog;
     private final DurableDataLog durableDataLog;
     private final MemoryStateUpdater memoryStateUpdater;
@@ -76,6 +73,8 @@ public class DurableLog extends AbstractService implements OperationLog {
     private final ScheduledExecutorService executor;
     private final AtomicReference<Throwable> stopException = new AtomicReference<>();
     private final AtomicBoolean closed;
+    private final CompletableFuture<Void> delayedStart;
+    private final Retry.RetryAndThrowConditionally delayedStartRetry;
 
     //endregion
 
@@ -93,26 +92,31 @@ public class DurableLog extends AbstractService implements OperationLog {
      */
     public DurableLog(DurableLogConfig config, UpdateableContainerMetadata metadata, DurableDataLogFactory dataFrameLogFactory, ReadIndex readIndex, ScheduledExecutorService executor) {
         Preconditions.checkNotNull(config, "config");
-        Preconditions.checkNotNull(metadata, "metadata");
+        this.metadata = Preconditions.checkNotNull(metadata, "metadata");
         Preconditions.checkNotNull(dataFrameLogFactory, "dataFrameLogFactory");
         Preconditions.checkNotNull(readIndex, "readIndex");
-        Preconditions.checkNotNull(executor, "executor");
+        this.executor = Preconditions.checkNotNull(executor, "executor");
 
-        this.config = config;
         this.durableDataLog = dataFrameLogFactory.createDurableDataLog(metadata.getContainerId());
         assert this.durableDataLog != null : "dataFrameLogFactory created null durableDataLog.";
 
         this.traceObjectId = String.format("DurableLog[%s]", metadata.getContainerId());
-        this.metadata = metadata;
-        this.executor = executor;
-        this.operationFactory = new OperationFactory();
-        this.inMemoryOperationLog = new SequencedItemList<>();
+        this.inMemoryOperationLog = createInMemoryLog();
         this.memoryStateUpdater = new MemoryStateUpdater(this.inMemoryOperationLog, readIndex, this::triggerTailReads);
-        MetadataCheckpointPolicy checkpointPolicy = new MetadataCheckpointPolicy(this.config, this::queueMetadataCheckpoint, this.executor);
+        MetadataCheckpointPolicy checkpointPolicy = new MetadataCheckpointPolicy(config, this::queueMetadataCheckpoint, this.executor);
         this.operationProcessor = new OperationProcessor(this.metadata, this.memoryStateUpdater, this.durableDataLog, checkpointPolicy, executor);
-        this.operationProcessor.addListener(new ServiceShutdownListener(this::queueStoppedHandler, this::queueFailedHandler), this.executor);
+        Services.onStop(this.operationProcessor, this::queueStoppedHandler, this::queueFailedHandler, this.executor);
         this.tailReads = new HashSet<>();
         this.closed = new AtomicBoolean();
+        this.delayedStart = new CompletableFuture<>();
+        this.delayedStartRetry = Retry.withExpBackoff(config.getStartRetryDelay().toMillis(), 1, Integer.MAX_VALUE)
+                                      .retryWhen(ex -> Exceptions.unwrap(ex) instanceof DataLogDisabledException);
+
+    }
+
+    @VisibleForTesting
+    protected SequencedItemList<Operation> createInMemoryLog() {
+        return new SequencedItemList<>();
     }
 
     //endregion
@@ -122,8 +126,7 @@ public class DurableLog extends AbstractService implements OperationLog {
     @Override
     public void close() {
         if (!this.closed.get()) {
-            stopAsync();
-            ServiceShutdownListener.awaitShutdown(this, false);
+            Futures.await(Services.stopAsync(this, this.executor));
 
             this.operationProcessor.close();
             this.durableDataLog.close(); // Call this again just in case we were not able to do it in doStop().
@@ -138,62 +141,135 @@ public class DurableLog extends AbstractService implements OperationLog {
 
     @Override
     protected void doStart() {
-        long traceId = LoggerHelpers.traceEnterWithContext(log, traceObjectId, "doStart");
         log.info("{}: Starting.", this.traceObjectId);
+        this.delayedStartRetry
+                .runAsync(() -> tryStartOnce()
+                        .whenComplete((v, ex) -> {
+                            if (ex == null) {
+                                // We are done.
+                                notifyDelayedStartComplete(null);
+                            } else {
+                                if (Exceptions.unwrap(ex) instanceof DataLogDisabledException) {
+                                    // Place the DurableLog in a Started State, but keep trying to restart.
+                                    notifyStartComplete(null);
+                                }
+                                throw new CompletionException(ex);
+                            }
+                        }), this.executor)
+                .exceptionally(this::notifyDelayedStartComplete);
+    }
 
-        this.executor.execute(() -> {
-            try {
-                boolean anyItemsRecovered = performRecovery();
-                this.operationProcessor.startAsync().awaitRunning();
-                if (!anyItemsRecovered) {
-                    // If the DurableLog is empty, need to queue a MetadataCheckpointOperation so we have a valid starting state (and wait for it).
-                    queueMetadataCheckpoint().get(RECOVERY_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-                }
-            } catch (Exception ex) {
-                if (this.operationProcessor.isRunning()) {
-                    // Make sure we stop the operation processor if we started it.
-                    this.operationProcessor.stopAsync();
-                }
+    private Void notifyDelayedStartComplete(Throwable failureCause) {
+        if (failureCause == null) {
+            this.delayedStart.complete(null);
+        } else {
+            this.delayedStart.completeExceptionally(failureCause);
+        }
 
-                notifyFailed(ExceptionHelpers.getRealException(ex));
-                return;
+        notifyStartComplete(failureCause);
+        return null;
+    }
+
+    private void notifyStartComplete(Throwable failureCause) {
+        if (failureCause == null && state() == State.STARTING) {
+            log.info("{}: Started ({}).", this.traceObjectId, isOffline() ? "OFFLINE" : "Online");
+            notifyStarted();
+        }
+
+        if (failureCause != null) {
+            failureCause = Exceptions.unwrap(failureCause);
+            this.stopException.set(failureCause);
+            if (state() == State.STARTING) {
+                // Make sure we stop the OperationProcessor if we started it, but not before we stop ourselves (with the
+                // correct failure cause), otherwise the OperationProcessor's listener will shut us down with a totally
+                // different failure cause.
+                notifyFailed(failureCause);
+                this.operationProcessor.stopAsync();
+            } else {
+                doStop();
+            }
+        }
+    }
+
+    private CompletableFuture<Void> tryStartOnce() {
+        return CompletableFuture
+                .supplyAsync(this::performRecovery, this.executor)
+                .thenCompose(anyItemsRecovered ->
+                        Services.startAsync(this.operationProcessor, this.executor)
+                                .thenComposeAsync(v -> anyItemsRecovered ? CompletableFuture.completedFuture(null) : queueMetadataCheckpoint(), this.executor));
+    }
+
+    @SneakyThrows(Exception.class)
+    private boolean performRecovery() {
+        // Make sure we are in the correct state. We do not want to do recovery while we are in full swing.
+        Preconditions.checkState(state() == State.STARTING || (state() == State.RUNNING && isOffline()), "Invalid State for recovery.");
+
+        this.operationProcessor.getMetrics().operationLogInit();
+        Timer timer = new Timer();
+        try {
+            // Initialize the DurableDataLog, which will acquire its lock and ensure we are the only active users of it.
+            this.durableDataLog.initialize(RECOVERY_TIMEOUT);
+
+            // Initiate the recovery.
+            RecoveryProcessor p = new RecoveryProcessor(this.metadata, this.durableDataLog, this.memoryStateUpdater);
+            int recoveredItemCount = p.performRecovery();
+            this.operationProcessor.getMetrics().operationsCompleted(recoveredItemCount, timer.getElapsed());
+
+            // Verify that the Recovery Processor has left the metadata in a non-recovery mode.
+            Preconditions.checkState(!this.metadata.isRecoveryMode(), "Recovery completed but Metadata is still in Recovery Mode.");
+            return recoveredItemCount > 0;
+        } catch (Exception ex) {
+            log.error("{} Recovery FAILED.", this.traceObjectId, ex);
+            if (Exceptions.unwrap(ex) instanceof DataCorruptionException) {
+                // DataCorruptionException during recovery means we will be unable to execute the recovery successfully
+                // regardless how many times we try. We need to disable the log so that future instances of this class
+                // will not attempt to do so indefinitely (which could wipe away useful debugging information before
+                // someone can manually fix the problem).
+                try {
+                    this.durableDataLog.disable();
+                    log.info("{} Log disabled due to DataCorruptionException during recovery.", this.traceObjectId);
+                } catch (Exception disableEx) {
+                    log.warn("{}: Unable to disable log after DataCorruptionException during recovery.", this.traceObjectId, disableEx);
+                    ex.addSuppressed(disableEx);
+                }
             }
 
-            // If we got here, all is good. We were able to start successfully.
-            log.info("{}: Started.", this.traceObjectId);
-            notifyStarted();
-            LoggerHelpers.traceLeave(log, traceObjectId, "doStart", traceId);
-        });
+            throw ex;
+        }
     }
 
     @Override
     protected void doStop() {
         long traceId = LoggerHelpers.traceEnterWithContext(log, traceObjectId, "doStop");
         log.info("{}: Stopping.", this.traceObjectId);
-        this.operationProcessor.stopAsync();
+        Services.stopAsync(this.operationProcessor, this.executor)
+                .whenCompleteAsync((r, ex) -> {
+                    cancelTailReads();
 
-        ExecutorServiceHelpers.execute(() -> {
-            ServiceShutdownListener.awaitShutdown(this.operationProcessor, false);
+                    this.durableDataLog.close();
+                    Throwable cause = this.stopException.get();
+                    if (cause == null && this.operationProcessor.state() == State.FAILED) {
+                        cause = this.operationProcessor.failureCause();
+                    }
 
-            cancelTailReads();
+                    // Terminate the delayed start future now, if still active.
+                    this.delayedStart.completeExceptionally(cause == null ? new ObjectClosedException(this) : cause);
 
-            this.durableDataLog.close();
-            Throwable cause = this.stopException.get();
-            if (cause == null && this.operationProcessor.state() == State.FAILED) {
-                cause = this.operationProcessor.failureCause();
-            }
+                    if (cause == null) {
+                        // Normal shutdown.
+                        notifyStopped();
+                    } else {
+                        // Shutdown caused by some failure.
+                        notifyFailed(cause);
+                    }
 
-            if (cause == null) {
-                // Normal shutdown.
-                notifyStopped();
-            } else {
-                // Shutdown caused by some failure.
-                notifyFailed(cause);
-            }
-
-            log.info("{}: Stopped.", this.traceObjectId);
-            LoggerHelpers.traceLeave(log, traceObjectId, "doStop", traceId);
-        }, this::notifyFailed, Runnables.doNothing(), this.executor);
+                    log.info("{}: Stopped.", this.traceObjectId);
+                    LoggerHelpers.traceLeave(log, traceObjectId, "doStop", traceId);
+                }, this.executor)
+                .exceptionally(ex -> {
+                    notifyFailed(ex);
+                    return null;
+                });
     }
 
     //endregion
@@ -205,12 +281,17 @@ public class DurableLog extends AbstractService implements OperationLog {
         return this.metadata.getContainerId();
     }
 
+    @Override
+    public boolean isOffline() {
+        return !this.delayedStart.isDone();
+    }
+
     //endregion
 
     //region OperationLog Implementation
 
     @Override
-    public CompletableFuture<Long> add(Operation operation, Duration timeout) {
+    public CompletableFuture<Void> add(Operation operation, Duration timeout) {
         ensureRunning();
         return this.operationProcessor.process(operation);
     }
@@ -242,10 +323,11 @@ public class DurableLog extends AbstractService implements OperationLog {
                 .thenComposeAsync(v -> this.durableDataLog.truncate(truncationFrameAddress, timer.getRemaining()), this.executor)
                 .thenRunAsync(() -> {
                     // Truncate InMemory Transaction Log.
-                    this.inMemoryOperationLog.truncate(actualTruncationSequenceNumber);
+                    int count = this.inMemoryOperationLog.truncate(actualTruncationSequenceNumber);
 
                     // Remove old truncation markers.
                     this.metadata.removeTruncationMarkers(actualTruncationSequenceNumber);
+                    this.operationProcessor.getMetrics().operationLogTruncate(count);
                 }, this.executor);
     }
 
@@ -287,150 +369,13 @@ public class DurableLog extends AbstractService implements OperationLog {
     }
 
     @Override
-    public CompletableFuture<Void> operationProcessingBarrier(Duration timeout) {
-        return FutureHelpers
-                .toVoid(add(new ProbeOperation(), timeout))
-                .whenComplete((r, ex) -> {
-                    // We don't care if this operation completed successfully or not. The Operation Barrier needs to complete
-                    // when all operations prior to it completed, regardless of outcome.
-                    if (ex != null) {
-                        log.warn("{}: Error caught while waiting for {}: {}.", this.traceObjectId, ProbeOperation.class.getSimpleName(), ex);
-                    }
-                });
-    }
-
-    //endregion
-
-    //region Recovery
-
-    private boolean performRecovery() throws Exception {
-        // Make sure we are in the correct state. We do not want to do recovery while we are in full swing.
-        Preconditions.checkState(state() == State.STARTING, "Cannot perform recovery if the DurableLog is not in a '%s' state.", State.STARTING);
-
-        long traceId = LoggerHelpers.traceEnterWithContext(log, this.traceObjectId, "performRecovery");
-        TimeoutTimer timer = new TimeoutTimer(RECOVERY_TIMEOUT);
-        log.info("{} Recovery started.", this.traceObjectId);
-
-        // Put metadata (and entire container) into 'Recovery Mode'.
-        this.metadata.enterRecoveryMode();
-
-        // Reset metadata.
-        this.metadata.reset();
-
-        OperationMetadataUpdater metadataUpdater = new OperationMetadataUpdater(this.metadata);
-        this.memoryStateUpdater.enterRecoveryMode(metadataUpdater);
-
-        boolean successfulRecovery = false;
-        boolean anyItemsRecovered;
-        try {
-            this.durableDataLog.initialize(timer.getRemaining());
-            anyItemsRecovered = recoverFromDataFrameLog(metadataUpdater);
-            this.metadata.setContainerEpoch(this.durableDataLog.getEpoch());
-            log.info("{} Recovery completed. Epoch = {}, Items Recovered = {}.", this.traceObjectId, this.metadata.getContainerEpoch(), anyItemsRecovered);
-            successfulRecovery = true;
-        } catch (Exception ex) {
-            log.error("{} Recovery FAILED. {}", this.traceObjectId, ex);
-            throw ex;
-        } finally {
-            // We must exit recovery mode when done, regardless of outcome.
-            this.metadata.exitRecoveryMode();
-            this.memoryStateUpdater.exitRecoveryMode(successfulRecovery);
+    public CompletableFuture<Void> awaitOnline() {
+        Exceptions.checkNotClosed(this.closed.get(), this);
+        if (state() != State.RUNNING) {
+            throw new IllegalContainerStateException(this.getId(), state(), State.RUNNING);
         }
 
-        LoggerHelpers.traceLeave(log, this.traceObjectId, "performRecovery", traceId);
-        return anyItemsRecovered;
-    }
-
-    /**
-     * Recovers the Operations from the DurableLog using the given OperationMetadataUpdater. Searches the DurableDataLog
-     * until the first MetadataCheckpointOperation is encountered. All Operations prior to this one are skipped over.
-     * Recovery starts with the first MetadataCheckpointOperation and runs until the end of the DurableDataLog is reached.
-     * Subsequent MetadataCheckpointOperations are ignored (as they contain redundant information - which has already
-     * been built up using the Operations up to them).
-     *
-     * @param metadataUpdater The OperationMetadataUpdater to use for updates.
-     * @return True if any operations were recovered, false otherwise.
-     */
-    private boolean recoverFromDataFrameLog(OperationMetadataUpdater metadataUpdater) throws Exception {
-        long traceId = LoggerHelpers.traceEnterWithContext(log, this.traceObjectId, "recoverFromDataFrameLog");
-        int skippedOperationCount = 0;
-        int skippedDataFramesCount = 0;
-        int recoveredItemCount = 0;
-
-        // Read all entries from the DataFrameLog and append them to the InMemoryOperationLog.
-        // Also update metadata along the way.
-        try (DataFrameReader<Operation> reader = new DataFrameReader<>(this.durableDataLog, this.operationFactory, getId())) {
-            DataFrameReader.ReadResult<Operation> readResult;
-
-            // We can only recover starting from a MetadataCheckpointOperation; find the first one.
-            while (true) {
-                // Fetch the next operation.
-                readResult = reader.getNext();
-                if (readResult == null) {
-                    // We have reached the end and have not found any MetadataCheckpointOperations.
-                    log.warn("{}: Reached the end of the DataFrameLog and could not find any MetadataCheckpointOperations after reading {} Operations and {} Data Frames.", this.traceObjectId, skippedOperationCount, skippedDataFramesCount);
-                    break;
-                } else if (readResult.getItem() instanceof MetadataCheckpointOperation) {
-                    // We found a checkpoint. Start recovering from here.
-                    log.info("{}: Starting recovery from Sequence Number {} (skipped {} Operations and {} Data Frames).", this.traceObjectId, readResult.getItem().getSequenceNumber(), skippedOperationCount, skippedDataFramesCount);
-                    break;
-                } else if (readResult.isLastFrameEntry()) {
-                    skippedDataFramesCount++;
-                }
-
-                skippedOperationCount++;
-                log.debug("{}: Not recovering operation because no MetadataCheckpointOperation encountered so far ({}).", this.traceObjectId, readResult.getItem());
-            }
-
-            // Now continue with the recovery from here.
-            while (readResult != null) {
-                recordTruncationMarker(readResult, metadataUpdater);
-                recoverOperation(readResult.getItem(), metadataUpdater);
-                recoveredItemCount++;
-
-                // Fetch the next operation.
-                readResult = reader.getNext();
-            }
-        }
-
-        // Commit whatever changes we have in the metadata updater to the Container Metadata.
-        // This code will only be invoked if we haven't encountered any exceptions during recovery.
-        metadataUpdater.commit();
-        LoggerHelpers.traceLeave(log, this.traceObjectId, "recoverFromDataFrameLog", traceId, recoveredItemCount);
-        return recoveredItemCount > 0;
-    }
-
-    private void recoverOperation(Operation operation, OperationMetadataUpdater metadataUpdater) throws DataCorruptionException {
-        // Update Metadata Sequence Number.
-        metadataUpdater.setOperationSequenceNumber(operation.getSequenceNumber());
-
-        // Update the metadata with the information from the Operation.
-        try {
-            log.debug("{} Recovering {}.", this.traceObjectId, operation);
-            metadataUpdater.preProcessOperation(operation);
-            metadataUpdater.acceptOperation(operation);
-        } catch (StreamSegmentException | ContainerException ex) {
-            // Metadata updates failures should not happen during recovery.
-            throw new DataCorruptionException(String.format("Unable to update metadata for Log Operation %s", operation), ex);
-        }
-
-        // Update in-memory structures.
-        this.memoryStateUpdater.process(operation);
-    }
-
-    private void recordTruncationMarker(DataFrameReader.ReadResult<Operation> readResult, OperationMetadataUpdater metadataUpdater) {
-        // Determine and record Truncation Markers, but only if the current operation spans multiple DataFrames
-        // or it's the last entry in a DataFrame.
-        LogAddress lastFullAddress = readResult.getLastFullDataFrameAddress();
-        LogAddress lastUsedAddress = readResult.getLastUsedDataFrameAddress();
-        if (lastFullAddress != null && lastFullAddress.getSequence() != lastUsedAddress.getSequence()) {
-            // This operation spans multiple DataFrames. The TruncationMarker should be set on the last DataFrame
-            // that ends with a part of it.
-            metadataUpdater.recordTruncationMarker(readResult.getItem().getSequenceNumber(), lastFullAddress);
-        } else if (readResult.isLastFrameEntry()) {
-            // The operation was the last one in the frame. This is a Truncation Marker.
-            metadataUpdater.recordTruncationMarker(readResult.getItem().getSequenceNumber(), lastUsedAddress);
-        }
+        return this.delayedStart;
     }
 
     //endregion
@@ -440,7 +385,9 @@ public class DurableLog extends AbstractService implements OperationLog {
     private void ensureRunning() {
         Exceptions.checkNotClosed(this.closed.get(), this);
         if (state() != State.RUNNING) {
-            throw new IllegalContainerStateException(this.getId(), state(), State.RUNNING);
+            throw new IllegalContainerStateException(getId(), state(), State.RUNNING);
+        } else if (isOffline()) {
+            throw new ContainerOfflineException(getId());
         }
     }
 
@@ -454,14 +401,14 @@ public class DurableLog extends AbstractService implements OperationLog {
     private void queueStoppedHandler() {
         if (state() != State.STOPPING && state() != State.FAILED) {
             // The Queue Processor stopped but we are not in a stopping phase. We need to shut down right away.
-            log.warn("{}: QueueProcessor stopped unexpectedly (no error) but DurableLog was not currently stopping. Shutting down DurableLog.", this.traceObjectId);
-            this.stopException.set(new StreamingException("QueueProcessor stopped unexpectedly (no error) but DurableLog was not currently stopping."));
+            log.warn("{}: OperationProcessor stopped unexpectedly (no error) but DurableLog was not currently stopping. Shutting down DurableLog.", this.traceObjectId);
+            this.stopException.set(new StreamingException("OperationProcessor stopped unexpectedly (no error) but DurableLog was not currently stopping."));
             stopAsync();
         }
     }
 
     private CompletableFuture<Void> queueMetadataCheckpoint() {
-        log.info("{}: MetadataCheckpointOperation queued.", this.traceObjectId);
+        log.debug("{}: Queuing MetadataCheckpointOperation.", this.traceObjectId);
         return this.operationProcessor
                 .process(new MetadataCheckpointOperation())
                 .thenAccept(seqNo -> log.info("{}: MetadataCheckpointOperation durably stored.", this.traceObjectId));
@@ -493,9 +440,9 @@ public class DurableLog extends AbstractService implements OperationLog {
 
             // Trigger all of them (no need to unregister them; the unregister handle is already wired up).
             for (TailRead tr : toTrigger) {
-                tr.future.complete(FutureHelpers.runOrFail(() -> {
-                    return this.inMemoryOperationLog.read(tr.afterSequenceNumber, tr.maxCount);
-                }, tr.future));
+                tr.future.complete(Futures.runOrFail(
+                        () -> this.inMemoryOperationLog.read(tr.afterSequenceNumber, tr.maxCount),
+                        tr.future));
             }
         });
     }
@@ -524,7 +471,7 @@ public class DurableLog extends AbstractService implements OperationLog {
         TailRead(long afterSequenceNumber, int maxCount, Duration timeout, ScheduledExecutorService executor) {
             this.afterSequenceNumber = afterSequenceNumber;
             this.maxCount = maxCount;
-            this.future = FutureHelpers.futureWithTimeout(timeout, executor);
+            this.future = Futures.futureWithTimeout(timeout, executor);
         }
 
         @Override

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,10 +46,18 @@ public interface HostControllerStore {
      * 
      * @param scope                         The scope of the segment
      * @param stream                        The stream of the segment
-     * @param segmentNumber                 The number of the segment
+     * @param segmentId                 The number of the segment
      * @return                              The host which owns the supplied segment.
      * @throws HostStoreException           On error while fetching host info from the ownership Map.
      */
-    Host getHostForSegment(String scope, String stream, int segmentNumber);
+    Host getHostForSegment(String scope, String stream, long segmentId);
 
+    /**
+     * Fetch the Host which owns the specified segment.
+     * 
+     * @param tableName                     The table segment name
+     * @return                              The host which owns the supplied segment.
+     * @throws HostStoreException           On error while fetching host info from the ownership Map.
+     */
+    Host getHostForTableSegment(String tableName);
 }

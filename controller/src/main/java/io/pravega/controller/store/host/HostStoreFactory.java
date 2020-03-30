@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,8 +26,8 @@ public class HostStoreFactory {
         Preconditions.checkNotNull(storeClient, "storeClient");
 
         if (hostMonitorConfig.isHostMonitorEnabled()) {
-            Preconditions.checkArgument(storeClient.getType() == StoreType.Zookeeper,
-                    "If host monitor is enabled then the store type should be Zookeeper");
+            Preconditions.checkArgument(storeClient.getType() == StoreType.Zookeeper || storeClient.getType() == StoreType.PravegaTable,
+                    "If host monitor is enabled then the store type should support Zookeeper");
             log.info("Creating Zookeeper based host store");
             return new ZKHostStore((CuratorFramework) storeClient.getClient(), hostMonitorConfig.getContainerCount());
         } else {

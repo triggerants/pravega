@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,14 +16,20 @@ rat {
             '**/*.iml',
             '**/*.iws',
             '**/*.ipr',
+            '**/*passwd',
             '**/gradle/wrapper/**',
             '**/build/**',
             '**/out/**',
             '**/generated/**',
             '**/checkstyle/**',
             'deployment/aws/installer/hosts-template',
+            'lombok.config',
             '**/*.log',
             '**/*.lock',
-            '**/*.json'
+            '**/*.json',
+            '**/config/*jks*',
+            '**/config/*.crt',
+            '**/config/*.key',
+            'CODE_OF_CONDUCT.md'
     ]
 }

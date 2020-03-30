@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -8,6 +8,11 @@
  *     http://www.apache.org/licenses/LICENSE-2.0
  */
 package io.pravega.client.stream;
+
+import com.google.common.base.Preconditions;
+import io.pravega.client.stream.impl.StreamImpl;
+import io.pravega.common.Exceptions;
+import io.pravega.shared.NameUtils;
 
 /**
  * A stream can be thought of as an unbounded sequence of events.
@@ -40,4 +45,32 @@ public interface Stream {
      */
     String getScopedName();
 
+    /**
+     * Helper utility to create a Stream object.
+     *
+     * @param scope Scope of the stream.
+     * @param streamName Name of the stream.
+     * @return Stream.
+     */
+    static Stream of(String scope, String streamName) {
+        NameUtils.validateScopeName(scope);
+        NameUtils.validateStreamName(streamName);
+        return new StreamImpl(scope, streamName);
+    }
+
+    /**
+     * Helper utility to create a Stream object from a scopedName of a Stream.
+     *
+     * @param scopedName Scoped Name of the stream e.g: scopeName/streamName .
+     * @return Stream.
+     */
+    static Stream of(final String scopedName) {
+        Exceptions.checkNotNullOrEmpty(scopedName, "scopedName");
+        String[] split = scopedName.split("/", 2);
+        Preconditions.checkArgument(split.length == 2,
+                "Ensure a fully scoped name of a stream is passed e.g: scopeName/streamName");
+        NameUtils.validateScopeName(split[0]);
+        NameUtils.validateStreamName(split[1]);
+        return new StreamImpl(split[0], split[1]);
+    }
 }

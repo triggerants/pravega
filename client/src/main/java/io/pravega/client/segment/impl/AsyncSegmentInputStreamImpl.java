@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,69 +9,69 @@
  */
 package io.pravega.client.segment.impl;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import io.pravega.auth.AuthenticationException;
+import io.pravega.client.netty.impl.Flow;
+import io.pravega.client.netty.impl.ClientConnection;
+import io.pravega.client.netty.impl.ConnectionFactory;
+import io.pravega.client.security.auth.DelegationTokenProvider;
+import io.pravega.client.stream.impl.ConnectionClosedException;
+import io.pravega.client.stream.impl.Controller;
 import io.pravega.common.Exceptions;
-import io.pravega.common.ObjectClosedException;
-import io.pravega.common.concurrent.FutureHelpers;
+import io.pravega.common.concurrent.Futures;
+import io.pravega.common.util.ByteBufferUtils;
+import io.pravega.common.util.Retry;
+import io.pravega.common.util.Retry.RetryWithBackoff;
 import io.pravega.shared.protocol.netty.ConnectionFailedException;
 import io.pravega.shared.protocol.netty.FailingReplyProcessor;
 import io.pravega.shared.protocol.netty.PravegaNodeUri;
-import io.pravega.common.util.Retry;
-import io.pravega.common.util.Retry.RetryWithBackoff;
-import io.pravega.client.netty.impl.ClientConnection;
-import io.pravega.client.netty.impl.ConnectionFactory;
-import io.pravega.client.stream.impl.ConnectionClosedException;
-import io.pravega.client.stream.impl.Controller;
-import com.google.common.base.Preconditions;
-import java.nio.ByteBuffer;
+import io.pravega.shared.protocol.netty.Reply;
+import io.pravega.shared.protocol.netty.WireCommands;
+import io.pravega.shared.protocol.netty.WireCommands.SegmentIsTruncated;
+import io.pravega.shared.protocol.netty.WireCommands.SegmentRead;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Supplier;
 import javax.annotation.concurrent.GuardedBy;
-
-import io.pravega.shared.protocol.netty.WireCommands;
-import lombok.Data;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 class AsyncSegmentInputStreamImpl extends AsyncSegmentInputStream {
 
-    private final RetryWithBackoff backoffSchedule = Retry.withExpBackoff(1, 10, 5);
+    private final RetryWithBackoff backoffSchedule = Retry.withExpBackoff(1, 10, 9, 30000);
     private final ConnectionFactory connectionFactory;
 
     private final Object lock = new Object();
     @GuardedBy("lock")
     private CompletableFuture<ClientConnection> connection = null;
     @GuardedBy("lock")
-    private final Map<Long, ReadFutureImpl> outstandingRequests = new HashMap<>();
-    @GuardedBy("lock")
-    private final Map<Long, CompletableFuture<WireCommands.StreamSegmentInfo>> infoRequests = new HashMap<>();
-    private final Supplier<Long> infoRequestIdGenerator = new AtomicLong()::incrementAndGet;
+    private final Map<Long, CompletableFuture<WireCommands.SegmentRead>> outstandingRequests = new HashMap<>();
+
     private final ResponseProcessor responseProcessor = new ResponseProcessor();
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final Controller controller;
+    private final DelegationTokenProvider tokenProvider;
+    @VisibleForTesting
+    @Getter
+    private final long requestId = Flow.create().asLong();
+    private final Semaphore replyAvailable;
 
     private final class ResponseProcessor extends FailingReplyProcessor {
-        
-        @Override
-        public void streamSegmentInfo(WireCommands.StreamSegmentInfo streamInfo) {
-            checkSegment(streamInfo.getSegmentName());
-            log.trace("Received stream segment info {}", streamInfo);
-            CompletableFuture<WireCommands.StreamSegmentInfo> future;
-            synchronized (lock) {
-                future = infoRequests.remove(streamInfo.getRequestId());
-            }
-            if (future != null) {
-                future.complete(streamInfo);
-            }
-        }        
 
+        @Override
+        public void process(Reply reply) {
+            super.process(reply);
+            if (replyAvailable != null) {
+                replyAvailable.release();
+            }
+        }
+        
         @Override
         public void connectionDropped() {
             closeConnection(new ConnectionFailedException());
@@ -84,45 +84,65 @@ class AsyncSegmentInputStreamImpl extends AsyncSegmentInputStream {
 
         @Override
         public void noSuchSegment(WireCommands.NoSuchSegment noSuchSegment) {
-            //TODO: It's not clear how we should be handling this case. (It should be impossible...)
-            closeConnection(new IllegalArgumentException(noSuchSegment.toString()));
+            log.info("Received noSuchSegment {}", noSuchSegment);
+            CompletableFuture<SegmentRead> future = grabFuture(noSuchSegment.getSegment(), noSuchSegment.getOffset());
+            if (future != null) {
+                future.completeExceptionally(new SegmentTruncatedException("Segment no longer exists."));
+            }
+        }
+        
+        @Override
+        public void segmentIsTruncated(SegmentIsTruncated segmentIsTruncated) {
+            log.info("Received segmentIsTruncated {}", segmentIsTruncated);
+            CompletableFuture<SegmentRead> future = grabFuture(segmentIsTruncated.getSegment(), segmentIsTruncated.getOffset());
+            if (future != null) {
+                future.completeExceptionally(new SegmentTruncatedException());
+            }
         }
         
         @Override
         public void segmentIsSealed(WireCommands.SegmentIsSealed segmentIsSealed) {
-            checkSegment(segmentIsSealed.getSegment());
-            ReadFutureImpl future;
-            synchronized (lock) {
-                future = outstandingRequests.remove(segmentIsSealed.getRequestId());
-            }
+            log.info("Received segmentSealed {}", segmentIsSealed);
+            CompletableFuture<SegmentRead> future = grabFuture(segmentIsSealed.getSegment(), segmentIsSealed.getOffset());
             if (future != null) {
-                future.complete(new WireCommands.SegmentRead(segmentIsSealed.getSegment(),
-                        segmentIsSealed.getRequestId(),
+                future.complete(new WireCommands.SegmentRead(
+                        segmentIsSealed.getSegment(),
+                        segmentIsSealed.getOffset(),
                         true,
                         true,
-                        ByteBuffer.allocate(0)));
+                        ByteBufferUtils.EMPTY,
+                        segmentIsSealed.getRequestId()));
             }
         }
 
         @Override
         public void segmentRead(WireCommands.SegmentRead segmentRead) {
-            checkSegment(segmentRead.getSegment());
             log.trace("Received read result {}", segmentRead);
-            ReadFutureImpl future;
-            synchronized (lock) {
-                future = outstandingRequests.remove(segmentRead.getOffset());
-            }
+            CompletableFuture<SegmentRead> future = grabFuture(segmentRead.getSegment(), segmentRead.getOffset());
             if (future != null) {
                 future.complete(segmentRead);
             }
         }
 
+        private CompletableFuture<SegmentRead> grabFuture(String segment, long offset) {
+            checkSegment(segment);
+            synchronized (lock) {
+                return outstandingRequests.remove(offset);
+            }
+        }
+
         @Override
         public void processingFailure(Exception error) {
-            log.warn("Processing failure: ", error);
+            log.warn("Processing failure on segment {}", segmentId, error);
             closeConnection(error);
         }
-        
+
+        @Override
+        public void authTokenCheckFailed(WireCommands.AuthTokenCheckFailed authTokenCheckFailed) {
+            log.warn("Auth check failed for reads on segment {} with {}",  segmentId, authTokenCheckFailed);
+            closeConnection(new AuthenticationException(authTokenCheckFailed.toString()));
+        }
+
         private void checkSegment(String segment) {
             Preconditions.checkState(segmentId.getScopedName().equals(segment),
                     "Operating on segmentId {} but received sealed for segment {}",
@@ -131,92 +151,96 @@ class AsyncSegmentInputStreamImpl extends AsyncSegmentInputStream {
         }
     }
 
-    @Data
-    private static class ReadFutureImpl implements ReadFuture {
-        private final WireCommands.ReadSegment request;
-        private final AtomicReference<CompletableFuture<WireCommands.SegmentRead>> result;
-
-        ReadFutureImpl(WireCommands.ReadSegment request) {
-            Preconditions.checkNotNull(request);
-            this.request = request;
-            this.result = new AtomicReference<>(new CompletableFuture<>());
-        }
-
-        @Override
-        public boolean await(long timeout) {
-            FutureHelpers.await(result.get(), timeout);
-            return result.get().isDone();
-        }
-        
-        public boolean await() {
-            return FutureHelpers.await(result.get());
-        }
-
-        private WireCommands.SegmentRead get() throws ExecutionException {
-            return Exceptions.handleInterrupted(() -> result.get().get());
-        }
-
-        private void complete(WireCommands.SegmentRead r) {
-            result.get().complete(r);
-        }
-
-        public void completeExceptionally(Exception e) {
-            result.get().completeExceptionally(e);
-        }
-
-        private void reset() {
-            CompletableFuture<WireCommands.SegmentRead> old = result.getAndSet(new CompletableFuture<>());
-            if (!old.isDone()) {
-                old.completeExceptionally(new RuntimeException("Retry already in progress"));
-            }
-        }
-
-        @Override
-        public boolean isSuccess() {
-            return FutureHelpers.isSuccessful(result.get());
-        }
-    }
-
-    public AsyncSegmentInputStreamImpl(Controller controller, ConnectionFactory connectionFactory, Segment segment) {
+    public AsyncSegmentInputStreamImpl(Controller controller, ConnectionFactory connectionFactory, Segment segment,
+                                       DelegationTokenProvider tokenProvider, Semaphore dataAvailable) {
         super(segment);
+        this.tokenProvider = tokenProvider;
         Preconditions.checkNotNull(controller);
         Preconditions.checkNotNull(connectionFactory);
         Preconditions.checkNotNull(segment);
         this.controller = controller;
         this.connectionFactory = connectionFactory;
+        this.replyAvailable = dataAvailable;
     }
 
     @Override
     public void close() {
+        log.info("Closing reader for {}", segmentId);
         if (closed.compareAndSet(false, true)) {
             closeConnection(new ConnectionClosedException());
         }
     }
 
     @Override
-    public ReadFuture read(long offset, int length) {
+    public boolean isClosed() {
+        return closed.get();
+    }
+
+    @Override
+    public CompletableFuture<SegmentRead> read(long offset, int length) {
         Exceptions.checkNotClosed(closed.get(), this);
-        WireCommands.ReadSegment request = new WireCommands.ReadSegment(segmentId.getScopedName(), offset, length);
+        return backoffSchedule.retryWhen(t -> {
+            Throwable ex = Exceptions.unwrap(t);
+            if (closed.get()) {
+                log.debug("Exception: {} while reading from Segment : {}", ex.toString(), segmentId);
+            } else {
+                log.warn("Exception while reading from Segment {} at offset {} :", segmentId, offset, ex);
+            }
+            return ex instanceof Exception && !(ex instanceof ConnectionClosedException) && !(ex instanceof SegmentTruncatedException);
+        }).runAsync(() -> this.tokenProvider.retrieveToken().thenComposeAsync(token -> {
+            final WireCommands.ReadSegment request = new WireCommands.ReadSegment(segmentId.getScopedName(), offset, length,
+                    token, requestId);
+            return getConnection()
+                    .whenComplete((connection1, ex) -> {
+                        if (ex != null) {
+                            log.warn("Exception while establishing connection with Pravega node {}: ", connection1,  ex);
+                            closeConnection(new ConnectionFailedException(ex));
+                        }
+                    }).thenCompose(c -> sendRequestOverConnection(request, c)
+                            .whenComplete((reply, ex) -> {
+                                if (ex instanceof ConnectionFailedException) {
+                                    log.debug("ConnectionFailedException observed when sending request {}", request, ex);
+                                    closeConnection((ConnectionFailedException) ex);
+                                }
+                            })
+                    );
+        }, connectionFactory.getInternalExecutor()), connectionFactory.getInternalExecutor());
+    }
         
-        ReadFutureImpl read = new ReadFutureImpl(request);
-        synchronized (lock) {
-            outstandingRequests.put(read.request.getOffset(), read);
+    private CompletableFuture<SegmentRead> sendRequestOverConnection(WireCommands.ReadSegment request, ClientConnection c) {
+        CompletableFuture<WireCommands.SegmentRead> result = new CompletableFuture<>();            
+        if (closed.get()) {
+            result.completeExceptionally(new ConnectionClosedException());
+            return result;
         }
-        getConnection().thenAccept((ClientConnection c) -> {
-            log.debug("Sending read request {}", read);
-            c.sendAsync(read.request);
+        synchronized (lock) {
+            outstandingRequests.put(request.getOffset(), result);
+        }
+        log.trace("Sending read request {}", request);
+        c.sendAsync(request, cfe -> {
+            if (cfe != null) {
+                log.error("Error while sending request {} to Pravega node {} :", request, c, cfe);
+                synchronized (lock) {
+                    outstandingRequests.remove(request.getOffset());
+                }
+                result.completeExceptionally(cfe);                
+            }
         });
-        return read;
+        return result;
     }
 
     private void closeConnection(Exception exceptionToInflightRequests) {
-        log.trace("Closing connection with exception: {}", exceptionToInflightRequests.toString());
+        if (closed.get()) {
+            log.info("Closing connection to segment: {}", segmentId);
+        } else {            
+            log.warn("Closing connection to segment {} with exception: {}", segmentId, exceptionToInflightRequests.toString());
+        }
         CompletableFuture<ClientConnection> c;
         synchronized (lock) {
             c = connection;
             connection = null;
         }
-        if (c != null && FutureHelpers.isSuccessful(c)) {
+        if (c != null && Futures.isSuccessful(c)) {
             try {
                 c.getNow(null).close();
             } catch (Exception e) {
@@ -236,68 +260,23 @@ class AsyncSegmentInputStreamImpl extends AsyncSegmentInputStream {
         return controller.getEndpointForSegment(segmentId.getScopedName()).thenCompose((PravegaNodeUri uri) -> {
             synchronized (lock) {
                 if (connection == null) {
-                    connection = connectionFactory.establishConnection(uri, responseProcessor);
+                    connection = connectionFactory.establishConnection(Flow.from(requestId), uri, responseProcessor);
                 }
-                return connection; 
-            } 
+                return connection;
+            }
         });
     }
 
     private void failAllInflight(Exception e) {
-        log.info("Connection failed due to a {}. Read requests will be retransmitted.", e.toString());
-        List<ReadFutureImpl> readsToFail;
-        List<CompletableFuture<WireCommands.StreamSegmentInfo>> infoRequestsToFail;
+        log.info("Connection failed due to a {}. Read requests for segment {} will be retransmitted.", e.toString(), segmentId);
+        List<CompletableFuture<WireCommands.SegmentRead>> readsToFail;
         synchronized (lock) {
             readsToFail = new ArrayList<>(outstandingRequests.values());
-            infoRequestsToFail = new ArrayList<>(infoRequests.values());
-            infoRequests.clear();
-            //outstanding requests are not removed as they may be retried.
+            outstandingRequests.clear();
         }
-        for (ReadFutureImpl read : readsToFail) {
+        for (CompletableFuture<WireCommands.SegmentRead> read : readsToFail) {
             read.completeExceptionally(e);
         }
-        for (CompletableFuture<WireCommands.StreamSegmentInfo> infoRequest : infoRequestsToFail) {
-            infoRequest.completeExceptionally(e);
-        }
-    }
-
-    @Override
-    public WireCommands.SegmentRead getResult(ReadFuture ongoingRead) {
-        ReadFutureImpl read = (ReadFutureImpl) ongoingRead;
-        return backoffSchedule.retryingOn(ExecutionException.class).throwingOn(RuntimeException.class).run(() -> {
-            if (closed.get()) {
-                throw new ObjectClosedException(this);
-            }
-            if (!read.await()) {
-                log.debug("Retransmitting a read request {}", read.request);
-                read.reset();
-                ClientConnection c = Exceptions.handleInterrupted(() -> getConnection().get());
-                try {
-                    c.send(read.request);
-                } catch (ConnectionFailedException e) {
-                    closeConnection(e);
-                }
-            }
-            return Exceptions.<ExecutionException, WireCommands.SegmentRead>handleInterrupted(() -> read.get());
-        });
-    }
-
-    @Override
-    public CompletableFuture<WireCommands.StreamSegmentInfo> getSegmentInfo() {
-        CompletableFuture<WireCommands.StreamSegmentInfo> result = new CompletableFuture<>();
-        long requestId = infoRequestIdGenerator.get();
-        synchronized (lock) {
-            infoRequests.put(requestId, result);
-        }
-        getConnection().thenAccept(c -> {
-            try {
-                log.trace("Getting segment info");
-                c.send(new WireCommands.GetStreamSegmentInfo(requestId, segmentId.getScopedName()));
-            } catch (ConnectionFailedException e) {
-                closeConnection(e);
-            }
-        });
-        return result;
     }
 
 }

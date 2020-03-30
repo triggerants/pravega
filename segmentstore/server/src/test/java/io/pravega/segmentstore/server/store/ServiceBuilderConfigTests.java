@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,33 +10,33 @@
 package io.pravega.segmentstore.server.store;
 
 import io.pravega.common.util.ConfigBuilder;
+import io.pravega.common.util.Property;
+import io.pravega.segmentstore.server.logs.DurableLogConfig;
 import io.pravega.segmentstore.server.reading.ReadIndexConfig;
 import io.pravega.segmentstore.server.writer.WriterConfig;
+import io.pravega.shared.metrics.MetricsConfig;
 import io.pravega.test.common.AssertExtensions;
 import java.io.File;
 import java.io.FileWriter;
-import java.util.Map;
-import java.util.Properties;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Consumer;
-
-import io.pravega.common.util.Property;
-import io.pravega.segmentstore.server.logs.DurableLogConfig;
-import lombok.Cleanup;
-import lombok.val;
-import io.pravega.shared.metrics.MetricsConfig;
-
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import lombok.Cleanup;
+import lombok.val;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.Timeout;
 
 /**
  * Unit tests for the ServiceBuilderConfig class.
@@ -47,6 +47,8 @@ public class ServiceBuilderConfigTests {
             .of(Integer.class.getName(), Long.class.getName(), String.class.getName(), Boolean.class.getName())
             .map(s -> Property.class.getSimpleName() + "<" + s + ">")
             .collect(Collectors.toList());
+    @Rule
+    public Timeout globalTimeout = Timeout.seconds(10);
 
     /**
      * Tests the Builder for ServiceBuilderConfig.
@@ -104,7 +106,7 @@ public class ServiceBuilderConfigTests {
         testClasses.put(ServiceConfig.class, ServiceConfig::builder);
 
         // Value generator.
-        val nextValue = new AtomicInteger(1000 * 1000 * 1000);
+        val nextValue = new AtomicInteger(10);
 
         // Create instances of each test class and dynamically assign their properties some arbitrary values
         val expectedValues = new HashMap<Class<?>, Object>();
@@ -118,6 +120,7 @@ public class ServiceBuilderConfigTests {
                 if (Modifier.isStatic(f.getModifiers())
                         && f.getType().isAssignableFrom(Property.class)
                         && isSupportedType(f.getGenericType().getTypeName())) {
+                    @SuppressWarnings("rawtypes")
                     Property p = (Property) f.get(null);
                     if (p.getDefaultValue() != null && p.getDefaultValue() instanceof Boolean) {
                         configBuilder.with(p, nextValue.incrementAndGet() % 2 == 0);

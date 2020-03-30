@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,18 +10,20 @@
 package io.pravega.common.util;
 
 import com.google.common.base.Preconditions;
-import io.pravega.common.ExceptionHelpers;
 import io.pravega.common.Exceptions;
-import io.pravega.common.concurrent.FutureHelpers;
+import io.pravega.common.concurrent.Futures;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import lombok.Getter;
+import lombok.experimental.Wither;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -53,6 +55,10 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public final class Retry {
 
+    private final static long DEFAULT_RETRY_INIT_DELAY = 100;
+    private final static int DEFAULT_RETRY_MULTIPLIER = 2;
+    private final static long DEFAULT_RETRY_MAX_DELAY = Duration.ofSeconds(5).toMillis();
+
     private Retry() {
     }
 
@@ -76,18 +82,36 @@ public final class Retry {
         return new RetryUnconditionally(consumer, params);
     }
 
+    public static RetryUnconditionally indefinitelyWithExpBackoff(String failureMessage) {
+        Exceptions.checkNotNullOrEmpty(failureMessage, "failureMessage");
+        RetryWithBackoff params = new RetryWithBackoff(DEFAULT_RETRY_INIT_DELAY, DEFAULT_RETRY_MULTIPLIER,
+                Integer.MAX_VALUE, DEFAULT_RETRY_MAX_DELAY);
+        Consumer<Throwable> consumer = e -> {
+            if (log.isDebugEnabled()) {
+                log.debug(failureMessage);
+            } else {
+                log.warn(failureMessage);
+            }
+        };
+        return new RetryUnconditionally(consumer, params);
+    }
+
     /**
      * Returned by {@link Retry#withExpBackoff(long, int, int)} to set the retry schedule.
      * Used to invoke {@link #retryingOn(Class)}. Note this object is reusable so this can be done more than once.
      */
     public static final class RetryWithBackoff {
         @Getter
+        @Wither
         private final long initialMillis;
         @Getter
+        @Wither
         private final int multiplier;
         @Getter
+        @Wither
         private final int attempts;
         @Getter
+        @Wither
         private final long maxDelay;
 
         private RetryWithBackoff(long initialMillis, int multiplier, int attempts, long maxDelay) {
@@ -102,9 +126,9 @@ public final class Retry {
             return new RetryExceptionally<>(retryType, this);
         }
 
-        public RetryConditionally retryWhen(Predicate<Throwable> predicate) {
+        public RetryAndThrowConditionally retryWhen(Predicate<Throwable> predicate) {
             Preconditions.checkNotNull(predicate);
-            return new RetryConditionally(predicate, this);
+            return new RetryAndThrowConditionally(predicate, this);
         }
     }
 
@@ -127,36 +151,15 @@ public final class Retry {
         }
     }
 
-    /**
-     * Returned by {@link RetryWithBackoff#retryingOn(Class)} to add the type of exception that should result in a retry.
-     * Any exception will be retried based on the predicate unless the subtype is passed to {@link RetryConditionally#throwingOn(Class)}.
-     */
-    public static final class RetryConditionally {
-        private final Predicate<Throwable> predicate;
-        private final RetryWithBackoff params;
-
-        private RetryConditionally(Predicate<Throwable> predicate, RetryWithBackoff params) {
-            this.predicate = predicate;
-            this.params = params;
-        }
-
-        public <ThrowsT extends Exception> RetryAndThrowConditionally<ThrowsT> throwingOn(Class<ThrowsT> throwType) {
-            Preconditions.checkNotNull(throwType);
-            return new RetryAndThrowConditionally<>(predicate, throwType, params);
-        }
-    }
-
     @FunctionalInterface
     public interface Retryable<ReturnT, RetryableET extends Exception, NonRetryableET extends Exception> {
         ReturnT attempt() throws RetryableET, NonRetryableET;
     }
 
     public static abstract class RetryAndThrowBase<ThrowsT extends Exception> {
-        final Class<ThrowsT> throwType;
         final RetryWithBackoff params;
 
-        private RetryAndThrowBase(Class<ThrowsT> throwType, RetryWithBackoff params) {
-            this.throwType = throwType;
+        private RetryAndThrowBase(RetryWithBackoff params) {
             this.params = params;
         }
 
@@ -178,24 +181,59 @@ public final class Retry {
                     }
                 }
 
-                final long sleepFor = delay;
-                Exceptions.handleInterrupted(() -> Thread.sleep(sleepFor));
+                if (attemptNumber < params.attempts) {
+                    // no need to sleep if it is the last attempt
+                    final long sleepFor = delay;
+                    Exceptions.handleInterrupted(() -> Thread.sleep(sleepFor));
 
-                delay = Math.min(params.maxDelay, params.multiplier * delay);
-                log.debug("Retrying command. Retry #{}, timestamp={}", attemptNumber, Instant.now());
+                    delay = Math.min(params.maxDelay, params.multiplier * delay);
+                    log.debug("Retrying command {} Retry #{}, timestamp={}", r.toString(), attemptNumber, Instant.now());
+                }
             }
             throw new RetriesExhaustedException(last);
         }
-
+        
+        public CompletableFuture<Void> runInExecutor(final Runnable task,
+                                                     final ScheduledExecutorService executorService) {
+            Preconditions.checkNotNull(task);
+            AtomicBoolean isDone = new AtomicBoolean();
+            AtomicInteger attemptNumber = new AtomicInteger(1);
+            AtomicLong delay = new AtomicLong(0);
+            return Futures.loop(
+                    () -> !isDone.get(),
+                    () -> Futures.delayedFuture(Duration.ofMillis(delay.get()), executorService)
+                                 .thenRunAsync(task, executorService)
+                                 .thenRun(() -> isDone.set(true)) // We are done.
+                                 .exceptionally(ex -> {
+                                if (!canRetry(ex)) {
+                                    // Cannot retry this exception. Fail now.
+                                    isDone.set(true);
+                                } else if (attemptNumber.get() + 1 > params.attempts) {
+                                    // We have retried as many times as we were asked, unsuccessfully.
+                                    isDone.set(true);
+                                    throw new RetriesExhaustedException(ex);
+                                } else {
+                                    // Try again.
+                                    delay.set(attemptNumber.get() == 1 ?
+                                            params.initialMillis :
+                                            Math.min(params.maxDelay, params.multiplier * delay.get()));
+                                    attemptNumber.incrementAndGet();
+                                    log.debug("Retrying command {} Retry #{}, timestamp={}", task.toString(), attemptNumber, Instant.now());
+                                }
+                                return null;
+                            }),
+                    executorService);
+        }
+        
         public <ReturnT> CompletableFuture<ReturnT> runAsync(final Supplier<CompletableFuture<ReturnT>> r,
                                                              final ScheduledExecutorService executorService) {
             Preconditions.checkNotNull(r);
             CompletableFuture<ReturnT> result = new CompletableFuture<>();
             AtomicInteger attemptNumber = new AtomicInteger(1);
             AtomicLong delay = new AtomicLong(0);
-            FutureHelpers.loop(
+            Futures.loop(
                     () -> !result.isDone(),
-                    () -> FutureHelpers
+                    () -> Futures
                             .delayedFuture(r, delay.get(), executorService)
                             .thenAccept(result::complete) // We are done.
                             .exceptionally(ex -> {
@@ -211,7 +249,7 @@ public final class Retry {
                                             params.initialMillis :
                                             Math.min(params.maxDelay, params.multiplier * delay.get()));
                                     attemptNumber.incrementAndGet();
-                                    log.debug("Retrying command. Retry #{}, timestamp={}", attemptNumber, Instant.now());
+                                    log.debug("Retrying command {} Retry #{}, timestamp={}", r.toString(), attemptNumber, Instant.now());
                                 }
 
                                 return null;
@@ -231,10 +269,12 @@ public final class Retry {
     public static final class RetryAndThrowExceptionally<RetryT extends Exception, ThrowsT extends Exception>
         extends RetryAndThrowBase<ThrowsT> {
         private final Class<RetryT> retryType;
+        private final Class<ThrowsT> throwType;
 
         private RetryAndThrowExceptionally(Class<RetryT> retryType, Class<ThrowsT> throwType, RetryWithBackoff params) {
-            super(throwType, params);
+            super(params);
             this.retryType = retryType;
+            this.throwType = throwType;
         }
 
         @Override
@@ -247,10 +287,10 @@ public final class Retry {
         }
 
         private Class<? extends Throwable> getErrorType(final Throwable e) {
-            if (ExceptionHelpers.shouldUnwrap(retryType) || ExceptionHelpers.shouldUnwrap(throwType)) {
+            if (Exceptions.shouldUnwrap(retryType) || Exceptions.shouldUnwrap(throwType)) {
                 return e.getClass();
             } else {
-                return ExceptionHelpers.unwrapIfRequired(e).getClass();
+                return Exceptions.unwrap(e).getClass();
             }
         }
     }
@@ -260,12 +300,11 @@ public final class Retry {
      * method to throw right away. If any subtype of this exception occurs the method will throw it right away unless
      * the predicate passed to {@link RetryWithBackoff#retryingOn(Class)} says otherwise
      */
-    public static final class RetryAndThrowConditionally<ThrowsT extends Exception>
-            extends RetryAndThrowBase<ThrowsT> {
+    public static final class RetryAndThrowConditionally extends RetryAndThrowBase<RuntimeException> {
         private final Predicate<Throwable> predicate;
 
-        private RetryAndThrowConditionally(Predicate<Throwable> predicate, Class<ThrowsT> throwType, RetryWithBackoff params) {
-            super(throwType, params);
+        private RetryAndThrowConditionally(Predicate<Throwable> predicate, RetryWithBackoff params) {
+            super(params);
             this.predicate = predicate;
         }
 
@@ -279,11 +318,11 @@ public final class Retry {
      * Returned by {@link Retry#indefinitelyWithExpBackoff(long, int, long, Consumer)} (Class)} to
      * retry indefinitely. Its can retry method always returns true.
      */
-    public static final class RetryUnconditionally extends RetryAndThrowBase<Exception> {
+    public static final class RetryUnconditionally extends RetryAndThrowBase<RuntimeException> {
         private final Consumer<Throwable> consumer;
 
         RetryUnconditionally(Consumer<Throwable> consumer, RetryWithBackoff params) {
-            super(Exception.class, params);
+            super(params);
             this.consumer = consumer;
         }
 

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -11,10 +11,12 @@ package io.pravega.common;
 
 import java.time.Duration;
 import java.util.function.Supplier;
+import lombok.ToString;
 
 /**
  * Helps figuring out how much time is left from a particular (initial) timeout.
  */
+@ToString(of = { "timeout" })
 public class TimeoutTimer {
     private final Supplier<Long> getNanos;
     private volatile Duration timeout;

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,6 +9,7 @@
  */
 package io.pravega.segmentstore.server.logs.operations;
 
+import io.pravega.common.util.ByteArraySegment;
 import io.pravega.test.common.AssertExtensions;
 import lombok.val;
 import org.junit.Test;
@@ -25,7 +26,7 @@ public class CachedStreamSegmentAppendOperationTests {
      */
     @Test
     public void testConstructor() {
-        byte[] data = "foo".getBytes();
+        ByteArraySegment data = new ByteArraySegment("foo".getBytes());
         val attributes = StreamSegmentAppendOperationTests.createAttributes();
         StreamSegmentAppendOperation baseOp = new StreamSegmentAppendOperation(SEGMENT_ID, data, attributes);
         baseOp.setSequenceNumber(1);

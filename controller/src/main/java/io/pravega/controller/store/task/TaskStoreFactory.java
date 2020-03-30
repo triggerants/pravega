@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -11,7 +11,7 @@ package io.pravega.controller.store.task;
 
 import io.pravega.controller.store.client.StoreClient;
 import com.google.common.annotations.VisibleForTesting;
-import org.apache.commons.lang.NotImplementedException;
+import org.apache.commons.lang3.NotImplementedException;
 import org.apache.curator.framework.CuratorFramework;
 
 import java.util.concurrent.ScheduledExecutorService;
@@ -24,11 +24,12 @@ public class TaskStoreFactory {
     public static TaskMetadataStore createStore(StoreClient storeClient, ScheduledExecutorService executor) {
         switch (storeClient.getType()) {
             case Zookeeper:
+            case PravegaTable:
                 return new ZKTaskMetadataStore((CuratorFramework) storeClient.getClient(), executor);
             case InMemory:
                 return new InMemoryTaskMetadataStore(executor);
             default:
-                throw new NotImplementedException();
+                throw new NotImplementedException(storeClient.getType().toString());
         }
     }
 

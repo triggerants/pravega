@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,10 +23,10 @@ public interface OperationLog extends Container {
      *
      * @param operation The Operation to append.
      * @param timeout   Timeout for the operation.
-     * @return A CompletableFuture that, when completed, will contain the Sequence for the Operation. If the entry failed to
-     * be added, this Future will complete with the appropriate exception.
+     * @return A CompletableFuture that, when completed, will indicate that the operation has been durably added. If the
+     * operation failed to be added, this Future will complete with the appropriate exception.
      */
-    CompletableFuture<Long> add(Operation operation, Duration timeout);
+    CompletableFuture<Void> add(Operation operation, Duration timeout);
 
     /**
      * Truncates the log up to the given sequence.
@@ -50,12 +50,12 @@ public interface OperationLog extends Container {
     CompletableFuture<Iterator<Operation>> read(long afterSequence, int maxCount, Duration timeout);
 
     /**
-     * Waits until all currently pending Operations up to this point are processed (whether successfully or not).
+     * Waits until the OperationLog enters an Online State.
      *
-     * @param timeout Timeout for the operation.
-     * @return A CompletableFuture that, when completed, will indicate that all currently pending operations up to this
-     * point will have completed (normally or exceptionally).
+     * @return A CompletableFuture that, when completed, will indicate that the OperationLog is Online. If the OperationLog
+     * is already Online, this Future will be already completed when returned. If the OperationLog encounters an exception
+     * while attempting to start (including it shutting down), this Future will be completed with the appropriate exception.
      */
-    CompletableFuture<Void> operationProcessingBarrier(Duration timeout);
+    CompletableFuture<Void> awaitOnline();
 }
 

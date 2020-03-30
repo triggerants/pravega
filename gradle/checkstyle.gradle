@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,7 +13,8 @@ plugins.withId('checkstyle') {
         toolVersion = checkstyleToolVersion
 
         configFile = new File(rootDir, "checkstyle/checkstyle.xml")
-        configProperties = [importControlFile: "$rootDir/checkstyle/import-control.xml"]
+        configProperties = [importControlFile: "$rootDir/checkstyle/import-control.xml",
+                            suppressionsFile: "$rootDir/checkstyle/suppressions.xml"]
     }
 
     plugins.withId('java') {

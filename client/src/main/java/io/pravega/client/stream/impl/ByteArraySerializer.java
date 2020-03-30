@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import java.nio.ByteBuffer;
  * An implementation of {@link Serializer} that converts byte arrays.
  */
 public class ByteArraySerializer implements Serializer<byte[]>, Serializable {
+    private static final long serialVersionUID = 1L;
     @Override
     public ByteBuffer serialize(byte[] value) {
         return ByteBuffer.wrap(value);

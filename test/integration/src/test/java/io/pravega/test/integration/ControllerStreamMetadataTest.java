@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,9 +9,13 @@
  */
 package io.pravega.test.integration;
 
+import io.pravega.client.ClientConfig;
 import io.pravega.client.admin.StreamManager;
 import io.pravega.client.admin.impl.StreamManagerImpl;
-import io.pravega.common.concurrent.FutureHelpers;
+import io.pravega.client.netty.impl.ConnectionFactory;
+import io.pravega.client.netty.impl.ConnectionFactoryImpl;
+import io.pravega.common.concurrent.Futures;
+import io.pravega.segmentstore.contracts.tables.TableStore;
 import io.pravega.test.common.TestingServerStarter;
 import io.pravega.test.integration.demo.ControllerWrapper;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
@@ -60,8 +64,9 @@ public class ControllerStreamMetadataTest {
             ServiceBuilder serviceBuilder = ServiceBuilder.newInMemoryBuilder(ServiceBuilderConfig.getDefaultConfig());
             serviceBuilder.initialize();
             StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
+            TableStore tableStore = serviceBuilder.createTableStoreService();
 
-            this.server = new PravegaConnectionListener(false, servicePort, store);
+            this.server = new PravegaConnectionListener(false, servicePort, store, tableStore);
             this.server.startListening();
 
             // 3. Start controller
@@ -70,8 +75,6 @@ public class ControllerStreamMetadataTest {
             this.controllerWrapper.awaitRunning();
             this.controller = controllerWrapper.getController();
             this.streamConfiguration = StreamConfiguration.builder()
-                    .scope(SCOPE)
-                    .streamName(STREAM)
                     .scalingPolicy(ScalingPolicy.fixed(1))
                     .build();
         } catch (Exception e) {
@@ -109,25 +112,25 @@ public class ControllerStreamMetadataTest {
         assertTrue(controller.deleteScope(SCOPE).join());
 
         // Try creating a stream. It should fail, since the scope does not exist.
-        assertFalse(FutureHelpers.await(controller.createStream(streamConfiguration)));
+        assertFalse(Futures.await(controller.createStream(SCOPE, STREAM, streamConfiguration)));
 
         // Again create the scope.
         assertTrue(controller.createScope(SCOPE).join());
 
         // Try creating the stream again. It should succeed now, since the scope exists.
-        assertTrue(controller.createStream(streamConfiguration).join());
+        assertTrue(controller.createStream(SCOPE, STREAM, streamConfiguration).join());
 
         // Delete test scope. This operation should fail, since it is not empty.
-        assertFalse(FutureHelpers.await(controller.deleteScope(SCOPE)));
+        assertFalse(Futures.await(controller.deleteScope(SCOPE)));
 
         // Try creating already existing scope.
         assertFalse(controller.createScope(SCOPE).join());
 
         // Try creating already existing stream.
-        assertFalse(controller.createStream(streamConfiguration).join());
+        assertFalse(controller.createStream(SCOPE, STREAM, streamConfiguration).join());
 
         // Delete test stream. This operation should fail, since it is not yet SEALED.
-        assertFalse(FutureHelpers.await(controller.deleteStream(SCOPE, STREAM)));
+        assertFalse(Futures.await(controller.deleteStream(SCOPE, STREAM)));
 
         // Seal the test stream. This operation should succeed.
         assertTrue(controller.sealStream(SCOPE, STREAM).join());
@@ -145,20 +148,20 @@ public class ControllerStreamMetadataTest {
         assertFalse(controller.deleteScope("non_existent_scope").join());
 
         // Create a scope with invalid characters. It should fail.
-        assertFalse(FutureHelpers.await(controller.createScope("abc/def")));
+        assertFalse(Futures.await(controller.createScope("abc/def")));
 
         // Try creating stream with invalid characters. It should fail.
-        assertFalse(FutureHelpers.await(controller.createStream(StreamConfiguration.builder()
-                                                                                   .scope(SCOPE)
-                                                                                   .streamName("abc/def")
-                                                                                   .scalingPolicy(ScalingPolicy.fixed(1))
-                                                                                   .build())));
+        assertFalse(Futures.await(controller.createStream(SCOPE, "abc/def", StreamConfiguration.builder()
+                                                                             .scalingPolicy(ScalingPolicy.fixed(1))
+                                                                             .build())));
     }
 
     @Test(timeout = 10000)
     public void streamManagerImpltest() {
         @Cleanup
-        StreamManager streamManager = new StreamManagerImpl(controller);
+        ConnectionFactory cf = new ConnectionFactoryImpl(ClientConfig.builder().build());
+        @Cleanup
+        StreamManager streamManager = new StreamManagerImpl(controller, cf);
 
         // Create and delete scope
         assertTrue(streamManager.createScope(SCOPE));

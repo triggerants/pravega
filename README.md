@@ -1,5 +1,5 @@
 <!--
-Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 -->
-# Pravega [![Build Status](https://travis-ci.com/pravega/pravega.svg?token=qhH3WLZqyhzViixpn6ZT&branch=master)](https://travis-ci.com/pravega/pravega) [![codecov](https://codecov.io/gh/pravega/pravega/branch/master/graph/badge.svg?token=6xOvaR0sIa)](https://codecov.io/gh/pravega/pravega)
+# Pravega [![Build Status](https://travis-ci.org/pravega/pravega.svg?branch=master)](https://travis-ci.org/pravega/pravega/builds) [![codecov](https://codecov.io/gh/pravega/pravega/branch/master/graph/badge.svg?token=6xOvaR0sIa)](https://codecov.io/gh/pravega/pravega) [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Version](https://img.shields.io/github/release/pravega/pravega.svg)](https://github.com/pravega/pravega/releases)
 
 Pravega is an open source distributed storage service implementing **Streams**. It offers Stream as the main primitive for the foundation of reliable storage systems: a *high-performance, durable, elastic, and unlimited append-only byte stream with strict ordering and consistency*.
 
@@ -63,29 +63,29 @@ The latest pravega releases can be found on the [Github Release](https://github.
 
 ## Quick Start
 
-Read [Getting Started](docs/getting-started.md) page for more information, and also visit [sample-apps](https://github.com/pravega/pravega-samples) repo for more applications.
+Read [Getting Started](documentation/src/docs/getting-started.md) page for more information, and also visit [sample-apps](https://github.com/pravega/pravega-samples) repo for more applications.
 
 ## Running Pravega
 
-Pravega can be installed locally or in a distributed environment. The installation and deployment of pravega is covered in the [Running Pravega](docs/deployment/deployment.md) guide.
+Pravega can be installed locally or in a distributed environment. The installation and deployment of pravega is covered in the [Running Pravega](documentation/src/docs/deployment/deployment.md) guide.
 
 ## Support
 
-Don’t hesitate to ask! Contact the developers and community on the [mailing lists](https://groups.google.com/forum/#!forum/pravega-users) or on [slack](https://codecommunity.slack.com/#pravega) if you need any help. 
+Don’t hesitate to ask! Contact the developers and community on the [mailing lists](https://groups.google.com/forum/#!forum/pravega-users) or on [slack](https://pravega-io.slack.com/) if you need any help.
 Open an issue if you found a bug on [Github
-Issues](https://github.com/pravega/pravega/issues)
+Issues](https://github.com/pravega/pravega/issues).
 
 ## Documentation
 
 The Pravega documentation of is hosted on the website:
-<http://pravega.io/docs> or in the [docs/](docs) directory of the source code.
+<http://pravega.io/docs/latest> or in the [documentation](documentation/src/docs) directory of the source code.
 
 ## Contributing
 
 Become one of the contributors! We thrive to build a welcoming and open
 community for anyone who wants to use the system or contribute to it.
-[Here](docs/contributing.md) we describe how to contribute to Pravega!
-You can see the roadmap document [here](docs/roadmap.md)
+[Here](documentation/src/docs/contributing.md) we describe how to contribute to Pravega!
+You can see the roadmap document [here](documentation/src/docs/roadmap.md).
 
 ## About
 

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,16 +10,10 @@
 package io.pravega.test.integration;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
-import io.pravega.client.ClientFactory;
+import io.pravega.client.ClientConfig;
+import io.pravega.client.EventStreamClientFactory;
 import io.pravega.client.admin.ReaderGroupManager;
 import io.pravega.client.admin.StreamManager;
-import io.pravega.common.concurrent.FutureHelpers;
-import io.pravega.test.integration.utils.IntegerSerializer;
-import io.pravega.test.integration.utils.SetupUtils;
-import io.pravega.segmentstore.contracts.StreamSegmentStore;
-import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
-import io.pravega.segmentstore.server.store.ServiceBuilder;
-import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.client.stream.EventStreamReader;
 import io.pravega.client.stream.EventStreamWriter;
 import io.pravega.client.stream.EventWriterConfig;
@@ -27,10 +21,20 @@ import io.pravega.client.stream.ReaderConfig;
 import io.pravega.client.stream.ReaderGroupConfig;
 import io.pravega.client.stream.ReinitializationRequiredException;
 import io.pravega.client.stream.ScalingPolicy;
+import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.mock.MockClientFactory;
 import io.pravega.client.stream.mock.MockStreamManager;
+import io.pravega.common.concurrent.ExecutorServiceHelpers;
+import io.pravega.common.concurrent.Futures;
+import io.pravega.segmentstore.contracts.StreamSegmentStore;
+import io.pravega.segmentstore.contracts.tables.TableStore;
+import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
+import io.pravega.segmentstore.server.store.ServiceBuilder;
+import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.test.common.TestUtils;
+import io.pravega.test.integration.utils.IntegerSerializer;
+import io.pravega.test.integration.utils.SetupUtils;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -100,21 +104,21 @@ public class MultiReadersEndToEndTest {
     private void runTest(final Set<String> streamNames, final int numParallelReaders, final int numSegments)
             throws Exception {
         @Cleanup
-        StreamManager streamManager = StreamManager.create(SETUP_UTILS.getControllerUri());
+        StreamManager streamManager = StreamManager.create(ClientConfig.builder()
+                                                                       .controllerURI(SETUP_UTILS.getControllerUri()).build());
         streamManager.createScope(SETUP_UTILS.getScope());
         streamNames.stream().forEach(stream -> {
             streamManager.createStream(SETUP_UTILS.getScope(),
                                        stream,
                                        StreamConfiguration.builder()
-                                               .scope(SETUP_UTILS.getScope())
-                                               .streamName(stream)
                                                .scalingPolicy(ScalingPolicy.fixed(numSegments))
                                                .build());
             log.info("Created stream: {}", stream);
         });
 
         @Cleanup
-        ClientFactory clientFactory = ClientFactory.withScope(SETUP_UTILS.getScope(), SETUP_UTILS.getControllerUri());
+        EventStreamClientFactory clientFactory = EventStreamClientFactory.withScope(SETUP_UTILS.getScope(), ClientConfig.builder()
+                                                                                                  .controllerURI(SETUP_UTILS.getControllerUri()).build());
         streamNames.stream().forEach(stream -> {
             EventStreamWriter<Integer> eventWriter = clientFactory.createEventWriter(
                     stream, new IntegerSerializer(), EventWriterConfig.builder().build());
@@ -129,21 +133,24 @@ public class MultiReadersEndToEndTest {
 
         @Cleanup
         ReaderGroupManager readerGroupManager = ReaderGroupManager.withScope(SETUP_UTILS.getScope(),
-                                                                             SETUP_UTILS.getControllerUri());
-        readerGroupManager.createReaderGroup(readerGroupName,
-                                             ReaderGroupConfig.builder().startingTime(0).build(),
-                                             streamNames);
+                                    ClientConfig.builder()
+                                                .controllerURI(SETUP_UTILS.getControllerUri()).build());
+        ReaderGroupConfig.ReaderGroupConfigBuilder builder = ReaderGroupConfig.builder();
+        streamNames.forEach(s -> builder.stream(Stream.of(SETUP_UTILS.getScope(), s)));
+        readerGroupManager.createReaderGroup(readerGroupName, builder.build());
 
         Collection<Integer> read = readAllEvents(numParallelReaders, clientFactory, readerGroupName, numSegments);
 
         Assert.assertEquals(NUM_TEST_EVENTS * streamNames.size(), read.size());
         // Check unique events.
         Assert.assertEquals(NUM_TEST_EVENTS, new TreeSet<>(read).size());
+        readerGroupManager.deleteReaderGroup(readerGroupName);
     }
 
-    private Collection<Integer> readAllEvents(final int numParallelReaders, ClientFactory clientFactory,
+    private Collection<Integer> readAllEvents(final int numParallelReaders, EventStreamClientFactory clientFactory,
                                               final String readerGroupName, final int numSegments) {
         ConcurrentLinkedQueue<Integer> read = new ConcurrentLinkedQueue<>();
+        @Cleanup("shutdownNow")
         final ExecutorService executorService = Executors.newFixedThreadPool(
                 numParallelReaders, new ThreadFactoryBuilder().setNameFormat("testreader-pool-%d").build());
         List<Future<?>> futures = new ArrayList<>();
@@ -173,8 +180,8 @@ public class MultiReadersEndToEndTest {
         }
 
         // Wait until all readers are done.
-        futures.forEach(f -> FutureHelpers.getAndHandleExceptions(f, RuntimeException::new));
-        executorService.shutdownNow();
+        futures.forEach(f -> Futures.getAndHandleExceptions(f, RuntimeException::new));
+        ExecutorServiceHelpers.shutdown(executorService);
         return read;
     }
     
@@ -184,8 +191,9 @@ public class MultiReadersEndToEndTest {
         ServiceBuilder serviceBuilder = ServiceBuilder.newInMemoryBuilder(ServiceBuilderConfig.getDefaultConfig());
         serviceBuilder.initialize();
         StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
+        TableStore tableStore = serviceBuilder.createTableStoreService();
         @Cleanup
-        PravegaConnectionListener server = new PravegaConnectionListener(false, servicePort, store);
+        PravegaConnectionListener server = new PravegaConnectionListener(false, servicePort, store, tableStore);
         server.startListening();
         @Cleanup
         MockStreamManager streamManager = new MockStreamManager("scope", "localhost", servicePort);
@@ -195,8 +203,6 @@ public class MultiReadersEndToEndTest {
             streamManager.createStream("scope",
                                        stream,
                                        StreamConfiguration.builder()
-                                       .scope("scope")
-                                       .streamName(stream)
                                        .scalingPolicy(ScalingPolicy.fixed(numSegments))
                                        .build());
             EventStreamWriter<Integer> eventWriter = clientFactory.createEventWriter(stream,
@@ -211,14 +217,15 @@ public class MultiReadersEndToEndTest {
         });
 
         final String readerGroupName = "testReaderGroup";
-        streamManager.createReaderGroup(readerGroupName,
-                                        ReaderGroupConfig.builder().startingTime(0).build(),
-                                        streamNames);
+        ReaderGroupConfig.ReaderGroupConfigBuilder builder = ReaderGroupConfig.builder();
+        streamNames.forEach(s -> builder.stream(Stream.of("scope", s)));
+        streamManager.createReaderGroup(readerGroupName, builder.build());
 
         Collection<Integer> read = readAllEvents(numParallelReaders, clientFactory, readerGroupName, numSegments);
 
         Assert.assertEquals(NUM_TEST_EVENTS * streamNames.size(), read.size());
         // Check unique events.
         Assert.assertEquals(NUM_TEST_EVENTS, new TreeSet<>(read).size());
+        streamManager.deleteReaderGroup(readerGroupName);
     }
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,11 +9,12 @@
  */
 package io.pravega.controller.eventProcessor.impl;
 
+import com.google.common.annotations.VisibleForTesting;
 import io.pravega.controller.store.checkpoint.CheckpointStoreException;
 import io.pravega.shared.controller.event.ControllerEvent;
 import io.pravega.client.stream.Position;
 
-import java.util.concurrent.Future;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Event processor interface.
@@ -26,8 +27,8 @@ public abstract class EventProcessor<T extends ControllerEvent> {
     }
 
     @FunctionalInterface
-    public interface Writer<T> {
-        Future<Void> write(T event);
+    public interface Writer<T extends ControllerEvent> {
+        CompletableFuture<Void> write(T event);
     }
 
     Checkpointer checkpointer;
@@ -72,7 +73,8 @@ public abstract class EventProcessor<T extends ControllerEvent> {
      * Returns a stream writer that can be used to write events to the underlying event stream.
      * @return a stream writer that can be used to write events to the underlying event stream.
      */
-    protected Writer<T> getSelfWriter() {
+    @VisibleForTesting
+    public Writer<T> getSelfWriter() {
         return selfWriter;
     }
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,11 +9,13 @@
  */
 package io.pravega.client.stream.impl;
 
-import io.pravega.client.stream.Serializer;
 import com.google.common.base.Preconditions;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.pravega.client.stream.Serializer;
+import io.pravega.shared.protocol.netty.WireCommands.Event;
 import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
-
 import lombok.Data;
 
 /**
@@ -22,7 +24,12 @@ import lombok.Data;
  */
 @Data
 public class PendingEvent {
-    public static final int MAX_WRITE_SIZE = Serializer.MAX_EVENT_SIZE;
+    /**
+     * The serialized event max size. Equals to the max event payload size plus additional 8 bytes for the wire command
+     * code and the payload size.
+     * @see Event for the details.
+     */
+    public static final int MAX_WRITE_SIZE = Serializer.MAX_EVENT_SIZE + 8;
     /**
      * The routing key that was provided to route the data.
      */
@@ -30,27 +37,27 @@ public class PendingEvent {
     /**
      * The data to be written. Note this is limited to {@value #MAX_WRITE_SIZE} bytes.
      */
-    private final ByteBuffer data;
+    private final ByteBuf data;
     /**
      * Callback to be invoked when the data is written.
      */
-    private final CompletableFuture<Boolean> ackFuture;
-    /**
-     * If this is not null the data should only be written if the segment is of this length before the data is added.
-     */
-    private final Long expectedOffset;
-    
-    public PendingEvent(String routingKey, ByteBuffer data, CompletableFuture<Boolean> ackFuture) {
-        this(routingKey, data, ackFuture, null);
-    }
-    
-    public PendingEvent(String routingKey, ByteBuffer data, CompletableFuture<Boolean> ackFuture, Long expectedOffset) {
+    private final CompletableFuture<Void> ackFuture;
+       
+    private PendingEvent(String routingKey, ByteBuf data, CompletableFuture<Void> ackFuture) {
         Preconditions.checkNotNull(data);
-        Preconditions.checkNotNull(ackFuture);
-        Preconditions.checkArgument(data.remaining() <= MAX_WRITE_SIZE, "Write size too large: %s", data.remaining());
+        Preconditions.checkArgument(data.readableBytes() <= MAX_WRITE_SIZE, "Write size too large: %s", data.readableBytes());
         this.routingKey = routingKey;
         this.data = data;
         this.ackFuture = ackFuture;
-        this.expectedOffset = expectedOffset;
+    }
+    
+    public static PendingEvent withHeader(String routingKey, ByteBuffer data, CompletableFuture<Void> ackFuture) {
+        ByteBuf eventBuf = new Event(Unpooled.wrappedBuffer(data)).getAsByteBuf();
+        return new PendingEvent(routingKey, eventBuf, ackFuture);
+        
+    }
+    
+    public static PendingEvent withoutHeader(String routingKey, ByteBuffer data, CompletableFuture<Void> ackFuture) {
+        return new PendingEvent(routingKey, Unpooled.wrappedBuffer(data), ackFuture);
     }
 }

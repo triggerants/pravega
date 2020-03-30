@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,12 +15,14 @@ import io.pravega.controller.store.client.StoreType;
 import io.pravega.controller.store.client.ZKClientConfig;
 import com.google.common.base.Preconditions;
 import lombok.Getter;
+import lombok.ToString;
 
 import java.util.Optional;
 
 /**
  * Store client configuration.
  */
+@ToString
 @Getter
 public class StoreClientConfigImpl implements StoreClientConfig {
 
@@ -45,5 +47,10 @@ public class StoreClientConfigImpl implements StoreClientConfig {
     public static StoreClientConfig withZKClient(ZKClientConfig zkClientConfig) {
         Preconditions.checkNotNull(zkClientConfig, "zkClientConfig");
         return new StoreClientConfigImpl(StoreType.Zookeeper, Optional.of(zkClientConfig));
+    }
+    
+    public static StoreClientConfig withPravegaTablesClient(ZKClientConfig zkClientConfig) {
+        Preconditions.checkNotNull(zkClientConfig, "zkClientConfig");
+        return new StoreClientConfigImpl(StoreType.PravegaTable, Optional.of(zkClientConfig));
     }
 }

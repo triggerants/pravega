@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,11 @@ public class MathHelpers {
     }
     
     public static long minMax(long value, long min, long max) {
+        Preconditions.checkArgument(min <= max, "min must be less than or equal to max");
+        return Math.max(Math.min(value, max), min);
+    }
+
+    public static double minMax(double value, double min, double max) {
         Preconditions.checkArgument(min <= max, "min must be less than or equal to max");
         return Math.max(Math.min(value, max), min);
     }

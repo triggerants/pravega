@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,8 +9,6 @@
  */
 package io.pravega.controller.server;
 
-import io.pravega.controller.fault.ControllerClusterListenerConfig;
-import io.pravega.controller.fault.impl.ControllerClusterListenerConfigImpl;
 import io.pravega.controller.server.impl.ControllerServiceConfigImpl;
 import io.pravega.controller.store.client.StoreClient;
 import io.pravega.controller.store.client.StoreClientConfig;
@@ -18,21 +16,21 @@ import io.pravega.controller.store.host.HostMonitorConfig;
 import io.pravega.controller.store.host.impl.HostMonitorConfigImpl;
 import io.pravega.controller.timeout.TimeoutServiceConfig;
 import io.pravega.controller.util.Config;
+import java.io.IOException;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.After;
-import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
-
-import java.util.Optional;
-import java.util.concurrent.TimeUnit;
 
 /**
  * ControllerServiceMain tests.
  */
 public abstract class ControllerServiceMainTest {
-
+    private static final CompletableFuture<Void> INVOKED = new CompletableFuture<>();
     protected StoreClientConfig storeClientConfig;
+
     private final boolean disableControllerCluster;
 
     ControllerServiceMainTest(final boolean disableControllerCluster) {
@@ -40,10 +38,10 @@ public abstract class ControllerServiceMainTest {
     }
 
     @Before
-    public abstract void setup();
+    public abstract void setup() throws Exception;
 
     @After
-    public abstract void tearDown();
+    public abstract void tearDown() throws IOException;
 
     @Slf4j
     static class MockControllerServiceStarter extends ControllerServiceStarter {
@@ -62,38 +60,50 @@ public abstract class ControllerServiceMainTest {
             log.info("MockControllerServiceStarter shutdown.");
         }
     }
+    
+    static void handleUncaughtException(Thread t, Throwable e) {
+        INVOKED.complete(null);    
+    }
 
+    @Test(timeout = 10000)
+    public void testUncaughtException() {
+        Main.setUncaughtExceptionHandler(Main::logUncaughtException);
+        Main.setUncaughtExceptionHandler(ControllerServiceMainTest::handleUncaughtException);
+        
+        Thread t = new Thread(() -> {
+            throw new RuntimeException();
+        });
+        
+        t.start();
+
+        INVOKED.join();
+    }
+    
+    @Test(timeout = 10000)
+    public void mainShutdownTest() {
+        ControllerServiceMain controllerServiceMain = new ControllerServiceMain(createControllerServiceConfig(),
+                MockControllerServiceStarter::new);
+
+        controllerServiceMain.startAsync();
+        controllerServiceMain.awaitRunning();
+        controllerServiceMain.awaitServiceStarting().awaitRunning();
+
+        Main.onShutdown(controllerServiceMain);
+        
+        controllerServiceMain.awaitTerminated();
+    }
+    
     @Test(timeout = 10000)
     public void testControllerServiceMainStartStop() {
         ControllerServiceMain controllerServiceMain = new ControllerServiceMain(createControllerServiceConfig(),
                 MockControllerServiceStarter::new);
 
         controllerServiceMain.startAsync();
-        try {
-            controllerServiceMain.awaitRunning();
-        } catch (IllegalStateException e) {
-            Assert.fail("Failed waiting for controllerServiceMain to get ready");
-        }
-
-        try {
-            controllerServiceMain.awaitServiceStarting().awaitRunning();
-        } catch (IllegalStateException e) {
-            Assert.fail("Failed waiting for starter to get ready");
-        }
-
+        controllerServiceMain.awaitRunning();
+        controllerServiceMain.awaitServiceStarting().awaitRunning();
         controllerServiceMain.stopAsync();
-
-        try {
-            controllerServiceMain.awaitServicePausing().awaitTerminated();
-        } catch (IllegalStateException e) {
-            Assert.fail("Failed waiting for termination of starter");
-        }
-
-        try {
-            controllerServiceMain.awaitTerminated();
-        } catch (IllegalStateException e) {
-            Assert.fail("Failed waiting for termination of controllerServiceMain");
-        }
+        controllerServiceMain.awaitServicePausing().awaitTerminated();
+        controllerServiceMain.awaitTerminated();
     }
 
     protected ControllerServiceConfig createControllerServiceConfig() {
@@ -105,32 +115,14 @@ public abstract class ControllerServiceMainTest {
                         Config.HOST_STORE_CONTAINER_COUNT))
                 .build();
 
-        Optional<ControllerClusterListenerConfig> controllerClusterListenerConfig;
-        if (!disableControllerCluster) {
-            controllerClusterListenerConfig = Optional.of(ControllerClusterListenerConfigImpl.builder()
-                    .minThreads(2)
-                    .maxThreads(10)
-                    .idleTime(10)
-                    .idleTimeUnit(TimeUnit.SECONDS)
-                    .maxQueueSize(512)
-                    .build());
-        } else {
-            controllerClusterListenerConfig = Optional.empty();
-        }
-
         TimeoutServiceConfig timeoutServiceConfig = TimeoutServiceConfig.builder()
                 .maxLeaseValue(Config.MAX_LEASE_VALUE)
-                .maxScaleGracePeriod(Config.MAX_SCALE_GRACE_PERIOD)
                 .build();
 
         return ControllerServiceConfigImpl.builder()
-                .serviceThreadPoolSize(3)
-                .taskThreadPoolSize(3)
-                .storeThreadPoolSize(3)
-                .eventProcThreadPoolSize(3)
-                .requestHandlerThreadPoolSize(3)
+                .threadPoolSize(15)
                 .storeClientConfig(storeClientConfig)
-                .controllerClusterListenerConfig(controllerClusterListenerConfig)
+                .controllerClusterListenerEnabled(!disableControllerCluster)
                 .hostMonitorConfig(hostMonitorConfig)
                 .timeoutServiceConfig(timeoutServiceConfig)
                 .eventProcessorConfig(Optional.empty())

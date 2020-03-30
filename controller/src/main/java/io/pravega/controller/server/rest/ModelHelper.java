@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,11 +29,9 @@ public class ModelHelper {
      * This method translates the REST request object CreateStreamRequest into internal object StreamConfiguration.
      *
      * @param createStreamRequest An object conforming to the createStream REST API json
-     * @param scope               The scope of stream
      * @return StreamConfiguration internal object
      */
-    public static final StreamConfiguration getCreateStreamConfig(final CreateStreamRequest createStreamRequest,
-                                                                  final String scope) {
+    public static final StreamConfiguration getCreateStreamConfig(final CreateStreamRequest createStreamRequest) {
         ScalingPolicy scalingPolicy;
         if (createStreamRequest.getScalingPolicy().getType() == ScalingConfig.TypeEnum.FIXED_NUM_SEGMENTS) {
            scalingPolicy = ScalingPolicy.fixed(createStreamRequest.getScalingPolicy().getMinSegments());
@@ -65,8 +63,6 @@ public class ModelHelper {
             }
         }
         return StreamConfiguration.builder()
-                .scope(scope)
-                .streamName(createStreamRequest.getStreamName())
                 .scalingPolicy(scalingPolicy)
                 .retentionPolicy(retentionPolicy)
                 .build();
@@ -76,12 +72,9 @@ public class ModelHelper {
      * This method translates the REST request object UpdateStreamRequest into internal object StreamConfiguration.
      *
      * @param updateStreamRequest An object conforming to the updateStreamConfig REST API json
-     * @param scope               The scope of stream
-     * @param stream              The name of stream
      * @return StreamConfiguration internal object
      */
-    public static final StreamConfiguration getUpdateStreamConfig(final UpdateStreamRequest updateStreamRequest,
-                                                                  final String scope, final String stream) {
+    public static final StreamConfiguration getUpdateStreamConfig(final UpdateStreamRequest updateStreamRequest) {
         ScalingPolicy scalingPolicy;
         if (updateStreamRequest.getScalingPolicy().getType() == ScalingConfig.TypeEnum.FIXED_NUM_SEGMENTS) {
             scalingPolicy = ScalingPolicy.fixed(updateStreamRequest.getScalingPolicy().getMinSegments());
@@ -113,8 +106,6 @@ public class ModelHelper {
             }
         }
         return StreamConfiguration.builder()
-                                  .scope(scope)
-                                  .streamName(stream)
                                   .scalingPolicy(scalingPolicy)
                                   .retentionPolicy(retentionPolicy)
                                   .build();
@@ -123,18 +114,20 @@ public class ModelHelper {
     /**
      * The method translates the internal object StreamConfiguration into REST response object.
      *
+     * @param scope the scope of the stream
+     * @param streamName the name of the stream
      * @param streamConfiguration The configuration of stream
      * @return Stream properties wrapped in StreamResponse object
      */
-    public static final StreamProperty encodeStreamResponse(final StreamConfiguration streamConfiguration) {
+    public static final StreamProperty encodeStreamResponse(String scope, String streamName, final StreamConfiguration streamConfiguration) {
         ScalingConfig scalingPolicy = new ScalingConfig();
-        if (streamConfiguration.getScalingPolicy().getType() == ScalingPolicy.Type.FIXED_NUM_SEGMENTS) {
+        if (streamConfiguration.getScalingPolicy().getScaleType() == ScalingPolicy.ScaleType.FIXED_NUM_SEGMENTS) {
             scalingPolicy.setType(ScalingConfig.TypeEnum.valueOf(streamConfiguration.getScalingPolicy().
-                    getType().name()));
+                    getScaleType().name()));
             scalingPolicy.setMinSegments(streamConfiguration.getScalingPolicy().getMinNumSegments());
         } else {
             scalingPolicy.setType(ScalingConfig.TypeEnum.valueOf(streamConfiguration.getScalingPolicy().
-                    getType().name()));
+                    getScaleType().name()));
             scalingPolicy.setTargetRate(streamConfiguration.getScalingPolicy().getTargetRate());
             scalingPolicy.setScaleFactor(streamConfiguration.getScalingPolicy().getScaleFactor());
             scalingPolicy.setMinSegments(streamConfiguration.getScalingPolicy().getMinNumSegments());
@@ -143,22 +136,22 @@ public class ModelHelper {
         RetentionConfig retentionConfig = null;
         if (streamConfiguration.getRetentionPolicy() != null) {
             retentionConfig = new RetentionConfig();
-            switch (streamConfiguration.getRetentionPolicy().getType()) {
+            switch (streamConfiguration.getRetentionPolicy().getRetentionType()) {
                 case SIZE:
                     retentionConfig.setType(RetentionConfig.TypeEnum.LIMITED_SIZE_MB);
-                    retentionConfig.setValue(streamConfiguration.getRetentionPolicy().getValue() / (1024 * 1024));
+                    retentionConfig.setValue(streamConfiguration.getRetentionPolicy().getRetentionParam() / (1024 * 1024));
                     break;
                 case TIME:
                     retentionConfig.setType(RetentionConfig.TypeEnum.LIMITED_DAYS);
                     retentionConfig.setValue(
-                            Duration.ofMillis(streamConfiguration.getRetentionPolicy().getValue()).toDays());
+                            Duration.ofMillis(streamConfiguration.getRetentionPolicy().getRetentionParam()).toDays());
                     break;
             }
         }
 
         StreamProperty streamProperty = new StreamProperty();
-        streamProperty.setStreamName(streamConfiguration.getStreamName());
-        streamProperty.setScopeName(streamConfiguration.getScope());
+        streamProperty.setScopeName(scope);
+        streamProperty.setStreamName(streamName);
         streamProperty.setScalingPolicy(scalingPolicy);
         streamProperty.setRetentionPolicy(retentionConfig);
         return streamProperty;

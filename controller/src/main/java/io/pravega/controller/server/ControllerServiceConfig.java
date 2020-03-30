@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,7 +9,6 @@
  */
 package io.pravega.controller.server;
 
-import io.pravega.controller.fault.ControllerClusterListenerConfig;
 import io.pravega.controller.server.eventProcessor.ControllerEventProcessorConfig;
 import io.pravega.controller.server.rest.RESTServerConfig;
 import io.pravega.controller.server.rpc.grpc.GRPCServerConfig;
@@ -24,39 +23,11 @@ import java.util.Optional;
  */
 public interface ControllerServiceConfig {
     /**
-     * Fetches the size of the thread pool used by controller service API handler.
+     * Fetches the size of the thread pool used by controller.
      *
-     * @return The size of the thread pool used by controller service API handler.
+     * @return The size of the thread pool used by controller.
      */
-    int getServiceThreadPoolSize();
-
-    /**
-     * Fetches the size of the thread pool used by controller's task processor.
-     *
-     * @return The size of the thread pool used by controller's task processor.
-     */
-    int getTaskThreadPoolSize();
-
-    /**
-     * Fetches the size of the thread pool used by controller's stream metadata store.
-     *
-     * @return The size of the thread pool used by controller's stream metadata store.
-     */
-    int getStoreThreadPoolSize();
-
-    /**
-     * Fetches the size of the thread pool used by controller's event processors.
-     *
-     * @return The size of the thread pool used by controller's event processors.
-     */
-    int getEventProcThreadPoolSize();
-
-    /**
-     * Fetches the size of the thread pool used by controller's request handlers.
-     *
-     * @return The size of the thread pool used by controller's request handlers.
-     */
-    int getRequestHandlerThreadPoolSize();
+    int getThreadPoolSize();
 
     /**
      * Fetches the configuration of the store client used for accessing stream metadata store.
@@ -73,11 +44,30 @@ public interface ControllerServiceConfig {
     HostMonitorConfig getHostMonitorConfig();
 
     /**
-     * Fetches whether the controller cluster listener is enabled, and its configuration if enabled.
+     * Fetches whether the controller cluster listener is enabled.
      *
-     * @return Whether the controller cluster listener is enabled, and its configuration if enabled.
+     * @return Whether the controller cluster listener is enabled.
      */
-    Optional<ControllerClusterListenerConfig> getControllerClusterListenerConfig();
+    boolean isControllerClusterListenerEnabled();
+
+    /**
+     * Fetches the optional configuration item that, if specified, represents whether segment store TLS is enabled. This
+     * is useful only in configuration where the Controller is not TLS enabled, but the segment store is. In the
+     * configuration where both Controller and Segment Store have TLS enabled, this value is expected to be left
+     * unspecified/empty.
+     *
+     * The returned value may take these values:
+     *
+     * - true/yes/y (case insensitive) - Indicating TLS is enabled for Segment Store (even if it is disabled for
+     *                                   the Controller based on Controller URI)
+     * - false/no/n (case insensitive) - Indicating TLS is disabled for Segment Store (even if it is enabled for the
+     *                                   Controller, based on Controller URI)
+     * - "" - Indicating the value was not set.  Should be interpreted from Controller URI.
+     * - Any other non-empty value - Should be interpreted from Controller URI.
+     *
+     * @return Specified configuration value
+     */
+    String getTlsEnabledForSegmentStore();
 
     /**
      * Fetches the configuration of service managing transaction timeouts.

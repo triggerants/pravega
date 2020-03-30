@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,11 +10,10 @@
 package io.pravega.shared.metrics;
 
 /**
- * Simple stats that require only increment and decrement
- * functions on a Long. Metrics like the number of topics, persist queue size
+ * Simple stats that require only increment functions on a Long. Metrics like the number of topics, persist queue size
  * etc. should use this.
  */
-public interface Counter {
+public interface Counter extends Metric {
     /**
      * Clear this stat.
      */
@@ -24,11 +23,6 @@ public interface Counter {
      * Increment the value associated with this stat.
      */
     void inc();
-
-    /**
-     * Decrement the value associated with this stat.
-     */
-    void dec();
 
     /**
      * Add delta to the value associated with this stat.
@@ -41,9 +35,4 @@ public interface Counter {
      * Get the value associated with this stat.
      */
     long get();
-
-    /**
-     * Gets name.
-     */
-    String getName();
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,11 @@ import io.pravega.shared.protocol.netty.WireCommands.Hello;
  * A class that handles each type of reply. (Visitor pattern)
  */
 public interface ReplyProcessor {
+    
+    default void process(Reply reply) {
+        reply.process(this);
+    }
+    
     void hello(Hello hello);
     
     void wrongHost(WireCommands.WrongHost wrongHost);
@@ -23,10 +28,12 @@ public interface ReplyProcessor {
 
     void segmentIsSealed(WireCommands.SegmentIsSealed segmentIsSealed);
 
+    void segmentIsTruncated(WireCommands.SegmentIsTruncated segmentIsTruncated);
+
     void noSuchSegment(WireCommands.NoSuchSegment noSuchSegment);
 
-    void noSuchTransaction(WireCommands.NoSuchTransaction noSuchTransaction);
-    
+    void tableSegmentNotEmpty(WireCommands.TableSegmentNotEmpty tableSegmentNotEmpty);
+
     void invalidEventNumber(WireCommands.InvalidEventNumber invalidEventNumber);
 
     void appendSetup(WireCommands.AppendSetup appendSetup);
@@ -43,19 +50,17 @@ public interface ReplyProcessor {
     
     void streamSegmentInfo(WireCommands.StreamSegmentInfo streamInfo);
     
-    void transactionInfo(WireCommands.TransactionInfo transactionInfo);
-
     void segmentCreated(WireCommands.SegmentCreated segmentCreated);
 
-    void transactionCreated(WireCommands.TransactionCreated transactionCreated);
-
-    void transactionCommitted(WireCommands.TransactionCommitted transactionCommitted);
-    
-    void transactionAborted(WireCommands.TransactionAborted transactionAborted);
+    void segmentsMerged(WireCommands.SegmentsMerged segmentsMerged);
 
     void segmentSealed(WireCommands.SegmentSealed segmentSealed);
 
+    void segmentTruncated(WireCommands.SegmentTruncated segmentTruncated);
+
     void segmentDeleted(WireCommands.SegmentDeleted segmentDeleted);
+
+    void operationUnsupported(WireCommands.OperationUnsupported operationUnsupported);
 
     void keepAlive(WireCommands.KeepAlive keepAlive);
     
@@ -64,4 +69,20 @@ public interface ReplyProcessor {
     void segmentPolicyUpdated(WireCommands.SegmentPolicyUpdated segmentPolicyUpdated);
     
     void processingFailure(Exception error);
+
+    void authTokenCheckFailed(WireCommands.AuthTokenCheckFailed authTokenCheckFailed);
+
+    void tableEntriesUpdated(WireCommands.TableEntriesUpdated tableEntriesUpdated);
+
+    void tableKeysRemoved(WireCommands.TableKeysRemoved tableKeysRemoved);
+
+    void tableRead(WireCommands.TableRead tableRead);
+
+    void tableKeyDoesNotExist(WireCommands.TableKeyDoesNotExist tableKeyDoesNotExist);
+
+    void tableKeyBadVersion(WireCommands.TableKeyBadVersion tableKeyBadVersion);
+
+    void tableKeysRead(WireCommands.TableKeysRead tableKeysRead);
+
+    void tableEntriesRead(WireCommands.TableEntriesRead tableEntriesRead);
 }

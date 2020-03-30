@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Copyright (c) 2017 Dell Inc., or its subsidiaries.
+  Copyright (c) Dell Inc., or its subsidiaries.
 
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
@@ -8,7 +8,7 @@
 
       http://www.apache.org/licenses/LICENSE-2.0
 -->
-<configuration scan="true">
+<configuration scan="true" scanPeriod="30 seconds">
     <appender name="consoleAppender" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
             <charset>UTF-8</charset>
@@ -21,10 +21,10 @@
         <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
             <!-- daily rollover. Make sure the path matches the one in the file element or else
              the rollover logs are placed in the working directory. -->
-            <fileNamePattern>controller_server_%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <fileNamePattern>controller_server_%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
 
             <timeBasedFileNamingAndTriggeringPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
-                <maxFileSize>5MB</maxFileSize>
+                <maxFileSize>10MB</maxFileSize>
             </timeBasedFileNamingAndTriggeringPolicy>
             <!-- keep 30 days' worth of history -->
             <maxHistory>30</maxHistory>

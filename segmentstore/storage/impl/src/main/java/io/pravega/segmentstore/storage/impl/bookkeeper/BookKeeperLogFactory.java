@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,8 +9,9 @@
  */
 package io.pravega.segmentstore.storage.impl.bookkeeper;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import io.pravega.common.ExceptionHelpers;
+import io.pravega.common.Exceptions;
 import io.pravega.segmentstore.storage.DataLogNotAvailableException;
 import io.pravega.segmentstore.storage.DurableDataLog;
 import io.pravega.segmentstore.storage.DurableDataLogException;
@@ -20,7 +21,9 @@ import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
 import lombok.val;
 import org.apache.bookkeeper.client.BookKeeper;
+import org.apache.bookkeeper.client.RackawareEnsemblePlacementPolicy;
 import org.apache.bookkeeper.conf.ClientConfiguration;
+import org.apache.bookkeeper.net.CommonConfigurationKeys;
 import org.apache.curator.framework.CuratorFramework;
 
 /**
@@ -86,7 +89,7 @@ public class BookKeeperLogFactory implements DurableDataLogFactory {
             close();
             throw ex;
         } catch (Throwable ex) {
-            if (!ExceptionHelpers.mustRethrow(ex)) {
+            if (!Exceptions.mustRethrow(ex)) {
                 // Make sure we close anything we may have opened.
                 close();
             }
@@ -97,9 +100,31 @@ public class BookKeeperLogFactory implements DurableDataLogFactory {
     }
 
     @Override
-    public DurableDataLog createDurableDataLog(int containerId) {
+    public DurableDataLog createDurableDataLog(int logId) {
         Preconditions.checkState(this.bookKeeper.get() != null, "BookKeeperLogFactory is not initialized.");
-        return new BookKeeperLog(containerId, this.zkClient, this.bookKeeper.get(), this.config, this.executor);
+        return new BookKeeperLog(logId, this.zkClient, this.bookKeeper.get(), this.config, this.executor);
+    }
+
+    /**
+     * Creates a new DebugLogWrapper that can be used for debugging purposes. This should not be used for regular operations.
+     *
+     * @param logId Id of the Log to create a wrapper for.
+     * @return A new instance of the DebugLogWrapper class.
+     */
+    public DebugLogWrapper createDebugLogWrapper(int logId) {
+        Preconditions.checkState(this.bookKeeper.get() != null, "BookKeeperLogFactory is not initialized.");
+        return new DebugLogWrapper(logId, this.zkClient, this.bookKeeper.get(), this.config, this.executor);
+    }
+
+    /**
+     * Gets a pointer to the BookKeeper client used by this BookKeeperLogFactory. This should only be used for testing or
+     * admin tool purposes only. It should not be used for regular operations.
+     *
+     * @return The BookKeeper client.
+     */
+    @VisibleForTesting
+    public BookKeeper getBookKeeperClient() {
+        return this.bookKeeper.get();
     }
 
     //endregion
@@ -107,16 +132,38 @@ public class BookKeeperLogFactory implements DurableDataLogFactory {
     //region Initialization
 
     private BookKeeper startBookKeeperClient() throws Exception {
+        // These two are in Seconds, not Millis.
+        int writeTimeout = (int) Math.ceil(this.config.getBkWriteTimeoutMillis() / 1000.0);
+        int readTimeout = (int) Math.ceil(this.config.getBkReadTimeoutMillis() / 1000.0);
         ClientConfiguration config = new ClientConfiguration()
-                .setZkServers(this.config.getZkAddress())
                 .setClientTcpNoDelay(true)
+                .setAddEntryTimeout(writeTimeout)
+                .setReadEntryTimeout(readTimeout)
+                .setGetBookieInfoTimeout(readTimeout)
                 .setClientConnectTimeoutMillis((int) this.config.getZkConnectionTimeout().toMillis())
                 .setZkTimeout((int) this.config.getZkConnectionTimeout().toMillis());
-        if (this.config.getBkLedgerPath().isEmpty()) {
-            config.setZkLedgersRootPath("/" + this.namespace + "/bookkeeper/ledgers");
-        } else {
-            config.setZkLedgersRootPath(this.config.getBkLedgerPath());
+
+        if (this.config.isTLSEnabled()) {
+            config = (ClientConfiguration) config.setTLSProvider("OpenSSL");
+            config = config.setTLSTrustStore(this.config.getTlsTrustStore());
+            config.setTLSTrustStorePasswordPath(this.config.getTlsTrustStorePasswordPath());
         }
+
+        String metadataServiceUri = "zk://" + this.config.getZkAddress();
+        if (this.config.getBkLedgerPath().isEmpty()) {
+            metadataServiceUri += "/" + this.namespace + "/bookkeeper/ledgers";
+        } else {
+            metadataServiceUri += this.config.getBkLedgerPath();
+        }
+        config = config.setMetadataServiceUri(metadataServiceUri);
+
+        if (this.config.isEnforceMinNumRacksPerWriteQuorum()) {
+            config = config.setEnsemblePlacementPolicy(RackawareEnsemblePlacementPolicy.class);
+            config.setEnforceMinNumRacksPerWriteQuorum(this.config.isEnforceMinNumRacksPerWriteQuorum());
+            config.setMinNumRacksPerWriteQuorum(this.config.getMinNumRacksPerWriteQuorum());
+            config.setProperty(CommonConfigurationKeys.NET_TOPOLOGY_SCRIPT_FILE_NAME_KEY, this.config.getNetworkTopologyFileName());
+        }
+
         return new BookKeeper(config);
     }
 

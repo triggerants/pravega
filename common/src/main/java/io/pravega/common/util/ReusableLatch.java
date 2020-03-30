@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,6 +10,8 @@
 package io.pravega.common.util;
 
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -46,6 +48,23 @@ public class ReusableLatch {
             return;
         }
         impl.acquire();
+    }
+
+    /**
+     * Block until another thread calls release, or the thread is interrupted.
+     *
+     * @param timeoutMillis Timeout, in milliseconds, to wait for the release.
+     * @throws InterruptedException If the operation was interrupted while waiting.
+     * @throws TimeoutException     If the timeout expired prior to being able to await the release.
+     */
+    public void await(long timeoutMillis) throws InterruptedException, TimeoutException {
+        if (released.get()) {
+            return;
+        }
+
+        if (!impl.tryAcquire(timeoutMillis, TimeUnit.MILLISECONDS)) {
+            throw new TimeoutException("Timeout expired prior to latch becoming available.");
+        }
     }
 
     /**
@@ -91,5 +110,10 @@ public class ReusableLatch {
                 }
             }
         }
+    }
+    
+    @Override
+    public String toString() {
+        return "LatchReleased: " + released.get();
     }
 }

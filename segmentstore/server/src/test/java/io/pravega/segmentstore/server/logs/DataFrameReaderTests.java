@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,27 +9,30 @@
  */
 package io.pravega.segmentstore.server.logs;
 
-import io.pravega.common.ExceptionHelpers;
+import io.pravega.common.Exceptions;
 import io.pravega.common.ObjectClosedException;
+import io.pravega.common.function.Callbacks;
+import io.pravega.common.io.SerializationException;
 import io.pravega.segmentstore.server.DataCorruptionException;
-import io.pravega.segmentstore.server.LogItemFactory;
 import io.pravega.segmentstore.server.TestDurableDataLog;
 import io.pravega.segmentstore.storage.DataLogNotAvailableException;
 import io.pravega.segmentstore.storage.DurableDataLog;
 import io.pravega.test.common.AssertExtensions;
 import io.pravega.test.common.ErrorInjector;
 import io.pravega.test.common.ThreadPooledTestSuite;
-import org.junit.Assert;
-import org.junit.Test;
-
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 import java.util.function.Predicate;
+import lombok.val;
+import org.junit.Assert;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.Timeout;
 
 /**
  * Unit tests for DataFrameReader class.
@@ -42,6 +45,10 @@ public class DataFrameReaderTests extends ThreadPooledTestSuite {
     private static final int LARGE_RECORD_MIN_SIZE = 1024;
     private static final int LARGE_RECORD_MAX_SIZE = 10240;
     private static final int FRAME_SIZE = 512;
+    private static final Serializer<TestLogItem> SERIALIZER = new TestLogItem.TestLogItemSerializer();
+
+    @Rule
+    public Timeout globalTimeout = Timeout.seconds(TIMEOUT.getSeconds());
 
     /**
      * Tests the happy case: DataFrameReader can read from a DataLog when the are no exceptions.
@@ -62,9 +69,10 @@ public class DataFrameReaderTests extends ThreadPooledTestSuite {
         try (TestDurableDataLog dataLog = TestDurableDataLog.create(CONTAINER_ID, FRAME_SIZE, executorService())) {
             dataLog.initialize(TIMEOUT);
 
-            ArrayList<DataFrameBuilder.DataFrameCommitArgs> commitFrames = new ArrayList<>();
-            Consumer<Throwable> errorCallback = ex -> Assert.fail(String.format("Unexpected error occurred upon commit. %s", ex));
-            try (DataFrameBuilder<TestLogItem> b = new DataFrameBuilder<>(dataLog, commitFrames::add, errorCallback)) {
+            BiConsumer<Throwable, DataFrameBuilder.CommitArgs> errorCallback = (ex, a) ->
+                    Assert.fail(String.format("Unexpected error occurred upon commit. %s", ex));
+            val args = new DataFrameBuilder.Args(Callbacks::doNothing, Callbacks::doNothing, errorCallback, executorService());
+            try (DataFrameBuilder<TestLogItem> b = new DataFrameBuilder<>(dataLog, SERIALIZER, args)) {
                 for (int i = 0; i < records.size(); i++) {
                     try {
                         b.append(records.get(i));
@@ -72,9 +80,10 @@ public class DataFrameReaderTests extends ThreadPooledTestSuite {
                         failedIndices.add(i);
                     }
                 }
+                b.flush();
             }
 
-            TestLogItemFactory logItemFactory = new TestLogItemFactory();
+            TestSerializer logItemFactory = new TestSerializer();
             DataFrameReader<TestLogItem> reader = new DataFrameReader<>(dataLog, logItemFactory, CONTAINER_ID);
             List<TestLogItem> readItems = readAll(reader);
             checkReadResult(records, failedIndices, readItems);
@@ -92,12 +101,16 @@ public class DataFrameReaderTests extends ThreadPooledTestSuite {
         try (TestDurableDataLog dataLog = TestDurableDataLog.create(CONTAINER_ID, FRAME_SIZE, executorService())) {
             dataLog.initialize(TIMEOUT);
 
-            ArrayList<DataFrameBuilder.DataFrameCommitArgs> commitFrames = new ArrayList<>();
-            Consumer<Throwable> errorCallback = ex -> Assert.fail(String.format("Unexpected error occurred upon commit. %s", ex));
-            try (DataFrameBuilder<TestLogItem> b = new DataFrameBuilder<>(dataLog, commitFrames::add, errorCallback)) {
-                for (int i = 0; i < records.size(); i++) {
-                    b.append(records.get(i));
+            ArrayList<DataFrameBuilder.CommitArgs> commitFrames = new ArrayList<>();
+            BiConsumer<Throwable, DataFrameBuilder.CommitArgs> errorCallback = (ex, a) ->
+                    Assert.fail(String.format("Unexpected error occurred upon commit. %s", ex));
+            val args = new DataFrameBuilder.Args(Callbacks::doNothing, commitFrames::add, errorCallback, executorService());
+            try (DataFrameBuilder<TestLogItem> b = new DataFrameBuilder<>(dataLog, SERIALIZER, args)) {
+                for (TestLogItem r : records) {
+                    b.append(r);
                 }
+
+                b.flush();
             }
 
             // Delete the first entry in the DataLog.
@@ -108,7 +121,7 @@ public class DataFrameReaderTests extends ThreadPooledTestSuite {
             // invalidate the first one.
             failedIndices.add(0);
 
-            TestLogItemFactory logItemFactory = new TestLogItemFactory();
+            TestSerializer logItemFactory = new TestSerializer();
             DataFrameReader<TestLogItem> reader = new DataFrameReader<>(dataLog, logItemFactory, CONTAINER_ID);
             List<TestLogItem> readItems = readAll(reader);
             checkReadResult(records, failedIndices, readItems);
@@ -128,19 +141,20 @@ public class DataFrameReaderTests extends ThreadPooledTestSuite {
         try (TestDurableDataLog dataLog = TestDurableDataLog.create(CONTAINER_ID, FRAME_SIZE, executorService())) {
             dataLog.initialize(TIMEOUT);
 
-            ArrayList<DataFrameBuilder.DataFrameCommitArgs> commitFrames = new ArrayList<>();
-            Consumer<Throwable> errorCallback = ex -> Assert.fail(String.format("Unexpected error occurred upon commit. %s", ex));
-            try (DataFrameBuilder<TestLogItem> b = new DataFrameBuilder<>(dataLog, commitFrames::add, errorCallback)) {
-                for (int i = 0; i < records.size(); i++) {
-                    b.append(records.get(i));
+            BiConsumer<Throwable, DataFrameBuilder.CommitArgs> errorCallback = (ex, a) ->
+                    Assert.fail(String.format("Unexpected error occurred upon commit. %s", ex));
+            val args = new DataFrameBuilder.Args(Callbacks::doNothing, Callbacks::doNothing, errorCallback, executorService());
+            try (DataFrameBuilder<TestLogItem> b = new DataFrameBuilder<>(dataLog, SERIALIZER, args)) {
+                for (TestLogItem r : records) {
+                    b.append(r);
                 }
             }
 
             ErrorInjector<SerializationException> errorInjector = new ErrorInjector<>(
                     count -> count % failDeserializationEvery == 0,
-                    () -> new SerializationException("intentional", "TestLogItem.deserialize"));
+                    () -> new SerializationException("TestLogItem.deserialize intentional"));
 
-            TestLogItemFactory logItemFactory = new TestLogItemFactory();
+            TestSerializer logItemFactory = new TestSerializer();
             logItemFactory.setDeserializationErrorInjector(errorInjector);
             testReadWithException(dataLog, logItemFactory, ex -> ex instanceof DataCorruptionException);
         }
@@ -161,15 +175,16 @@ public class DataFrameReaderTests extends ThreadPooledTestSuite {
         try (TestDurableDataLog dataLog = TestDurableDataLog.create(CONTAINER_ID, FRAME_SIZE, executorService())) {
             dataLog.initialize(TIMEOUT);
 
-            ArrayList<DataFrameBuilder.DataFrameCommitArgs> commitFrames = new ArrayList<>();
-            Consumer<Throwable> errorCallback = ex -> Assert.fail(String.format("Unexpected error occurred upon commit. %s", ex));
-            try (DataFrameBuilder<TestLogItem> b = new DataFrameBuilder<>(dataLog, commitFrames::add, errorCallback)) {
-                for (int i = 0; i < records.size(); i++) {
-                    b.append(records.get(i));
+            BiConsumer<Throwable, DataFrameBuilder.CommitArgs> errorCallback = (ex, a) ->
+                    Assert.fail(String.format("Unexpected error occurred upon commit. %s", ex));
+            val args = new DataFrameBuilder.Args(Callbacks::doNothing, Callbacks::doNothing, errorCallback, executorService());
+            try (DataFrameBuilder<TestLogItem> b = new DataFrameBuilder<>(dataLog, SERIALIZER, args)) {
+                for (TestLogItem r : records) {
+                    b.append(r);
                 }
             }
 
-            TestLogItemFactory logItemFactory = new TestLogItemFactory();
+            TestSerializer logItemFactory = new TestSerializer();
 
             // Test 1: Initial call to getReader.
             ErrorInjector<Exception> getReaderErrorInjector = new ErrorInjector<>(
@@ -179,7 +194,7 @@ public class DataFrameReaderTests extends ThreadPooledTestSuite {
             AssertExtensions.assertThrows(
                     "No exception or wrong type of exception thrown by getNext() with exception thrown by getReader().",
                     () -> new DataFrameReader<>(dataLog, logItemFactory, CONTAINER_ID),
-                    ex -> ExceptionHelpers.getRealException(ex) == getReaderErrorInjector.getLastCycleException());
+                    ex -> Exceptions.unwrap(ex) == getReaderErrorInjector.getLastCycleException());
 
             // Test 2: Failures during getNext().
             ErrorInjector<Exception> readErrorInjector = new ErrorInjector<>(
@@ -190,19 +205,19 @@ public class DataFrameReaderTests extends ThreadPooledTestSuite {
         }
     }
 
-    private void testReadWithException(DurableDataLog dataLog, LogItemFactory<TestLogItem> logItemFactory, Predicate<Throwable> exceptionVerifier) throws Exception {
-        try (DataFrameReader<TestLogItem> reader = new DataFrameReader<>(dataLog, logItemFactory, CONTAINER_ID)) {
+    private void testReadWithException(DurableDataLog dataLog, Serializer<TestLogItem> serializer, Predicate<Throwable> exceptionVerifier) throws Exception {
+        try (DataFrameReader<TestLogItem> reader = new DataFrameReader<>(dataLog, serializer, CONTAINER_ID)) {
             boolean encounteredException = false;
             while (true) {
-                DataFrameReader.ReadResult<TestLogItem> readResult;
+                DataFrameRecord<TestLogItem> dataFrameRecord;
 
                 try {
-                    readResult = reader.getNext();
+                    dataFrameRecord = reader.getNext();
 
                     // We are expecting an exception at all times (the catch block will verify the correctness of the exception thrown).
                     Assert.fail("Expected an exception but none got thrown.");
                 } catch (Exception ex) {
-                    Throwable realException = ExceptionHelpers.getRealException(ex);
+                    Throwable realException = Exceptions.unwrap(ex);
 
                     //Verify we were really expecting this exception.
                     if (encounteredException) {
@@ -218,7 +233,7 @@ public class DataFrameReaderTests extends ThreadPooledTestSuite {
                     }
                 }
 
-                if (readResult == null) {
+                if (dataFrameRecord == null) {
                     Assert.fail("Reached the end of the log and no exceptions were detected.");
                     break;
                 }
@@ -249,26 +264,26 @@ public class DataFrameReaderTests extends ThreadPooledTestSuite {
         boolean expectDifferentDataFrameSequence = true;
         while (true) {
             // Fetch the next operation.
-            DataFrameReader.ReadResult<TestLogItem> readResult = reader.getNext();
-            if (readResult == null) {
+            DataFrameRecord<TestLogItem> dataFrameRecord = reader.getNext();
+            if (dataFrameRecord == null) {
                 // We have reached the end.
                 break;
             }
 
-            // Check the monotonicity of the DataFrameSequence. If we encountered a ReadResult with the flag isLastFrameEntry,
+            // Check the monotonicity of the DataFrameSequence. If we encountered a DataFrameRecord with the flag isLastFrameEntry,
             // then we must ensure the DataFrameSequence changes (increases).
             if (expectDifferentDataFrameSequence) {
-                AssertExtensions.assertGreaterThan("Expecting a different (and larger) DataFrameSequence.", lastDataFrameSequence, readResult.getLastUsedDataFrameAddress().getSequence());
+                AssertExtensions.assertGreaterThan("Expecting a different (and larger) DataFrameSequence.", lastDataFrameSequence, dataFrameRecord.getLastUsedDataFrameAddress().getSequence());
                 expectDifferentDataFrameSequence = false;
             } else {
-                AssertExtensions.assertGreaterThanOrEqual("Expecting a increasing (or equal) DataFrameSequence.", lastDataFrameSequence, readResult.getLastUsedDataFrameAddress().getSequence());
+                AssertExtensions.assertGreaterThanOrEqual("Expecting a increasing (or equal) DataFrameSequence.", lastDataFrameSequence, dataFrameRecord.getLastUsedDataFrameAddress().getSequence());
             }
 
-            if (readResult.isLastFrameEntry()) {
+            if (dataFrameRecord.isLastFrameEntry()) {
                 expectDifferentDataFrameSequence = true;
             }
 
-            result.add(readResult.getItem());
+            result.add(dataFrameRecord.getItem());
         }
 
         return result;

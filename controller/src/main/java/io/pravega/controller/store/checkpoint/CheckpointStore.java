@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@ import java.util.Set;
 
 /**
  * Store maintains the following two mappings
- * 1. ProcessId -> ReaderGroupName, which maps ProcessId to all the reader groups within it.
- * 2. (ProcessId, ReaderGroupName) -> List (readerId, position), which maps the pair
+ * 1. ProcessId -{@literal >} ReaderGroupName, which maps ProcessId to all the reader groups within it.
+ * 2. (ProcessId, ReaderGroupName) -{@literal >} List (readerId, position), which maps the pair
  * (ProcessId, ReaderGroupName) to the readers participating in the reader group and running
  * within the process.
  *

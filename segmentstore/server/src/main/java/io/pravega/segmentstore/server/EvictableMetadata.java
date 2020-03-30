@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,4 +35,16 @@ public interface EvictableMetadata extends ContainerMetadata {
      * subset of cleanupCandidates.
      */
     Collection<SegmentMetadata> cleanup(Collection<SegmentMetadata> evictionCandidates, long sequenceNumberCutoff);
+
+    /**
+     * Evicts Extended Attributes from those Segments which have exceeded the maximum Extended Attribute count.
+     *
+     * @param maximumAttributeCount The maximum number of Extended Attributes per Segment. Cleanup will only be performed
+     *                              for a Segment if that Segment's Metadata has at least this many Extended Attributes
+     *                              in memory.
+     * @param sequenceNumberCutoff  The Operation Sequence number before which it is safe to remove an Extended Attribute.
+     *                              Any Extended Attribute that has been used after this cutoff will not be removed.
+     * @return The number of Extended Attributes removed.
+     */
+    int cleanupExtendedAttributes(int maximumAttributeCount, long sequenceNumberCutoff);
 }

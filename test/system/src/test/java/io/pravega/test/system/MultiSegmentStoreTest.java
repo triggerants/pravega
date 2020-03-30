@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,16 +9,10 @@
  */
 package io.pravega.test.system;
 
-import io.pravega.client.ClientFactory;
+import io.pravega.client.ClientConfig;
+import io.pravega.client.EventStreamClientFactory;
 import io.pravega.client.admin.ReaderGroupManager;
 import io.pravega.client.admin.StreamManager;
-import io.pravega.test.system.framework.Environment;
-import io.pravega.test.system.framework.SystemTestRunner;
-import io.pravega.test.system.framework.services.BookkeeperService;
-import io.pravega.test.system.framework.services.PravegaControllerService;
-import io.pravega.test.system.framework.services.PravegaSegmentStoreService;
-import io.pravega.test.system.framework.services.Service;
-import io.pravega.test.system.framework.services.ZookeeperService;
 import io.pravega.client.stream.EventStreamReader;
 import io.pravega.client.stream.EventStreamWriter;
 import io.pravega.client.stream.EventWriterConfig;
@@ -26,123 +20,100 @@ import io.pravega.client.stream.ReaderConfig;
 import io.pravega.client.stream.ReaderGroupConfig;
 import io.pravega.client.stream.ReinitializationRequiredException;
 import io.pravega.client.stream.ScalingPolicy;
+import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.impl.JavaSerializer;
+import io.pravega.common.concurrent.Futures;
+import io.pravega.test.system.framework.Environment;
+import io.pravega.test.system.framework.SystemTestRunner;
+import io.pravega.test.system.framework.Utils;
+import io.pravega.test.system.framework.services.Service;
+import java.io.Serializable;
+import java.net.URI;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.ExecutionException;
 import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
-import mesosphere.marathon.client.utils.MarathonException;
+import mesosphere.marathon.client.MarathonException;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.Timeout;
 import org.junit.runner.RunWith;
-
-import java.io.Serializable;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.util.Collections;
-import java.util.List;
-import java.util.UUID;
 
 /**
  * Test cases for deploying multiple segment stores.
  */
 @Slf4j
 @RunWith(SystemTestRunner.class)
-public class MultiSegmentStoreTest {
+public class MultiSegmentStoreTest extends AbstractSystemTest {
+
+    @Rule
+    public Timeout globalTimeout = Timeout.seconds(10 * 60);
 
     private Service segmentServiceInstance = null;
     private Service controllerInstance = null;
 
     @Environment
-    public static void initialize() throws InterruptedException, MarathonException, URISyntaxException {
-
-        // 1. Check if zk is running, if not start it.
-        Service zkService = new ZookeeperService("zookeeper");
-        if (!zkService.isRunning()) {
-            zkService.start(true);
-        }
-
-        List<URI> zkUris = zkService.getServiceDetails();
-        log.info("zookeeper service details: {}", zkUris);
-        URI zkUri = zkUris.get(0);
-        // 2. Check if bk is running, otherwise start it.
-        Service bkService = new BookkeeperService("bookkeeper", zkUri);
-        if (!bkService.isRunning()) {
-            bkService.start(true);
-        }
-
-        List<URI> bkUris = bkService.getServiceDetails();
-        log.info("bookkeeper service details: {}", bkUris);
-
-        // 3. Start controller.
-        Service controllerService = new PravegaControllerService("controller", zkUri);
-        if (!controllerService.isRunning()) {
-            controllerService.start(true);
-        }
-
-        List<URI> conUris = controllerService.getServiceDetails();
-        log.info("Pravega Controller service instance details: {}", conUris);
-
-        // 4. Start segment store.
-        Service segService = new PravegaSegmentStoreService("segmentstore", zkUri, conUris.get(0));
-        if (!segService.isRunning()) {
-            segService.start(true);
-        }
-
-        List<URI> segUris = segService.getServiceDetails();
-        log.info("pravega host service details: {}", segUris);
+    public static void initialize() throws MarathonException {
+        URI zkUri = startZookeeperInstance();
+        startBookkeeperInstances(zkUri);
+        URI controllerUri = ensureControllerRunning(zkUri);
+        ensureSegmentStoreRunning(zkUri, controllerUri);
     }
 
     @Before
     public void setup() {
-        Service zkService = new ZookeeperService("zookeeper");
+        Service zkService = Utils.createZookeeperService();
         Assert.assertTrue(zkService.isRunning());
         List<URI> zkUris = zkService.getServiceDetails();
         log.info("zookeeper service details: {}", zkUris);
 
         // Verify controller is running.
-        this.controllerInstance = new PravegaControllerService("controller", zkUris.get(0));
+        this.controllerInstance = Utils.createPravegaControllerService(zkUris.get(0));
         Assert.assertTrue(this.controllerInstance.isRunning());
         List<URI> conURIs = this.controllerInstance.getServiceDetails();
         log.info("Pravega Controller service instance details: {}", conURIs);
 
         // Verify segment stores is running.
-        this.segmentServiceInstance = new PravegaSegmentStoreService("segmentstore", zkUris.get(0), conURIs.get(0));
+        this.segmentServiceInstance = Utils.createPravegaSegmentStoreService(zkUris.get(0), conURIs.get(0));
         Assert.assertTrue(this.segmentServiceInstance.isRunning());
         Assert.assertEquals(1, this.segmentServiceInstance.getServiceDetails().size());
         log.info("Pravega segment store instance details: {}", this.segmentServiceInstance.getServiceDetails());
     }
 
     @After
-    public void tearDown() {
+    public void tearDown() throws ExecutionException {
         // Scale back the segment store instance count.
-        this.segmentServiceInstance.scaleService(1, true);
+        Futures.getAndHandleExceptions(this.segmentServiceInstance.scaleService(1), ExecutionException::new);
     }
 
-    @Test(timeout = 600000)
-    public void testMultiSegmentStores() throws InterruptedException {
+    @Test
+    public void testMultiSegmentStores() throws InterruptedException, ExecutionException {
         // Test Sanity.
         log.info("Test with 1 segment store running");
         testReadWrite();
 
         // Scale up and test.
-        this.segmentServiceInstance.scaleService(3, true);
+        Futures.getAndHandleExceptions(this.segmentServiceInstance.scaleService(3), ExecutionException::new);
         // Wait for all containers to be up and registered.
         Thread.sleep(60000);
         log.info("Test with 3 segment stores running");
         testReadWrite();
 
         // Rescale and verify.
-        this.segmentServiceInstance.scaleService(2, true);
+        Futures.getAndHandleExceptions(this.segmentServiceInstance.scaleService(2), ExecutionException::new);
         // Wait for all containers to be up and registered.
         Thread.sleep(60000);
         log.info("Test with 2 segment stores running");
         testReadWrite();
 
         // Rescale to single instance and verify.
-        this.segmentServiceInstance.scaleService(1, true);
+        Futures.getAndHandleExceptions(this.segmentServiceInstance.scaleService(1), ExecutionException::new);
         // Wait for all containers to be up and registered.
         Thread.sleep(60000);
         log.info("Test with 1 segment store running");
@@ -156,19 +127,19 @@ public class MultiSegmentStoreTest {
         String scope = "testscope" + RandomStringUtils.randomAlphanumeric(10);
         String stream = "teststream" + RandomStringUtils.randomAlphanumeric(10);
 
+        ClientConfig clientConfig = Utils.buildClientConfig(controllerUri);
         @Cleanup
-        StreamManager streamManager = StreamManager.create(controllerUri);
+        StreamManager streamManager = StreamManager.create(clientConfig);
         Assert.assertTrue(streamManager.createScope(scope));
 
         // Create stream with large number of segments so that most segment containers are used.
         Assert.assertTrue(streamManager.createStream(scope, stream, StreamConfiguration.builder()
-                .scope(scope)
-                .streamName(stream)
                 .scalingPolicy(ScalingPolicy.fixed(10))
                 .build()));
 
         @Cleanup
-        ClientFactory clientFactory = ClientFactory.withScope(scope, controllerUri);
+        EventStreamClientFactory clientFactory = EventStreamClientFactory.withScope(scope,
+                clientConfig);
 
         log.info("Invoking writer with controller URI: {}", controllerUri);
         @Cleanup
@@ -186,9 +157,9 @@ public class MultiSegmentStoreTest {
 
         log.info("Invoking reader with controller URI: {}", controllerUri);
         final String readerGroup = "testreadergroup" + RandomStringUtils.randomAlphanumeric(10);
-        ReaderGroupManager.withScope(scope, controllerUri)
-                .createReaderGroup(readerGroup, ReaderGroupConfig.builder().startingTime(0).build(),
-                        Collections.singleton(stream));
+        ReaderGroupManager groupManager = ReaderGroupManager.withScope(scope, clientConfig);
+        groupManager.createReaderGroup(readerGroup,
+                ReaderGroupConfig.builder().disableAutomaticCheckpoints().stream(Stream.of(scope, stream)).build());
 
         @Cleanup
         EventStreamReader<String> reader = clientFactory.createReader(UUID.randomUUID().toString(),

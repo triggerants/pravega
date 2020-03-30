@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,8 +10,13 @@
 package io.pravega.client.stream.impl;
 
 import com.google.common.base.Preconditions;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.pravega.client.segment.impl.Segment;
+import io.pravega.client.stream.PingFailedException;
+import io.pravega.client.stream.RetentionPolicy;
 import io.pravega.client.stream.ScalingPolicy;
+import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.Transaction;
 import io.pravega.common.Exceptions;
@@ -20,13 +25,12 @@ import io.pravega.controller.stream.api.grpc.v1.Controller.NodeUri;
 import io.pravega.controller.stream.api.grpc.v1.Controller.SegmentId;
 import io.pravega.controller.stream.api.grpc.v1.Controller.SegmentRange;
 import io.pravega.controller.stream.api.grpc.v1.Controller.StreamConfig;
+import io.pravega.controller.stream.api.grpc.v1.Controller.StreamCut;
 import io.pravega.controller.stream.api.grpc.v1.Controller.StreamInfo;
 import io.pravega.controller.stream.api.grpc.v1.Controller.SuccessorResponse;
 import io.pravega.controller.stream.api.grpc.v1.Controller.TxnId;
 import io.pravega.controller.stream.api.grpc.v1.Controller.TxnState;
 import io.pravega.shared.protocol.netty.PravegaNodeUri;
-import io.pravega.client.stream.RetentionPolicy;
-
 import java.util.AbstractMap;
 import java.util.AbstractMap.SimpleEntry;
 import java.util.List;
@@ -38,6 +42,9 @@ import java.util.stream.Collectors;
 
 /**
  * Provides translation (encode/decode) between the Model classes and its gRPC representation.
+ * 
+ * NOTE: For some unknown reason all methods that encode data to go over the wire are called
+ * "decode" and all method that take the wire format an instantiate java objects are called "encode".
  */
 public final class ModelHelper {
 
@@ -61,14 +68,14 @@ public final class ModelHelper {
     public static final Segment encode(final SegmentId segment) {
         Preconditions.checkNotNull(segment, "segment");
         return new Segment(segment.getStreamInfo().getScope(),
-                           segment.getStreamInfo().getStream(),
-                           segment.getSegmentNumber());
+                segment.getStreamInfo().getStream(),
+                segment.getSegmentId());
     }
 
     public static final ScalingPolicy encode(final Controller.ScalingPolicy policy) {
         Preconditions.checkNotNull(policy, "policy");
         return ScalingPolicy.builder()
-                            .type(ScalingPolicy.Type.valueOf(policy.getType().name()))
+                            .scaleType(ScalingPolicy.ScaleType.valueOf(policy.getScaleType().name()))
                             .targetRate(policy.getTargetRate())
                             .scaleFactor(policy.getScaleFactor())
                             .minNumSegments(policy.getMinNumSegments())
@@ -84,10 +91,10 @@ public final class ModelHelper {
     public static final RetentionPolicy encode(final Controller.RetentionPolicy policy) {
         // Using default enum type of UNKNOWN(0) to detect if retention policy has been set or not.
         // This is required since proto3 does not have any other way to detect if a field has been set or not.
-        if (policy != null && policy.getType() != Controller.RetentionPolicy.RetentionPolicyType.UNKNOWN) {
+        if (policy != null && policy.getRetentionType() != Controller.RetentionPolicy.RetentionPolicyType.UNKNOWN) {
             return RetentionPolicy.builder()
-                    .type(RetentionPolicy.Type.valueOf(policy.getType().name()))
-                    .value(policy.getValue())
+                    .retentionType(RetentionPolicy.RetentionType.valueOf(policy.getRetentionType().name()))
+                    .retentionParam(policy.getRetentionParam())
                     .build();
         } else {
             return null;
@@ -103,8 +110,6 @@ public final class ModelHelper {
     public static final StreamConfiguration encode(final StreamConfig config) {
         Preconditions.checkNotNull(config, "config");
         return StreamConfiguration.builder()
-                .scope(config.getStreamInfo().getScope())
-                .streamName(config.getStreamInfo().getStream())
                 .scalingPolicy(encode(config.getScalingPolicy()))
                 .retentionPolicy(encode(config.getRetentionPolicy()))
                 .build();
@@ -127,7 +132,7 @@ public final class ModelHelper {
      * @param keyRanges List of Key Value pairs.
      * @return Collection of key ranges available.
      */
-    public static final List<AbstractMap.SimpleEntry<Double, Double>> encode(final Map<Double, Double> keyRanges) {
+    public static final List<Map.Entry<Double, Double>> encode(final Map<Double, Double> keyRanges) {
         Preconditions.checkNotNull(keyRanges, "keyRanges");
 
         return keyRanges
@@ -175,6 +180,37 @@ public final class ModelHelper {
     }
 
     /**
+     * Returns the status of Ping Transaction.
+     *
+     * @param status     PingTxnStatus object instance.
+     * @param logString Description text to be logged when ping transaction status is invalid.
+     * @return Transaction.PingStatus
+     * @throws PingFailedException if status of Ping transaction operations is not successful.
+     */
+    public static final Transaction.PingStatus encode(final Controller.PingTxnStatus.Status status, final String logString)
+            throws PingFailedException {
+        Preconditions.checkNotNull(status, "status");
+        Exceptions.checkNotNullOrEmpty(logString, "logString");
+        Transaction.PingStatus result;
+        switch (status) {
+            case OK:
+                result = Transaction.PingStatus.OPEN;
+                break;
+            case COMMITTED:
+                result = Transaction.PingStatus.COMMITTED;
+                break;
+            case ABORTED:
+                result = Transaction.PingStatus.ABORTED;
+                break;
+            case UNKNOWN:
+                throw new StatusRuntimeException(Status.NOT_FOUND);
+            default:
+                throw new PingFailedException("Ping transaction for " + logString + " failed with status " + status);
+        }
+        return result;
+    }
+
+    /**
      * Helper to convert SegmentRange to SegmentWithRange.
      *
      * @param segmentRange segmentRange
@@ -185,6 +221,15 @@ public final class ModelHelper {
                 .getMaxKey());
     }
 
+    /**
+     * Helper method to convery stream cut to map of segment to position.
+     * @param streamCut Stream cut
+     * @return map of segment to position
+     */
+    public static Map<Long, Long> encode(Controller.StreamCut streamCut) {
+        return streamCut.getCutMap();
+    }
+    
     /**
      * Returns TxnId object instance for a given transaction with UUID.
      *
@@ -207,7 +252,7 @@ public final class ModelHelper {
      */
     public static final SegmentId decode(final Segment segment) {
         Preconditions.checkNotNull(segment, "segment");
-        return createSegmentId(segment.getScope(), segment.getStreamName(), segment.getSegmentNumber());
+        return createSegmentId(segment.getScope(), segment.getStreamName(), segment.getSegmentId());
     }
 
     /**
@@ -219,7 +264,7 @@ public final class ModelHelper {
     public static final Controller.ScalingPolicy decode(final ScalingPolicy policyModel) {
         Preconditions.checkNotNull(policyModel, "policyModel");
         return Controller.ScalingPolicy.newBuilder()
-                .setType(Controller.ScalingPolicy.ScalingPolicyType.valueOf(policyModel.getType().name()))
+                .setScaleType(Controller.ScalingPolicy.ScalingPolicyType.valueOf(policyModel.getScaleType().name()))
                 .setTargetRate(policyModel.getTargetRate())
                 .setScaleFactor(policyModel.getScaleFactor())
                 .setMinNumSegments(policyModel.getMinNumSegments())
@@ -235,8 +280,8 @@ public final class ModelHelper {
     public static final Controller.RetentionPolicy decode(final RetentionPolicy policyModel) {
         if (policyModel != null) {
             return Controller.RetentionPolicy.newBuilder()
-                    .setType(Controller.RetentionPolicy.RetentionPolicyType.valueOf(policyModel.getType().name()))
-                    .setValue(policyModel.getValue())
+                    .setRetentionType(Controller.RetentionPolicy.RetentionPolicyType.valueOf(policyModel.getRetentionType().name()))
+                    .setRetentionParam(policyModel.getRetentionParam())
                     .build();
         } else {
             return null;
@@ -245,14 +290,16 @@ public final class ModelHelper {
 
     /**
      * Converts StreamConfiguration into StreamConfig.
-     *
+     * 
+     * @param scope the stream's scope 
+     * @param streamName The Stream Name
      * @param configModel The stream configuration.
      * @return StreamConfig instance.
      */
-    public static final StreamConfig decode(final StreamConfiguration configModel) {
+    public static final StreamConfig decode(String scope, String streamName, final StreamConfiguration configModel) {
         Preconditions.checkNotNull(configModel, "configModel");
         final StreamConfig.Builder builder = StreamConfig.newBuilder()
-                .setStreamInfo(createStreamInfo(configModel.getScope(), configModel.getStreamName()))
+                .setStreamInfo(createStreamInfo(scope, streamName))
                 .setScalingPolicy(decode(configModel.getScalingPolicy()));
         if (configModel.getRetentionPolicy() != null) {
             builder.setRetentionPolicy(decode(configModel.getRetentionPolicy()));
@@ -270,20 +317,40 @@ public final class ModelHelper {
         Preconditions.checkNotNull(uri, "uri");
         return NodeUri.newBuilder().setEndpoint(uri.getEndpoint()).setPort(uri.getPort()).build();
     }
-    
-    public static final Set<Integer> getSegmentsFromPositions(final List<PositionInternal> positions) {
+
+    /**
+     * Creates a stream cut object.
+     *
+     * @param scope     scope
+     * @param stream    stream
+     * @param streamCut map of segment to position
+     * @return stream cut
+     */
+    public static Controller.StreamCut decode(final String scope, final String stream, Map<Long, Long> streamCut) {
+        return Controller.StreamCut.newBuilder().setStreamInfo(createStreamInfo(scope, stream)).putAllCut(streamCut).build();
+    }
+
+    public static Controller.StreamCutRange decode(final String scope, final String stream, Map<Long, Long> from, Map<Long, Long> to) {
+        Exceptions.checkNotNullOrEmpty(scope, "scope");
+        Exceptions.checkNotNullOrEmpty(stream, "stream");
+
+        return Controller.StreamCutRange.newBuilder().setStreamInfo(createStreamInfo(scope, stream)).putAllFrom(from)
+                .putAllTo(to).build();
+    }
+
+    public static final Set<Long> getSegmentsFromPositions(final List<PositionInternal> positions) {
         Preconditions.checkNotNull(positions, "positions");
         return positions.stream()
-            .flatMap(position -> position.getCompletedSegments().stream().map(Segment::getSegmentNumber))
+            .flatMap(position -> position.getCompletedSegments().stream().map(Segment::getSegmentId))
             .collect(Collectors.toSet());
     }
     
-    public static final Map<Integer, Long> toSegmentOffsetMap(final PositionInternal position) {
+    public static final Map<Long, Long> toSegmentOffsetMap(final PositionInternal position) {
         Preconditions.checkNotNull(position, "position");
         return position.getOwnedSegmentsWithOffsets()
             .entrySet()
             .stream()
-            .map(e -> new SimpleEntry<>(e.getKey().getSegmentNumber(), e.getValue()))
+            .map(e -> new SimpleEntry<>(e.getKey().getSegmentId(), e.getValue()))
             .collect(Collectors.toMap(Entry::getKey, Entry::getValue));
     }
 
@@ -298,27 +365,55 @@ public final class ModelHelper {
         return StreamInfo.newBuilder().setScope(scope).setStream(stream).build();
     }
 
-    public static final SegmentId createSegmentId(final String scope, final String stream, final int segmentNumber) {
+    public static final SegmentId createSegmentId(final String scope, final String stream, final long segmentId) {
         Exceptions.checkNotNullOrEmpty(scope, "scope");
         Exceptions.checkNotNullOrEmpty(stream, "stream");
         return SegmentId.newBuilder()
                 .setStreamInfo(createStreamInfo(scope, stream))
-                .setSegmentNumber(segmentNumber)
+                .setSegmentId(segmentId)
                 .build();
     }
 
     public static final SegmentRange createSegmentRange(final String scope, final String stream,
-            final int segmentNumber, final double rangeMinKey, final double rangeMaxKey) {
+            final long segmentId, final double rangeMinKey, final double rangeMaxKey) {
         Exceptions.checkNotNullOrEmpty(scope, "scope");
         Exceptions.checkNotNullOrEmpty(stream, "stream");
         return SegmentRange.newBuilder()
-                .setSegmentId(createSegmentId(scope, stream, segmentNumber))
+                .setSegmentId(createSegmentId(scope, stream, segmentId))
                 .setMinKey(rangeMinKey)
                 .setMaxKey(rangeMaxKey)
                 .build();
     }
 
-    public static final SuccessorResponse createSuccessorResponse(Map<SegmentRange, List<Integer>> segments) {
+    public static final Controller.StreamCutRangeResponse createStreamCutRangeResponse(final String scope, final String stream,
+                                                                                       final List<SegmentId> segments, String delegationToken) {
+        Exceptions.checkNotNullOrEmpty(scope, "scope");
+        Exceptions.checkNotNullOrEmpty(stream, "stream");
+        Exceptions.checkArgument(segments.stream().allMatch(x -> x.getStreamInfo().getScope().equals(scope) &&
+                        x.getStreamInfo().getStream().equals(stream)),
+                "streamInfo", "stream info does not match segment id", scope, stream, segments);
+        return Controller.StreamCutRangeResponse.newBuilder()
+                .addAllSegments(segments)
+                .setDelegationToken(delegationToken)
+                .build();
+    }
+
+    /**
+     * Builds a stream cut, mapping the segments of a stream to their offsets from a writer position object.
+     * 
+     * @param stream The stream the cut is on.
+     * @param position The position object to take the offsets from.
+     * @return a StreamCut.
+     */
+    public static StreamCut createStreamCut(Stream stream, WriterPosition position) {
+        StreamCut.Builder builder = StreamCut.newBuilder().setStreamInfo(createStreamInfo(stream.getScope(), stream.getStreamName()));
+        for (Entry<Segment, Long> entry : position.getSegmentsWithOffsets().entrySet()) {
+            builder.putCut(entry.getKey().getSegmentId(), entry.getValue());
+        }
+        return builder.build();
+    }
+
+    public static final SuccessorResponse.Builder createSuccessorResponse(Map<SegmentRange, List<Long>> segments) {
         Preconditions.checkNotNull(segments);
         return SuccessorResponse.newBuilder()
                 .addAllSegments(
@@ -327,7 +422,6 @@ public final class ModelHelper {
                                         .setSegment(segmentRangeListEntry.getKey())
                                         .addAllValue(segmentRangeListEntry.getValue())
                                         .build())
-                                .collect(Collectors.toList()))
-                .build();
+                                .collect(Collectors.toList()));
     }
 }

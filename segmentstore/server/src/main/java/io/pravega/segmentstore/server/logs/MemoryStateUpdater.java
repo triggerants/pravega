@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,34 +9,41 @@
  */
 package io.pravega.segmentstore.server.logs;
 
-import io.pravega.common.ExceptionHelpers;
+import com.google.common.base.Preconditions;
+import io.pravega.common.Exceptions;
+import io.pravega.common.ObjectClosedException;
 import io.pravega.common.util.SequencedItemList;
+import io.pravega.segmentstore.contracts.StreamSegmentNotExistsException;
+import io.pravega.segmentstore.server.CacheUtilizationProvider;
 import io.pravega.segmentstore.server.ContainerMetadata;
 import io.pravega.segmentstore.server.DataCorruptionException;
 import io.pravega.segmentstore.server.ReadIndex;
+import io.pravega.segmentstore.server.SegmentOperation;
 import io.pravega.segmentstore.server.logs.operations.CachedStreamSegmentAppendOperation;
+import io.pravega.segmentstore.server.logs.operations.MergeSegmentOperation;
 import io.pravega.segmentstore.server.logs.operations.Operation;
 import io.pravega.segmentstore.server.logs.operations.StorageOperation;
 import io.pravega.segmentstore.server.logs.operations.StreamSegmentAppendOperation;
-import io.pravega.segmentstore.server.logs.operations.MergeTransactionOperation;
-import com.google.common.base.Preconditions;
-
+import io.pravega.segmentstore.storage.cache.CacheFullException;
 import java.util.HashSet;
-import javax.annotation.concurrent.GuardedBy;
+import java.util.Iterator;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import javax.annotation.concurrent.ThreadSafe;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * Helper class that allows appending Log Operations to available InMemory Structures.
  */
 @ThreadSafe
+@Slf4j
 class MemoryStateUpdater {
     //region Private
 
     private final ReadIndex readIndex;
     private final SequencedItemList<Operation> inMemoryOperationLog;
-    private final Runnable flushCallback;
-    @GuardedBy("readIndex")
-    private HashSet<Long> recentStreamSegmentIds;
+    private final Runnable commitSuccess;
+    private final AtomicBoolean recoveryMode;
 
     //endregion
 
@@ -46,32 +53,30 @@ class MemoryStateUpdater {
      * Creates a new instance of the MemoryStateUpdater class.
      *
      * @param inMemoryOperationLog InMemory Operation Log.
-     * @param readIndex            The ReadIndex.
-     */
-    MemoryStateUpdater(SequencedItemList<Operation> inMemoryOperationLog, ReadIndex readIndex) {
-        this(inMemoryOperationLog, readIndex, null);
-    }
-
-    /**
-     * Creates a new instance of the MemoryStateUpdater class.
-     *
-     * @param inMemoryOperationLog InMemory Operation Log.
      * @param readIndex            The ReadIndex to update.
-     * @param flushCallback        (Optional) A callback to be invoked whenever flush() is invoked.
+     * @param commitSuccess        (Optional) A callback to be invoked whenever an Operation or set of Operations are
+     *                             successfully committed.
      */
-    MemoryStateUpdater(SequencedItemList<Operation> inMemoryOperationLog, ReadIndex readIndex, Runnable flushCallback) {
-        Preconditions.checkNotNull(readIndex, "readIndex");
-        Preconditions.checkNotNull(inMemoryOperationLog, "inMemoryOperationLog");
-
-        this.inMemoryOperationLog = inMemoryOperationLog;
-        this.readIndex = readIndex;
-        this.flushCallback = flushCallback;
-        this.recentStreamSegmentIds = new HashSet<>();
+    MemoryStateUpdater(SequencedItemList<Operation> inMemoryOperationLog, ReadIndex readIndex, Runnable commitSuccess) {
+        this.inMemoryOperationLog = Preconditions.checkNotNull(inMemoryOperationLog, "inMemoryOperationLog");
+        this.readIndex = Preconditions.checkNotNull(readIndex, "readIndex");
+        this.commitSuccess = commitSuccess;
+        this.recoveryMode = new AtomicBoolean();
     }
 
     //endregion
 
     //region Operations
+
+    /**
+     * Gets the {@link CacheUtilizationProvider} shared across all Segment Containers hosted in this process that can
+     * be used to query the Cache State.
+     *
+     * @return The {@link CacheUtilizationProvider}.
+     */
+    public CacheUtilizationProvider getCacheUtilizationProvider() {
+        return this.readIndex.getCacheUtilizationProvider();
+    }
 
     /**
      * Puts the Log Updater in Recovery Mode, using the given Metadata Source as interim.
@@ -80,6 +85,7 @@ class MemoryStateUpdater {
      */
     void enterRecoveryMode(ContainerMetadata recoveryMetadataSource) {
         this.readIndex.enterRecoveryMode(recoveryMetadataSource);
+        this.recoveryMode.set(true);
     }
 
     /**
@@ -90,34 +96,93 @@ class MemoryStateUpdater {
      */
     void exitRecoveryMode(boolean successfulRecovery) throws DataCorruptionException {
         this.readIndex.exitRecoveryMode(successfulRecovery);
+        this.recoveryMode.set(false);
     }
 
     /**
-     * Appends the given operation.
+     * Processes the given operations and applies them to the ReadIndex and InMemory OperationLog.
      *
-     * @param operation The operation to append.
+     * @param operations An Iterator iterating over the operations to process (in sequence).
+     * @param callback   A Consumer that will be invoked on EVERY {@link Operation} in the operations iterator, in the
+     *                   order returned from the iterator, regardless of whether the operation was processed or not.
      * @throws DataCorruptionException If a serious, non-recoverable, data corruption was detected, such as trying to
      *                                 append operations out of order.
+     * @throws CacheFullException      If any operation in the given iterator contains data that needs to be added to the
+     *                                 {@link ReadIndex} but it could not be done due to the cache being full and unable
+     *                                 to evict anything to make room for more.
      */
-    void process(Operation operation) throws DataCorruptionException {
-        if (!operation.canSerialize()) {
-            // Nothing to do.
-            return;
+    void process(Iterator<Operation> operations, Consumer<Operation> callback) throws DataCorruptionException, CacheFullException {
+        HashSet<Long> segmentIds = new HashSet<>();
+        Operation op = null;
+        try {
+            while (operations.hasNext()) {
+                op = operations.next();
+                process(op);
+                callback.accept(op);
+                if (op instanceof SegmentOperation) {
+                    // Record recent activity on stream segment, if applicable. This should be recorded for any kind
+                    // of Operation that touches a Segment, since when we issue 'triggerFutureReads' on the readIndex,
+                    // it should include 'sealed' StreamSegments too - any Future Reads waiting on that Offset will be cancelled.
+                    segmentIds.add(((SegmentOperation) op).getStreamSegmentId());
+                }
+            }
+            op = null;
+        } catch (Throwable ex) {
+            // Invoke the callback on every remaining operation (including the failed one, which is no longer part of the iterator).
+            if (op != null) {
+                callback.accept(op);
+            }
+            operations.forEachRemaining(callback);
+            throw ex;
         }
 
-        // Add entry to MemoryTransactionLog and ReadIndex/Cache. This callback is invoked from the QueueProcessor,
+        if (!this.recoveryMode.get()) {
+            // Trigger Future Reads on those segments which were touched by Appends or Seals.
+            this.readIndex.triggerFutureReads(segmentIds);
+            if (this.commitSuccess != null) {
+                this.commitSuccess.run();
+            }
+        }
+    }
+
+    /**
+     * Processes the given operation and applies it to the ReadIndex and InMemory OperationLog.
+     *
+     * @param operation The operation to process.
+     * @throws DataCorruptionException If a serious, non-recoverable, data corruption was detected, such as trying to
+     *                                 append operations out of order.
+     * @throws CacheFullException If the operation contains data that needs to be added to the {@link ReadIndex} but it
+     * could not be done due to the cache being full and unable to evict anything to make room for more.
+     */
+    void process(Operation operation) throws DataCorruptionException, CacheFullException {
+        // Add entry to MemoryTransactionLog and ReadIndex/Cache. This callback is invoked from the OperationProcessor,
         // which always acks items in order of Sequence Number - so the entries should be ordered (but always check).
         if (operation instanceof StorageOperation) {
             addToReadIndex((StorageOperation) operation);
             if (operation instanceof StreamSegmentAppendOperation) {
                 // Transform a StreamSegmentAppendOperation into its corresponding Cached version.
+                StreamSegmentAppendOperation appendOp = (StreamSegmentAppendOperation) operation;
                 try {
-                    operation = new CachedStreamSegmentAppendOperation((StreamSegmentAppendOperation) operation);
+                    operation = new CachedStreamSegmentAppendOperation(appendOp);
                 } catch (Throwable ex) {
-                    if (ExceptionHelpers.mustRethrow(ex)) {
+                    if (Exceptions.mustRethrow(ex)) {
                         throw ex;
                     } else {
                         throw new DataCorruptionException(String.format("Unable to create a CachedStreamSegmentAppendOperation from operation '%s'.", operation), ex);
+                    }
+                }
+
+                // Release the memory occupied by this StreamSegmentAppendOperation's BufferView - it has been processed
+                // and is no longer needed.
+                try {
+                    appendOp.close();
+                } catch (Throwable ex) {
+                    if (Exceptions.mustRethrow(ex)) {
+                        throw ex;
+                    } else {
+                        // We do want to know if for some reason we're unable to release the BufferView's memory, but
+                        // this is no reason to halt the ingestion pipeline and cause a container shutdown.
+                        log.warn("Unable to release memory for operation '{}': ", operation, ex);
                     }
                 }
             }
@@ -134,52 +199,45 @@ class MemoryStateUpdater {
     }
 
     /**
-     * Flushes recently appended items, if needed.
-     * For example, it may trigger Future Reads on the ReadIndex, if the readIndex supports that.
-     */
-    void flush() {
-        HashSet<Long> elements;
-        synchronized (this.readIndex) {
-            elements = this.recentStreamSegmentIds;
-            this.recentStreamSegmentIds = new HashSet<>();
-        }
-
-        this.readIndex.triggerFutureReads(elements);
-        if (this.flushCallback != null) {
-            this.flushCallback.run();
-        }
-    }
-
-    /**
      * Registers the given operation in the ReadIndex.
      *
      * @param operation The operation to register.
+     * @throws CacheFullException If the operation could not be added to the {@link ReadIndex} due to the cache being
+     * full and unable to evict anything to make room for more.
+     * @throws DataCorruptionException If any unexpected exception occurred that prevented the operation from being
+     * added to the {@link ReadIndex}. Unexpected exceptions are all exceptions other than those declared in this
+     * method or that indicate we are shutting down or that the segment has been deleted.
      */
-    private void addToReadIndex(StorageOperation operation) {
-        if (operation instanceof StreamSegmentAppendOperation) {
-            // Record a StreamSegmentAppendOperation. Just in case, we also support this type of operation, but we need to
-            // log a warning indicating so. This means we do not optimize memory properly, and we end up storing data
-            // in two different places.
-            StreamSegmentAppendOperation appendOperation = (StreamSegmentAppendOperation) operation;
-            this.readIndex.append(appendOperation.getStreamSegmentId(),
-                    appendOperation.getStreamSegmentOffset(),
-                    appendOperation.getData());
-        } else if (operation instanceof MergeTransactionOperation) {
-            // Record a MergeTransactionOperation. We call beginMerge here, and the StorageWriter will call completeMerge.
-            MergeTransactionOperation mergeOperation = (MergeTransactionOperation) operation;
-            this.readIndex.beginMerge(mergeOperation.getStreamSegmentId(),
-                    mergeOperation.getStreamSegmentOffset(),
-                    mergeOperation.getTransactionSegmentId());
-        } else {
-            assert !(operation instanceof CachedStreamSegmentAppendOperation)
-                    : "attempted to add a CachedStreamSegmentAppendOperation to the ReadIndex";
-        }
-
-        // Record recent activity on stream segment, if applicable.
-        // We should record this for any kind of StorageOperation. When we issue 'triggerFutureReads' on the readIndex,
-        // it should include 'sealed' StreamSegments too - any Future Reads waiting on that Offset will be cancelled.
-        synchronized (this.readIndex) {
-            this.recentStreamSegmentIds.add(operation.getStreamSegmentId());
+    private void addToReadIndex(StorageOperation operation) throws DataCorruptionException, CacheFullException {
+        try {
+            if (operation instanceof StreamSegmentAppendOperation) {
+                // Record a StreamSegmentAppendOperation. Just in case, we also support this type of operation, but we need to
+                // log a warning indicating so. This means we do not optimize memory properly, and we end up storing data
+                // in two different places.
+                StreamSegmentAppendOperation appendOperation = (StreamSegmentAppendOperation) operation;
+                this.readIndex.append(appendOperation.getStreamSegmentId(),
+                        appendOperation.getStreamSegmentOffset(),
+                        appendOperation.getData());
+            } else if (operation instanceof MergeSegmentOperation) {
+                // Record a MergeSegmentOperation. We call beginMerge here, and the StorageWriter will call completeMerge.
+                MergeSegmentOperation mergeOperation = (MergeSegmentOperation) operation;
+                this.readIndex.beginMerge(mergeOperation.getStreamSegmentId(),
+                        mergeOperation.getStreamSegmentOffset(),
+                        mergeOperation.getSourceSegmentId());
+            } else {
+                assert !(operation instanceof CachedStreamSegmentAppendOperation)
+                        : "attempted to add a CachedStreamSegmentAppendOperation to the ReadIndex";
+            }
+        } catch (ObjectClosedException | StreamSegmentNotExistsException ex) {
+            // The Segment is in the process of being deleted. We usually end up in here because a concurrent delete
+            // request has updated the metadata while we were executing.
+            log.warn("Not adding operation '{}' to ReadIndex because it refers to a deleted StreamSegment.", operation);
+        } catch (CacheFullException ex) {
+            // Record the operation that we couldn't add and re-throw the exception as we cannot do anything about it here.
+            log.warn("Not adding operation '{}' to ReadIndex because the Cache is full.", operation);
+            throw ex;
+        } catch (Exception ex) {
+            throw new DataCorruptionException(String.format("Unable to add operation '%s' to ReadIndex.", operation), ex);
         }
     }
 

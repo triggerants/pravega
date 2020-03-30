@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,12 +23,12 @@ import io.pravega.client.state.examples.SetSynchronizer;
 import io.pravega.client.stream.impl.JavaSerializer;
 import io.pravega.client.stream.mock.MockStreamManager;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
+import io.pravega.segmentstore.contracts.tables.TableStore;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.test.common.TestUtils;
 import java.io.Serializable;
-import java.util.Collections;
 import java.util.concurrent.atomic.AtomicInteger;
 import lombok.Cleanup;
 import lombok.Data;
@@ -39,6 +39,7 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.mock;
 
 public class StateSynchronizerTest {
 
@@ -70,6 +71,7 @@ public class StateSynchronizerTest {
 
     @Data
     private static class TestUpdate implements Update<TestState>, InitialUpdate<TestState>, Serializable {
+        private static final long serialVersionUID = 1L;
         private final String value;
 
         @Override
@@ -90,15 +92,16 @@ public class StateSynchronizerTest {
         int port = TestUtils.getAvailableListenPort();
         StreamSegmentStore store = this.serviceBuilder.createStreamSegmentService();
         @Cleanup
-        PravegaConnectionListener server = new PravegaConnectionListener(false, port, store);
+        PravegaConnectionListener server = new PravegaConnectionListener(false, port, store, mock(TableStore.class));
         server.startListening();
         @Cleanup
         MockStreamManager streamManager = new MockStreamManager("scope", endpoint, port);
         streamManager.createScope("scope");
         streamManager.createStream("scope", stateName, null);
         JavaSerializer<TestUpdate> serializer = new JavaSerializer<TestUpdate>();
-        
+        @Cleanup
         val a = streamManager.getClientFactory().createStateSynchronizer(stateName, serializer, serializer, SynchronizerConfig.builder().build());
+        @Cleanup
         val b = streamManager.getClientFactory().createStateSynchronizer(stateName, serializer, serializer, SynchronizerConfig.builder().build());
 
         a.initialize(new TestUpdate("init"));
@@ -129,9 +132,9 @@ public class StateSynchronizerTest {
     
     private int update(StateSynchronizer<TestState> sync, String string) {
         AtomicInteger count = new AtomicInteger(0);
-        sync.updateState(state -> {
+        sync.updateState((state, updates) -> {
             count.incrementAndGet();
-            return Collections.singletonList(new TestUpdate(string));
+            updates.add(new TestUpdate(string));
         });
         return count.get();
     }
@@ -143,7 +146,7 @@ public class StateSynchronizerTest {
         int port = TestUtils.getAvailableListenPort();
         StreamSegmentStore store = this.serviceBuilder.createStreamSegmentService();
         @Cleanup
-        PravegaConnectionListener server = new PravegaConnectionListener(false, port, store);
+        PravegaConnectionListener server = new PravegaConnectionListener(false, port, store, mock(TableStore.class));
         server.startListening();
         @Cleanup
         MockStreamManager streamManager = new MockStreamManager("scope", endpoint, port);
@@ -170,7 +173,7 @@ public class StateSynchronizerTest {
         int port = TestUtils.getAvailableListenPort();
         StreamSegmentStore store = this.serviceBuilder.createStreamSegmentService();
         @Cleanup
-        PravegaConnectionListener server = new PravegaConnectionListener(false, port, store);
+        PravegaConnectionListener server = new PravegaConnectionListener(false, port, store, mock(TableStore.class));
         server.startListening();
         @Cleanup
         MockStreamManager streamManager = new MockStreamManager("scope", endpoint, port);

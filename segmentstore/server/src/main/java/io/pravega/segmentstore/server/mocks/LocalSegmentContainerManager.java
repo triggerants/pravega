@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,11 +12,11 @@ package io.pravega.segmentstore.server.mocks;
 import com.google.common.base.Preconditions;
 import io.pravega.common.Exceptions;
 import io.pravega.common.LoggerHelpers;
-import io.pravega.common.concurrent.FutureHelpers;
-import io.pravega.common.segment.SegmentToContainerMapper;
+import io.pravega.common.concurrent.Futures;
 import io.pravega.segmentstore.server.ContainerHandle;
 import io.pravega.segmentstore.server.SegmentContainerManager;
 import io.pravega.segmentstore.server.SegmentContainerRegistry;
+import io.pravega.shared.segment.SegmentToContainerMapper;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -30,8 +30,9 @@ import lombok.extern.slf4j.Slf4j;
  * Local (sandbox) implementation for SegmentContainerManager. Nothing that happens here ever leaves the confines
  * of this class. All information is lost upon closing and/or garbage-collection.
  * <p>
- * The SegmentName -> ContainerId mapping is done by taking the hash of the StreamSegment name and then modulo the
+ * The SegmentName -&lt; ContainerId mapping is done by taking the hash of the StreamSegment name and then modulo the
  * number of containers (result is in hex).
+ * </p>
  */
 @Slf4j
 @ThreadSafe
@@ -88,7 +89,7 @@ public class LocalSegmentContainerManager implements SegmentContainerManager {
             }
 
             // Wait for all the containers to be closed.
-            FutureHelpers.await(FutureHelpers.allOf(results), CLOSE_TIMEOUT_PER_CONTAINER.toMillis());
+            Futures.await(Futures.allOf(results), CLOSE_TIMEOUT_PER_CONTAINER.toMillis());
         }
     }
 
@@ -107,7 +108,7 @@ public class LocalSegmentContainerManager implements SegmentContainerManager {
                                      .thenAccept(this::registerHandle));
         }
 
-        FutureHelpers.allOf(futures).join();
+        Futures.allOf(futures).join();
         LoggerHelpers.traceLeave(log, "initialize", traceId);
     }
 

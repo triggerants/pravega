@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -58,6 +58,7 @@ public interface TruncationMarkerRepository {
      * setValidTruncationPoint().
      *
      * @param operationSequenceNumber The Sequence number to query.
+     * @return true if the given Operation Sequence Number is a valid Truncation Point, false otherwise.
      */
     boolean isValidTruncationPoint(long operationSequenceNumber);
 
@@ -65,6 +66,7 @@ public interface TruncationMarkerRepository {
      * Gets a value representing the highest Truncation Point that is smaller than or equal to the given Sequence Number.
      *
      * @param operationSequenceNumber The Sequence number to query.
+     * @return The highest Truncation Point.
      */
     long getClosestValidTruncationPoint(long operationSequenceNumber);
 }

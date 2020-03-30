@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,12 +12,16 @@ package io.pravega.segmentstore.server.logs;
 import io.pravega.test.common.ThreadPooledTestSuite;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.Timeout;
 
 /**
  * Unit tests for MetadataCheckpointPolicy.
  */
 public class MetadataCheckpointPolicyTests extends ThreadPooledTestSuite {
+    @Rule
+    public Timeout globalTimeout = Timeout.seconds(10);
 
     /**
      * Tests invoking the callback upon calls to commit.

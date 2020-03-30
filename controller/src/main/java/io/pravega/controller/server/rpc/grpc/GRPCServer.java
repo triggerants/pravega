@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,12 +9,20 @@
  */
 package io.pravega.controller.server.rpc.grpc;
 
-import io.pravega.common.LoggerHelpers;
-import io.pravega.controller.server.ControllerService;
-import io.pravega.controller.server.rpc.grpc.v1.ControllerServiceImpl;
+import com.google.common.base.Strings;
 import com.google.common.util.concurrent.AbstractIdleService;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import io.grpc.ServerInterceptors;
+import io.pravega.common.LoggerHelpers;
+import io.pravega.common.tracing.RequestTracker;
+import io.pravega.controller.server.ControllerService;
+import io.pravega.controller.server.rpc.auth.GrpcAuthHelper;
+import io.pravega.controller.server.rpc.auth.AuthHandlerManager;
+import io.pravega.controller.server.rpc.grpc.v1.ControllerServiceImpl;
+import io.pravega.shared.controller.tracing.RPCTracingHelpers;
+import java.io.File;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -27,19 +35,38 @@ public class GRPCServer extends AbstractIdleService {
     private final Server server;
     private final GRPCServerConfig config;
 
+    @Getter
+    private final AuthHandlerManager authHandlerManager;
+
     /**
      * Create gRPC server on the specified port.
      *
      * @param controllerService The controller service implementation.
      * @param serverConfig      The RPC Server config.
+     * @param requestTracker    Cache to track and access to client request identifiers.
      */
-    public GRPCServer(ControllerService controllerService, GRPCServerConfig serverConfig) {
+    public GRPCServer(ControllerService controllerService, GRPCServerConfig serverConfig, RequestTracker requestTracker) {
         this.objectId = "gRPCServer";
         this.config = serverConfig;
-        this.server = ServerBuilder
+        GrpcAuthHelper authHelper = new GrpcAuthHelper(serverConfig.isAuthorizationEnabled(),
+                serverConfig.getTokenSigningKey(), serverConfig.getAccessTokenTTLInSeconds());
+        ServerBuilder<?> builder = ServerBuilder
                 .forPort(serverConfig.getPort())
-                .addService(new ControllerServiceImpl(controllerService))
-                .build();
+                .addService(ServerInterceptors.intercept(new ControllerServiceImpl(controllerService, authHelper, requestTracker,
+                                serverConfig.isReplyWithStackTraceOnError()),
+                        RPCTracingHelpers.getServerInterceptor(requestTracker)));
+        if (serverConfig.isAuthorizationEnabled()) {
+            this.authHandlerManager = new AuthHandlerManager(serverConfig);
+            this.authHandlerManager.registerInterceptors(builder);
+        } else {
+            this.authHandlerManager = null;
+        }
+
+        if (serverConfig.isTlsEnabled() && !Strings.isNullOrEmpty(serverConfig.getTlsCertFile())) {
+            builder = builder.useTransportSecurity(new File(serverConfig.getTlsCertFile()),
+                    new File(serverConfig.getTlsKeyFile()));
+        }
+        this.server = builder.build();
     }
 
     /**

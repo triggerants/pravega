@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,6 +10,7 @@
 package io.pravega.controller.util;
 
 import io.pravega.controller.server.rpc.grpc.GRPCServerConfig;
+import lombok.val;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -35,19 +36,25 @@ public class ConfigTest {
         Assert.assertEquals("localhost:2181", Config.ZK_URL);
         Assert.assertEquals(100, Config.ZK_RETRY_SLEEP_MS);
         Assert.assertEquals(5, Config.ZK_MAX_RETRIES);
-        Assert.assertEquals("localhost", Config.REST_SERVER_IP);
+        Assert.assertEquals(10 * 1000, Config.ZK_SESSION_TIMEOUT_MS);
+        Assert.assertEquals("0.0.0.0", Config.REST_SERVER_IP);
         Assert.assertEquals(9091, Config.REST_SERVER_PORT);
         Assert.assertEquals(30000, Config.MAX_LEASE_VALUE);
-        Assert.assertEquals(30000, Config.MAX_SCALE_GRACE_PERIOD);
         Assert.assertEquals("_requeststream", Config.SCALE_STREAM_NAME);
         Assert.assertEquals("scaleGroup", Config.SCALE_READER_GROUP);
     }
 
     @Test
     public void testGRPCConfig() {
-        GRPCServerConfig grpcServerConfig = Config.getGRPCServerConfig();
+        GRPCServerConfig grpcServerConfig = Config.GRPC_SERVER_CONFIG;
         Assert.assertEquals(9090, grpcServerConfig.getPort());
         Assert.assertEquals(9090, (int) grpcServerConfig.getPublishedRPCPort().orElse(12345));
         Assert.assertFalse(grpcServerConfig.getPublishedRPCHost().isPresent());
+    }
+
+    @Test
+    public void testMetricsConfig() {
+        val mc = Config.METRICS_CONFIG;
+        Assert.assertEquals("no-host", mc.getStatsDHost());
     }
 }

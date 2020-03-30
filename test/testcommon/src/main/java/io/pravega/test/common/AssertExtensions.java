@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,18 +15,72 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import org.junit.Assert;
 
+import static org.junit.Assert.assertEquals;
+
 /**
  * Additional Assert Methods that are useful during testing.
  */
 public class AssertExtensions {
+
+    /**
+     * Invokes `eval` in a loop over and over (with a small sleep) and asserts that the value eventually reaches `expected`.
+     * @param <T>                   The type of the value to compare.
+     * @param expected              The expected return value.
+     * @param eval                  The function to test
+     * @param timeoutMillis         The timeout in milliseconds after which an assertion error should be thrown.
+     * @throws Exception            If the is an assertion error, and exception from `eval`, or the thread is interrupted.
+     */
+    public static <T> void assertEventuallyEquals(T expected, Callable<T> eval, long timeoutMillis) throws Exception {
+        assertEventuallyEquals(expected, eval, 10, timeoutMillis);
+    }
+
+    /**
+     * Invokes `eval` in a loop over and over (with a small sleep) and asserts that the value eventually reaches `expected`.
+     * @param <T>                   The type of the value to compare.
+     * @param expected              The expected return value.
+     * @param eval                  The function to test
+     * @param checkIntervalMillis   The number of milliseconds to wait between two checks.
+     * @param timeoutMillis         The timeout in milliseconds after which an assertion error should be thrown.
+     * @throws Exception            If the is an assertion error, and exception from `eval`, or the thread is interrupted.
+     */
+    private static <T> void assertEventuallyEquals(T expected, Callable<T> eval, int checkIntervalMillis, long timeoutMillis) throws Exception {
+        TestUtils.await(() -> {
+                try {
+                    return (expected == null && eval.call() == null) || (expected != null && expected.equals(eval.call()));
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+        }, checkIntervalMillis, timeoutMillis);
+        assertEquals(expected, eval.call());
+    }
+
+    /**
+     * Invokes `eval` in a loop over and over (with a small sleep) and asserts that the value eventually reaches `expected`.
+     *
+     * @param <T>                 The type of the value to compare.
+     * @param message             The message ot include.
+     * @param expected            The expected return value.
+     * @param eval                The function to test
+     * @param checkIntervalMillis The number of milliseconds to wait between two checks.
+     * @param timeoutMillis       The timeout in milliseconds after which an assertion error should be thrown.
+     * @throws Exception If the is an assertion error, and exception from `eval`, or the thread is interrupted.
+     */
+    public static <T> void assertEventuallyEquals(String message, T expected, Callable<T> eval, int checkIntervalMillis, long timeoutMillis) throws Exception {
+        assertEventuallyEquals(expected, eval, checkIntervalMillis, timeoutMillis);
+        assertEquals(message, expected, eval.call());
+    }
 
     /**
      * Asserts that an exception of the Type provided is thrown.
@@ -38,6 +92,12 @@ public class AssertExtensions {
         try {
             run.run();
             Assert.fail("No exception thrown where: " + type.getName() + " was expected");
+        } catch (CompletionException | ExecutionException e) {
+            if (!type.isAssignableFrom(e.getCause().getClass())) {
+                throw new RuntimeException(
+                        "Exception of the wrong type. Was expecting " + type + " but got: " + e.getCause().getClass().getName(),
+                        e);
+            }
         } catch (Exception e) {
             if (!type.isAssignableFrom(e.getClass())) {
                 throw new RuntimeException(
@@ -60,12 +120,11 @@ public class AssertExtensions {
             Assert.fail(message + " No exception has been thrown.");
         } catch (CompletionException | ExecutionException ex) {
             if (!tester.test(ex.getCause())) {
-                Assert.fail(message + " Exception thrown was of unexpected type: " + ex.getCause());
+                throw new AssertionError(message + " Exception thrown was of unexpected type: " + ex.getCause(), ex);
             }
-        } catch (Exception ex) {
+        } catch (Throwable ex) {
             if (!tester.test(ex)) {
-                ex.printStackTrace();
-                Assert.fail(message + " Exception thrown was of unexpected type: " + ex);
+                throw new AssertionError(message + " Exception thrown was of unexpected type: " + ex, ex);
             }
         }
     }
@@ -78,13 +137,13 @@ public class AssertExtensions {
      * @param tester         A predicate that indicates whether the exception (if thrown) is as expected.
      * @param <T>            The type of the future's result.
      */
-    public static <T> void assertThrows(String message, Supplier<CompletableFuture<T>> futureSupplier, Predicate<Throwable> tester) {
+    public static <T> void assertSuppliedFutureThrows(String message,
+            Supplier<CompletableFuture<T>> futureSupplier, Predicate<Throwable> tester) {
         try {
             futureSupplier.get().join();
             Assert.fail(message + " No exception has been thrown.");
         } catch (CompletionException ex) {
             if (!tester.test(getRealException(ex))) {
-                ex.printStackTrace();
                 Assert.fail(message + " Exception thrown was of unexpected type: " + getRealException(ex));
             }
         } catch (Exception ex) {
@@ -102,7 +161,7 @@ public class AssertExtensions {
      * @param tester  A predicate that indicates whether the exception (if thrown) is as expected.
      * @param <T>     The type of the future's result.
      */
-    public static <T> void assertThrows(String message, CompletableFuture<T> future, Predicate<Throwable> tester) {
+    public static <T> void assertFutureThrows(String message, CompletableFuture<T> future, Predicate<Throwable> tester) {
         try {
             future.join();
             Assert.fail(message + " No exception has been thrown.");
@@ -251,7 +310,7 @@ public class AssertExtensions {
     }
 
     /**
-     * Asserts that actual < expected.
+     * Asserts that actual {@literal <} expected.
      *
      * @param message  The message to include in the Assert calls.
      * @param expected The larger value.
@@ -262,7 +321,7 @@ public class AssertExtensions {
     }
 
     /**
-     * Asserts that actual <= expected.
+     * Asserts that actual {@literal <=} expected.
      *
      * @param message  The message to include in the Assert calls.
      * @param expected The larger value.
@@ -273,7 +332,7 @@ public class AssertExtensions {
     }
 
     /**
-     * Asserts that actual > expected.
+     * Asserts that actual {@literal >} expected.
      *
      * @param message  The message to include in the Assert calls.
      * @param expected The smaller value.
@@ -284,7 +343,7 @@ public class AssertExtensions {
     }
 
     /**
-     * Asserts that actual >= expected.
+     * Asserts that actual {@literal >=} expected.
      *
      * @param message  The message to include in the Assert calls.
      * @param expected The smaller value.
@@ -314,6 +373,30 @@ public class AssertExtensions {
         Assert.assertFalse(message, string == null || string.length() == 0);
     }
 
+    /**
+     * Asserts that a future (that has not yet been invoked) throws an expected exception or completes without
+     * exception.
+     *
+     * @param message        The message to include in the Assert calls.
+     * @param futureSupplier A Supplier that returns a new CompletableFuture, to test.
+     * @param tester         A predicate that indicates whether the exception (if thrown) is as expected.
+     * @param <T>            The type of the future's result.
+     */
+    public static <T> void assertMayThrow(String message, Supplier<CompletableFuture<T>> futureSupplier,
+                                             Predicate<Throwable> tester) {
+        try {
+            futureSupplier.get().join();
+        } catch (CompletionException ex) {
+            if (!tester.test(getRealException(ex))) {
+                Assert.fail(message + " Exception thrown was of unexpected type: " + getRealException(ex));
+            }
+        } catch (Exception ex) {
+            if (!tester.test(ex)) {
+                Assert.fail(message + " Exception thrown was of unexpected type: " + ex);
+            }
+        }
+    }
+
     private static Throwable getRealException(Throwable ex) {
         if (ex instanceof CompletionException) {
             return getRealException(ex.getCause());
@@ -326,7 +409,131 @@ public class AssertExtensions {
         return ex;
     }
 
+    @FunctionalInterface
     public interface RunnableWithException {
         void run() throws Exception;
+    }
+
+    /**
+     * Asserts that the provided function blocks until the second function is run.
+     *
+     * @param blockingFunction The function that is expected to block
+     * @param unblocker The function that is expected to unblock the blocking function.
+     * @return The result of the blockingFunction.
+     * @param <ResultT> The result of the blockingFunction.
+     */
+    public static <ResultT> ResultT assertBlocks(Callable<ResultT> blockingFunction, RunnableWithException unblocker) {
+        final AtomicReference<ResultT> result = new AtomicReference<>(null);
+        final AtomicReference<Throwable> exception = new AtomicReference<>(null);
+        final Semaphore isBlocked = new Semaphore(0);
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    result.set(blockingFunction.call());
+                } catch (Throwable e) {
+                    exception.set(e);
+                }
+                isBlocked.release();
+            }
+        });
+        t.start();
+        try {
+            Assert.assertFalse(isBlocked.tryAcquire(200, TimeUnit.MILLISECONDS));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+        try {
+            unblocker.run();
+        } catch (Exception e) {
+            throw new RuntimeException("Blocking call threw an exception", e);
+        }
+        try {
+            isBlocked.acquire();
+            t.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+        if (exception.get() != null) {
+            throw new RuntimeException(exception.get());
+        } else {
+            return result.get();
+        }
+    }
+
+    /**
+     * Asserts that the provided function blocks until the second function is run.
+     *
+     * @param blockingFunction The function that is expected to block
+     * @param unblocker The function that is expected to unblock the blocking function.
+     */
+    public static void assertBlocks(RunnableWithException blockingFunction, RunnableWithException unblocker) {
+        final AtomicReference<Throwable> exception = new AtomicReference<>(null);
+        final Semaphore isBlocked = new Semaphore(0);
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    blockingFunction.run();
+                } catch (Throwable e) {
+                    exception.set(e);
+                }
+                isBlocked.release();
+            }
+        });
+        t.start();
+        try {
+            if (isBlocked.tryAcquire(200, TimeUnit.MILLISECONDS)) {
+                if (exception.get() != null) {
+                    throw new RuntimeException("Blocking code threw an exception", exception.get());
+                } else {
+                    throw new AssertionError("Failed to block.");
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+        try {
+            unblocker.run();
+        } catch (Exception e) {
+            throw new RuntimeException("Blocking call threw an exception", e);
+        }
+        try {
+            if (!isBlocked.tryAcquire(2000, TimeUnit.MILLISECONDS)) {
+                RuntimeException e = new RuntimeException("Failed to unblock");
+                e.setStackTrace(t.getStackTrace());
+                t.interrupt();
+                throw new RuntimeException(e);
+            }
+            t.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+        if (exception.get() != null) {
+            throw new RuntimeException(exception.get());
+        }
+    }
+
+    /**
+    * Compares two floating point values with a given precision.
+    *
+    * @param a the first operand.
+    * @param b the second operand.
+    * @param precision the maximum absolute difference between the two values.
+    * @return true if the two operands are both null or the represent the same
+    * value within the given precision
+    */
+    public static boolean nearlyEquals(Double a, Double b, double precision) {
+        if (a == null && b == null) {
+            return true;
+        }
+        if (a != null && b != null) {
+            return Math.abs(a - b) <= precision;
+        }
+        return false;
     }
 }

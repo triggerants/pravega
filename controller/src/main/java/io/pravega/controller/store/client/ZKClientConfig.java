@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,9 +35,30 @@ public interface ZKClientConfig {
     int getInitialSleepInterval();
 
     /**
-     * Fetches the maximum nnumber of retries the client should make while attempting to connect to ZK servers.
+     * Fetches the maximum number of retries the client should make while attempting to connect to ZK servers.
      *
-     * @return The maximum nnumber of retries the client should make while attempting to connect to ZK servers.
+     * @return The maximum number of retries the client should make while attempting to connect to ZK servers.
      */
     int getMaxRetries();
+
+    /**
+     * Fetches the session timeout in milli seconds.
+     * @return session timeout in milli seconds.
+     */
+    int getSessionTimeoutMs();
+
+    /**
+     * Fetches whether the connection is secure.
+     */
+    boolean isSecureConnectionToZooKeeper();
+
+    /**
+     * Fetches the trust store location.
+     */
+    String getTrustStorePath();
+
+    /**
+     * Fetches the trust store password path.
+     */
+    String getTrustStorePasswordPath();
 }

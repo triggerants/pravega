@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,8 +42,9 @@ public interface ClientConnection extends AutoCloseable {
      * Sends a wire command asynchronously.
      *
      * @param cmd The wire command to be sent.
+     * @param callback A callback to be invoked when the operation is complete
      */
-    void sendAsync(WireCommand cmd);
+    void sendAsync(WireCommand cmd, CompletedCallback callback);
 
     /**
      * Sends the provided append commands.

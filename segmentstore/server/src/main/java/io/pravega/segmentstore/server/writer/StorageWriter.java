@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,30 +10,40 @@
 package io.pravega.segmentstore.server.writer;
 
 import com.google.common.base.Preconditions;
-import io.pravega.common.ExceptionHelpers;
+import com.google.common.collect.ImmutableList;
+import io.pravega.common.Exceptions;
 import io.pravega.common.LoggerHelpers;
 import io.pravega.common.MathHelpers;
+import io.pravega.common.ObjectClosedException;
 import io.pravega.common.Timer;
 import io.pravega.common.concurrent.AbstractThreadPoolService;
-import io.pravega.common.concurrent.FutureHelpers;
-import io.pravega.segmentstore.server.UpdateableSegmentMetadata;
-import io.pravega.segmentstore.server.logs.operations.MetadataOperation;
-import io.pravega.segmentstore.server.logs.operations.StorageOperation;
+import io.pravega.common.concurrent.Futures;
+import io.pravega.common.concurrent.SequentialProcessor;
 import io.pravega.segmentstore.server.DataCorruptionException;
+import io.pravega.segmentstore.server.SegmentOperation;
+import io.pravega.segmentstore.server.SegmentStoreMetrics;
+import io.pravega.segmentstore.server.UpdateableSegmentMetadata;
 import io.pravega.segmentstore.server.Writer;
+import io.pravega.segmentstore.server.WriterFactory;
+import io.pravega.segmentstore.server.WriterFlushResult;
+import io.pravega.segmentstore.server.WriterSegmentProcessor;
 import io.pravega.segmentstore.server.logs.operations.MetadataCheckpointOperation;
+import io.pravega.segmentstore.server.logs.operations.MetadataOperation;
 import io.pravega.segmentstore.server.logs.operations.Operation;
+import io.pravega.segmentstore.server.logs.operations.StorageOperation;
 import io.pravega.segmentstore.storage.Storage;
+import io.pravega.segmentstore.storage.StorageNotPrimaryException;
 import java.time.Duration;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
-import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import lombok.val;
 
@@ -47,10 +57,13 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
     private final WriterConfig config;
     private final WriterDataSource dataSource;
     private final Storage storage;
-    private final HashMap<Long, SegmentAggregator> aggregators;
+    private final HashMap<Long, ProcessorCollection> processors;
     private final WriterState state;
     private final Timer timer;
     private final AckCalculator ackCalculator;
+    private final WriterFactory.CreateProcessors createProcessors;
+    private final SequentialProcessor ackProcessor;
+    private final SegmentStoreMetrics.StorageWriter metrics;
 
     //endregion
 
@@ -59,25 +72,28 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
     /**
      * Creates a new instance of the StorageWriter class.
      *
-     * @param config     The WriterConfig to use.
-     * @param dataSource The WriterDataSource to use.
-     * @param storage    The Storage to use.
-     * @param executor   The Executor to use for async callbacks and operations.
+     * @param config           The WriterConfig to use.
+     * @param dataSource       The WriterDataSource to use.
+     * @param storage          The Storage to use.
+     * @param createProcessors A Function, that, when invoked with a Segment Metadata as an argument, will return a Collection
+     *                         of WriterSegmentProcessors to handle that Segment's operations.
+     * @param executor         The Executor to use for async callbacks and operations.
      */
-    StorageWriter(WriterConfig config, WriterDataSource dataSource, Storage storage, ScheduledExecutorService executor) {
+    StorageWriter(WriterConfig config, WriterDataSource dataSource, Storage storage, WriterFactory.CreateProcessors createProcessors,
+                  ScheduledExecutorService executor) {
         super(String.format("StorageWriter[%d]", dataSource.getId()), executor);
 
         // No need to check dataSource or executor != null as the super() call above takes care of that.
-        Preconditions.checkNotNull(config, "config");
-        Preconditions.checkNotNull(storage, "storage");
-
-        this.config = config;
+        this.config = Preconditions.checkNotNull(config, "config");
         this.dataSource = dataSource;
-        this.storage = storage;
-        this.aggregators = new HashMap<>();
+        this.storage = Preconditions.checkNotNull(storage, "storage");
+        this.createProcessors = Preconditions.checkNotNull(createProcessors, "createProcessors");
+        this.processors = new HashMap<>();
         this.state = new WriterState();
         this.timer = new Timer();
         this.ackCalculator = new AckCalculator(this.state);
+        this.ackProcessor = new SequentialProcessor(this.executor);
+        this.metrics = new SegmentStoreMetrics.StorageWriter(dataSource.getId());
     }
 
     //endregion
@@ -94,25 +110,26 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
         // A Writer iteration is made of the following stages:
         // 1. Delay (if necessary).
         // 2. Read data.
-        // 3. Load data into SegmentAggregators.
-        // 4. Flush eligible SegmentAggregators.
+        // 3. Load data into SegmentProcessors.
+        // 4. Flush eligible SegmentProcessors.
         // 5. Acknowledge (truncate).
-        return FutureHelpers.loop(
+        return Futures.loop(
                 this::canRun,
-                () -> FutureHelpers
+                () -> Futures
                         .delayedFuture(getIterationStartDelay(), this.executor)
                         .thenRun(this::beginIteration)
                         .thenComposeAsync(this::readData, this.executor)
-                        .thenAcceptAsync(this::processReadResult, this.executor)
+                        .thenComposeAsync(this::processReadResult, this.executor)
                         .thenComposeAsync(this::flush, this.executor)
-                        .thenComposeAsync(this::acknowledge, this.executor)
+                        .thenRunAsync(this::triggerAcknowledge, this.executor)
                         .exceptionally(this::iterationErrorHandler)
-                        .thenRun(this::endIteration),
-                this.executor);
+                        .thenRunAsync(this::endIteration, this.executor),
+                this.executor)
+                      .thenRun(this::closeProcessors);
     }
 
     private boolean canRun() {
-        return isRunning() && !hasStopException();
+        return isRunning() && getStopException() == null;
     }
 
     private void beginIteration() {
@@ -121,16 +138,18 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
     }
 
     private void endIteration() {
-        // Perform internal cleanup (get rid of those SegmentAggregators that are closed).
+        // Perform internal cleanup (get rid of those SegmentProcessors that are closed).
         cleanup();
-        logStageEvent("Finish", "Elapsed " + this.state.getElapsedSinceIterationStart(this.timer).toMillis() + "ms");
+        Duration elapsed = this.state.getElapsedSinceIterationStart(this.timer);
+        this.metrics.iterationComplete(elapsed);
+        logStageEvent("Finish", "Elapsed " + elapsed.toMillis() + "ms");
     }
 
     private Void iterationErrorHandler(Throwable ex) {
-        if (ExceptionHelpers.getRealException(ex) instanceof CancellationException && !canRun()) {
+        if (isShutdownException(ex) && !canRun()) {
             // Writer is not running and we caught a CancellationException.
             // This is a normal behavior and it is triggered by stopAsync(); just exit without logging or triggering anything else.
-            log.info("{}: StorageWriter intercepted {} while shutting down.", this.traceObjectId, ExceptionHelpers.getRealException(ex).getClass().getSimpleName());
+            log.info("{}: StorageWriter intercepted {} while shutting down.", this.traceObjectId, Exceptions.unwrap(ex).getClass().getSimpleName());
             return null;
         }
 
@@ -145,6 +164,16 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
         }
 
         return null;
+    }
+
+    /**
+     * Closes all processors. This is usually done when the StorageWriter has stopped or is about to stop.
+     */
+    private void closeProcessors() {
+        this.processors.values().forEach(ProcessorCollection::close);
+        this.processors.clear();
+        this.ackProcessor.close();
+        this.metrics.close();
     }
 
     //endregion
@@ -167,7 +196,7 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
                         return result;
                     })
                     .exceptionally(ex -> {
-                        ex = ExceptionHelpers.getRealException(ex);
+                        ex = Exceptions.unwrap(ex);
                         if (ex instanceof TimeoutException) {
                             // TimeoutExceptions are acceptable for Reads. In that case we just return null as opposed from
                             // killing the entire Iteration. Even if we were unable to read, we may still need to flush
@@ -180,12 +209,12 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
                     });
         } catch (Throwable ex) {
             // This is for synchronous exceptions.
-            Throwable realEx = ExceptionHelpers.getRealException(ex);
+            Throwable realEx = Exceptions.unwrap(ex);
             if (realEx instanceof TimeoutException) {
                 logErrorHandled(realEx);
                 return CompletableFuture.completedFuture(null);
             } else {
-                return FutureHelpers.failedFuture(ex);
+                return Futures.failedFuture(ex);
             }
         }
     }
@@ -195,60 +224,75 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
      *
      * @param readResult The read result to process.
      */
-    @SneakyThrows(DataCorruptionException.class)
-    private void processReadResult(Iterator<Operation> readResult) {
+    private CompletableFuture<Void> processReadResult(Iterator<Operation> readResult) {
         long traceId = LoggerHelpers.traceEnterWithContext(log, this.traceObjectId, "processReadResult");
         InputReadStageResult result = new InputReadStageResult(this.state);
         if (readResult == null) {
             // This happens when we get a TimeoutException from the read operation.
+            this.metrics.readComplete(0);
             logStageEvent("InputRead", result);
             LoggerHelpers.traceLeave(log, this.traceObjectId, "processReadResult", traceId);
-            return;
+            return CompletableFuture.completedFuture(null);
         }
 
-        while (readResult.hasNext()) {
-            checkRunning();
-            Operation op = readResult.next();
-
-            // Verify that the Operation we got is in the correct order (check Sequence Number).
-            if (op.getSequenceNumber() <= this.state.getLastReadSequenceNumber()) {
-                throw new DataCorruptionException(String.format("Operation '%s' has a sequence number that is lower than the previous one (%d).", op, this.state.getLastReadSequenceNumber()));
-            }
-
-            if (op instanceof MetadataOperation) {
-                processMetadataOperation((MetadataOperation) op);
-            } else if (op instanceof StorageOperation) {
-                result.bytes += processStorageOperation((StorageOperation) op);
-            } else {
-                // Unknown operation. Better throw an error rather than skipping over what could be important data.
-                throw new DataCorruptionException(String.format("Unsupported operation %s.", op));
-            }
-
-            // We have now internalized all operations from this batch; and even if subsequent operations in this iteration
-            // fail, we no longer need to re-read these operations, so update the state with the last read SeqNo.
-            this.state.setLastReadSequenceNumber(op.getSequenceNumber());
-            result.count++;
-        }
-
-        logStageEvent("InputRead", result);
-        LoggerHelpers.traceLeave(log, this.traceObjectId, "processReadResult", traceId);
+        return Futures.loop(
+                () -> canRun() && readResult.hasNext(),
+                () -> {
+                    Operation op = readResult.next();
+                    return processOperation(op).thenRun(() -> {
+                        // We have now internalized all operations from this batch; and even if subsequent operations in this iteration
+                        // fail, we no longer need to re-read these operations, so update the state with the last read SeqNo.
+                        this.state.setLastReadSequenceNumber(op.getSequenceNumber());
+                        result.operationProcessed(op);
+                    });
+                },
+                this.executor)
+                      .thenRun(() -> {
+                          logStageEvent("InputRead", result);
+                          LoggerHelpers.traceLeave(log, this.traceObjectId, "processReadResult", traceId);
+                      });
     }
 
-    private void processMetadataOperation(MetadataOperation op) throws DataCorruptionException {
+    private CompletableFuture<Void> processOperation(Operation op) {
+        // Verify that the Operation we got is in the correct order (check Sequence Number).
+        if (op.getSequenceNumber() <= this.state.getLastReadSequenceNumber()) {
+            return Futures.failedFuture(new DataCorruptionException(String.format(
+                    "Operation '%s' has a sequence number that is lower than the previous one (%d).", op, this.state.getLastReadSequenceNumber())));
+        }
+
+        if (op instanceof SegmentOperation) {
+            return processSegmentOperation((SegmentOperation) op);
+        } else if (op instanceof MetadataOperation) {
+            return processMetadataOperation((MetadataOperation) op);
+        } else {
+            // Unknown operation. Better throw an error rather than skipping over what could be important data.
+            return Futures.failedFuture(new DataCorruptionException(String.format("Unsupported operation %s.", op)));
+        }
+    }
+
+    private CompletableFuture<Void> processMetadataOperation(MetadataOperation op) {
         // We only care about MetadataCheckpointOperations; all others are no-ops here.
         if (op instanceof MetadataCheckpointOperation) {
             // We don't care about the contents of the operation, we just need to verify that it is correctly mapped to a Valid Truncation Point.
             if (!this.dataSource.isValidTruncationPoint(op.getSequenceNumber())) {
-                throw new DataCorruptionException(String.format("Operation '%s' does not correspond to a valid Truncation Point in the metadata.", op));
+                return Futures.failedFuture(new DataCorruptionException(String.format(
+                        "Operation '%s' does not correspond to a valid Truncation Point in the metadata.", op)));
             }
         }
+
+        return CompletableFuture.completedFuture(null);
     }
 
-    private long processStorageOperation(StorageOperation op) throws DataCorruptionException {
+    private CompletableFuture<Void> processSegmentOperation(SegmentOperation op) {
         // Add the operation to the appropriate Aggregator.
-        SegmentAggregator aggregator = getSegmentAggregator(op.getStreamSegmentId());
-        aggregator.add(op);
-        return op.getLength();
+        return getProcessor(op.getStreamSegmentId())
+                .thenAccept(aggregator -> {
+                    try {
+                        aggregator.add(op);
+                    } catch (DataCorruptionException ex) {
+                        throw new CompletionException(ex);
+                    }
+                });
     }
 
     //endregion
@@ -263,22 +307,24 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
         long traceId = LoggerHelpers.traceEnterWithContext(log, this.traceObjectId, "flush");
 
         // Flush everything we can flush.
-        val flushFutures = this.aggregators.values().stream()
-                                           .filter(SegmentAggregator::mustFlush)
-                                           .map(a -> a.flush(this.config.getFlushTimeout(), this.executor))
-                                           .collect(Collectors.toList());
+        val timer = new Timer();
+        val flushFutures = this.processors.values().stream()
+                                          .filter(ProcessorCollection::mustFlush)
+                                          .map(a -> a.flush(this.config.getFlushTimeout()))
+                                          .collect(Collectors.toList());
 
-        return FutureHelpers
+        return Futures
                 .allOfWithResults(flushFutures)
-                .thenAccept(flushResults -> {
+                .thenAcceptAsync(flushResults -> {
                     FlushStageResult result = new FlushStageResult();
                     flushResults.forEach(result::withFlushResult);
-                    if (result.getFlushedBytes() + result.getMergedBytes() + result.count > 0) {
+                    if (result.getFlushedBytes() + result.getMergedBytes() + result.getFlushedAttributes() > 0) {
                         logStageEvent("Flush", result);
                     }
 
+                    this.metrics.flushComplete(result.getFlushedBytes(), result.getMergedBytes(), result.getFlushedAttributes(), timer.getElapsed());
                     LoggerHelpers.traceLeave(log, this.traceObjectId, "flush", traceId);
-                });
+                }, this.executor);
     }
 
     /**
@@ -286,51 +332,61 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
      */
     private void cleanup() {
         long traceId = LoggerHelpers.traceEnterWithContext(log, this.traceObjectId, "cleanup");
-        val toRemove = this.aggregators.values().stream()
-                                       .map(this::closeIfNecessary)
-                                       .filter(SegmentAggregator::isClosed)
-                                       .map(a -> a.getMetadata().getId())
-                                       .collect(Collectors.toList());
-        toRemove.forEach(this.aggregators::remove);
+        val toRemove = this.processors.values().stream()
+                                      .map(this::closeIfNecessary)
+                                      .filter(ProcessorCollection::isClosed)
+                                      .map(ProcessorCollection::getId)
+                                      .collect(Collectors.toList());
+        toRemove.forEach(this.processors::remove);
         LoggerHelpers.traceLeave(log, this.traceObjectId, "cleanup", traceId, toRemove.size());
     }
 
     /**
-     * Closes the given SegmentAggregator if it is deleted in Storage or inexistent in the Container Metadata.
+     * Closes the given ProcessorCollection if necessary.
      *
-     * @param aggregator The SegmentAggregator to test (and close if needed).
+     * @param processorCollection The ProcessorCollection to test (and close if needed).
      * @return The same SegmentAggregator.
      */
-    private SegmentAggregator closeIfNecessary(SegmentAggregator aggregator) {
-        if (aggregator.getMetadata().isDeleted() || !aggregator.getMetadata().isActive()) {
-            aggregator.close();
+    private ProcessorCollection closeIfNecessary(ProcessorCollection processorCollection) {
+        if (processorCollection.shouldClose()) {
+            processorCollection.close();
         }
 
-        return aggregator;
+        return processorCollection;
     }
 
     /**
      * Acknowledges operations that were flushed to storage
      */
-    private CompletableFuture<Void> acknowledge(Void ignored) {
+    private void triggerAcknowledge() {
         checkRunning();
         long traceId = LoggerHelpers.traceEnterWithContext(log, this.traceObjectId, "acknowledge");
-
-        long highestCommittedSeqNo = this.ackCalculator.getHighestCommittedSequenceNumber(this.aggregators.values());
+        long highestCommittedSeqNo = this.ackCalculator.getHighestCommittedSequenceNumber(this.processors.values());
         long ackSequenceNumber = this.dataSource.getClosestValidTruncationPoint(highestCommittedSeqNo);
+
         if (ackSequenceNumber > this.state.getLastTruncatedSequenceNumber()) {
-            // Issue the truncation and update the state (when done).
-            return this.dataSource
-                    .acknowledge(ackSequenceNumber, this.config.getAckTimeout())
-                    .thenRun(() -> {
-                        this.state.setLastTruncatedSequenceNumber(ackSequenceNumber);
-                        logStageEvent("Acknowledged", "SeqNo=" + ackSequenceNumber);
-                        LoggerHelpers.traceLeave(log, this.traceObjectId, "acknowledge", traceId, ackSequenceNumber);
-                    });
+            this.ackProcessor.add(() -> {
+                // If the StorageWriter completes an iteration faster than the data source can process the acknowledgment,
+                // then the State's LastTruncatedSequenceNumber may not be updated in time and we can re-queue the same
+                // truncation multiple times, which is undesirable. However, the ackProcessor serializes all invocations
+                // to its add() method so at this point we are guaranteed to have completed the callback below that updates
+                // that value.
+                if (ackSequenceNumber <= this.state.getLastTruncatedSequenceNumber()) {
+                    return CompletableFuture.completedFuture(null);
+                }
+
+                // Issue the truncation and update the state (when done).
+                return this.dataSource
+                        .acknowledge(ackSequenceNumber, this.config.getAckTimeout())
+                        .thenRun(() -> {
+                            this.state.setLastTruncatedSequenceNumber(ackSequenceNumber);
+                            logStageEvent("Acknowledged", "SeqNo=" + ackSequenceNumber);
+                            LoggerHelpers.traceLeave(log, this.traceObjectId, "acknowledge", traceId, ackSequenceNumber);
+                        });
+            }).exceptionally(this::iterationErrorHandler);
         } else {
             // Nothing to do.
             LoggerHelpers.traceLeave(log, this.traceObjectId, "acknowledge", traceId, Operation.NO_SEQUENCE_NUMBER);
-            return CompletableFuture.completedFuture(null);
         }
     }
 
@@ -342,42 +398,54 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
      * Gets, or creates, a SegmentAggregator for the given StorageOperation.
      *
      * @param streamSegmentId The Id of the StreamSegment to get the aggregator for.
-     * @throws DataCorruptionException If the Operation refers to a StreamSegmentId that does not exist in Metadata.
      */
-    private SegmentAggregator getSegmentAggregator(long streamSegmentId) throws DataCorruptionException {
-        SegmentAggregator result = this.aggregators.getOrDefault(streamSegmentId, null);
-        if (result != null && closeIfNecessary(result).isClosed()) {
-            // Existing SegmentAggregator has become stale (most likely due to its SegmentMetadata being evicted),
-            // so it has been closed and we need to create a new one.
-            this.aggregators.remove(streamSegmentId);
-            result = null;
-        }
-
-        if (result == null) {
-            // We do not yet have this aggregator. First, get its metadata.
-            UpdateableSegmentMetadata segmentMetadata = this.dataSource.getStreamSegmentMetadata(streamSegmentId);
-            if (segmentMetadata == null) {
-                throw new DataCorruptionException(String.format("No StreamSegment with id '%d' is registered in the metadata.", streamSegmentId));
-            }
-
-            // Then create the aggregator, and only register it after a successful initialization. Otherwise we risk
-            // having a registered aggregator that is not initialized.
-            result = new SegmentAggregator(segmentMetadata, this.dataSource, this.storage, this.config, this.timer);
-            try {
-                result.initialize(this.config.getFlushTimeout(), this.executor).join(); // TODO: get rid of this join() at one point.
-                this.aggregators.put(streamSegmentId, result);
-            } catch (Exception ex) {
-                result.close();
-                throw ex;
+    private CompletableFuture<ProcessorCollection> getProcessor(long streamSegmentId) {
+        ProcessorCollection existingProcessor = this.processors.getOrDefault(streamSegmentId, null);
+        if (existingProcessor != null) {
+            if (closeIfNecessary(existingProcessor).isClosed()) {
+                // Existing SegmentAggregator has become stale (most likely due to its SegmentMetadata being evicted),
+                // so it has been closed and we need to create a new one.
+                this.processors.remove(streamSegmentId);
+            } else {
+                return CompletableFuture.completedFuture(existingProcessor);
             }
         }
 
-        return result;
+        // Get the SegmentAggregator's Metadata.
+        UpdateableSegmentMetadata segmentMetadata = this.dataSource.getStreamSegmentMetadata(streamSegmentId);
+        if (segmentMetadata == null) {
+            return Futures.failedFuture(new DataCorruptionException(String.format(
+                    "No StreamSegment with id '%d' is registered in the metadata.", streamSegmentId)));
+        }
+
+        // Then create the aggregator, and only register it after a successful initialization. Otherwise we risk
+        // having a registered aggregator that is not initialized.
+        SegmentAggregator segmentAggregator = new SegmentAggregator(segmentMetadata, this.dataSource, this.storage, this.config, this.timer, this.executor);
+        AttributeAggregator attributeAggregator = new AttributeAggregator(segmentMetadata, this.dataSource, this.config, this.timer, this.executor);
+        ProcessorCollection pc = new ProcessorCollection(segmentAggregator, attributeAggregator, this.createProcessors.apply(segmentMetadata));
+        try {
+            CompletableFuture<Void> init = segmentAggregator.initialize(this.config.getFlushTimeout());
+            Futures.exceptionListener(init, ex -> segmentAggregator.close());
+            return init.thenApply(ignored -> {
+                this.processors.put(streamSegmentId, pc);
+                return pc;
+            });
+        } catch (Exception ex) {
+            pc.close();
+            throw ex;
+        }
     }
 
     private boolean isCriticalError(Throwable ex) {
-        return ExceptionHelpers.mustRethrow(ex)
-                || ExceptionHelpers.getRealException(ex) instanceof DataCorruptionException;
+        ex = Exceptions.unwrap(ex);
+        return Exceptions.mustRethrow(ex)
+                || ex instanceof DataCorruptionException     // Data corruption - stop processing to prevent more damage.
+                || ex instanceof StorageNotPrimaryException; // Fenced out - another instance took over.
+    }
+
+    private boolean isShutdownException(Throwable ex) {
+        ex = Exceptions.unwrap(ex);
+        return ex instanceof ObjectClosedException || ex instanceof CancellationException;
     }
 
     /**
@@ -392,7 +460,7 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
         long maxTimeMillis = this.config.getMaxReadTimeout().toMillis();
         long minTimeMillis = this.config.getMinReadTimeout().toMillis();
         long timeMillis = maxTimeMillis;
-        for (SegmentAggregator a : this.aggregators.values()) {
+        for (ProcessorCollection a : this.processors.values()) {
             if (a.mustFlush()) {
                 // We found a SegmentAggregator that needs to flush right away. No need to search anymore.
                 timeMillis = 0;
@@ -427,7 +495,7 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
     }
 
     private void logError(Throwable ex, boolean critical) {
-        ex = ExceptionHelpers.getRealException(ex);
+        ex = Exceptions.unwrap(ex);
         if (critical) {
             log.error("{}: Iteration[{}].CriticalError.", this.traceObjectId, this.state.getIterationId(), ex);
         } else {
@@ -437,7 +505,7 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
     }
 
     private void logErrorHandled(Throwable ex) {
-        ex = ExceptionHelpers.getRealException(ex);
+        ex = Exceptions.unwrap(ex);
         log.warn("{}: Iteration[{}].HandledError {}", this.traceObjectId, this.state.getIterationId(), ex.toString());
         //        System.out.println(String.format("%s: Iteration[%s].Warn. %s", this.traceObjectId, this.state.getIterationId(), ex));
     }
@@ -455,11 +523,11 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
     /**
      * Represents the result of an iteration stage.
      */
-    private static class FlushStageResult extends FlushResult {
+    private static class FlushStageResult extends WriterFlushResult {
         int count;
 
         @Override
-        public FlushStageResult withFlushResult(FlushResult flushResult) {
+        public FlushStageResult withFlushResult(WriterFlushResult flushResult) {
             this.count++;
             return (FlushStageResult) super.withFlushResult(flushResult);
         }
@@ -482,10 +550,108 @@ class StorageWriter extends AbstractThreadPoolService implements Writer {
             this.state = state;
         }
 
+        void operationProcessed(Operation op) {
+            this.count++;
+            if (op instanceof StorageOperation) {
+                this.bytes += ((StorageOperation) op).getLength();
+            }
+        }
+
         @Override
         public String toString() {
             return String.format("Count=%d, Bytes=%d, LastReadSN=%d", this.count, this.bytes, this.state.getLastReadSequenceNumber());
         }
+    }
+
+    //endregion
+
+    //region ProcessorCollection
+
+    /**
+     * Wraps a collection of WriterSegmentProcessors, including the main Segment Aggregator.
+     */
+    private class ProcessorCollection implements WriterSegmentProcessor {
+        private final SegmentAggregator aggregator;
+        private final List<WriterSegmentProcessor> processors;
+
+        ProcessorCollection(SegmentAggregator aggregator, AttributeAggregator attributeAggregator, Collection<WriterSegmentProcessor> processors) {
+            // We separate out the main SegmentAggregator since we depend on it for some operations, however when we
+            // generate the list of processors we make sure to put it first; if there are any issues with the operations
+            // to process we need to ensure that no other processor may see those operations before the Segment Aggregator.
+            this.aggregator = aggregator;
+            this.processors = ImmutableList.<WriterSegmentProcessor>builder()
+                    .add(aggregator)
+                    .add(attributeAggregator)
+                    .addAll(processors).build();
+        }
+
+        //region SegmentAggregator direct wrapper
+
+        /**
+         * Gets a value indicating the amount of time since the main Segment Aggregator has been flushed.
+         */
+        Duration getElapsedSinceLastFlush() {
+            return this.aggregator.getElapsedSinceLastFlush();
+        }
+
+        /**
+         * Gets a value indicating the Segment Id for all processors in this collection.
+         */
+        long getId() {
+            return this.aggregator.getMetadata().getId();
+        }
+
+        /**
+         * Gets a value indicating whether the SegmentAggregator can be closed.
+         */
+        boolean shouldClose() {
+            return this.aggregator.getMetadata().isDeletedInStorage() || !this.aggregator.getMetadata().isActive();
+        }
+
+        //endregion
+
+        //region WriterSegmentProcessor Implementation
+
+        @Override
+        public void close() {
+            this.processors.forEach(WriterSegmentProcessor::close);
+        }
+
+        @Override
+        public boolean isClosed() {
+            return this.processors.stream().allMatch(WriterSegmentProcessor::isClosed);
+        }
+
+        @Override
+        public long getLowestUncommittedSequenceNumber() {
+            return StorageWriter.this.ackCalculator.getLowestUncommittedSequenceNumber(this.processors);
+        }
+
+        @Override
+        public boolean mustFlush() {
+            return this.processors.stream().anyMatch(WriterSegmentProcessor::mustFlush);
+        }
+
+        @Override
+        public void add(SegmentOperation operation) throws DataCorruptionException {
+            for (WriterSegmentProcessor wsp : this.processors) {
+                wsp.add(operation);
+            }
+        }
+
+        @Override
+        public CompletableFuture<WriterFlushResult> flush(Duration timeout) {
+            return Futures.allOfWithResults(this.processors.stream().map(wsp -> wsp.flush(timeout)).collect(Collectors.toList()))
+                          .thenApply(results -> {
+                              WriterFlushResult r = results.get(0);
+                              for (int i = 1; i < results.size(); i++) {
+                                  r.withFlushResult(results.get(i));
+                              }
+                              return r;
+                          });
+        }
+
+        //endregion
     }
 
     //endregion

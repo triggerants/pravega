@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,8 +9,6 @@
  */
 package io.pravega.controller.server;
 
-import io.pravega.controller.fault.ControllerClusterListenerConfig;
-import io.pravega.controller.fault.impl.ControllerClusterListenerConfigImpl;
 import io.pravega.controller.server.impl.ControllerServiceConfigImpl;
 import io.pravega.controller.server.rest.impl.RESTServerConfigImpl;
 import io.pravega.controller.server.rpc.grpc.impl.GRPCServerConfigImpl;
@@ -25,7 +23,6 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.util.Optional;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Tests for ControllerServiceConfig.
@@ -107,15 +104,10 @@ public class ControllerServiceConfigTest {
 
         // Positive values required
         AssertExtensions.assertThrows(IllegalArgumentException.class,
-                () -> TimeoutServiceConfig.builder().maxLeaseValue(-10).maxScaleGracePeriod(10).build());
-
-        // Positive values required
-        AssertExtensions.assertThrows(IllegalArgumentException.class,
-                () -> TimeoutServiceConfig.builder().maxLeaseValue(10).maxScaleGracePeriod(-10).build());
+                () -> TimeoutServiceConfig.builder().maxLeaseValue(-10).build());
 
         TimeoutServiceConfig timeoutServiceConfig = TimeoutServiceConfig.builder()
                 .maxLeaseValue(10)
-                .maxScaleGracePeriod(20)
                 .build();
 
         AssertExtensions.assertThrows(NullPointerException.class,
@@ -138,16 +130,17 @@ public class ControllerServiceConfigTest {
                 () -> ZKClientConfigImpl.builder().connectionString("localhost").namespace("test")
                         .initialSleepInterval(10).maxRetries(-10).namespace("").build());
 
+        // zk session timeout should be positive number
+        AssertExtensions.assertThrows(IllegalArgumentException.class,
+                () -> ZKClientConfigImpl.builder().connectionString("localhost").namespace("test")
+                        .sessionTimeoutMs(-10).namespace("").build());
+
         StoreClientConfig storeClientConfig = StoreClientConfigImpl.withInMemoryClient();
 
         // If eventProcessor config is enabled, it should be non-null
         AssertExtensions.assertThrows(NullPointerException.class,
                 () -> ControllerServiceConfigImpl.builder()
-                        .serviceThreadPoolSize(3)
-                        .taskThreadPoolSize(3)
-                        .storeThreadPoolSize(3)
-                        .eventProcThreadPoolSize(3)
-                        .requestHandlerThreadPoolSize(3)
+                        .threadPoolSize(15)
                         .storeClientConfig(storeClientConfig)
                         .hostMonitorConfig(hostMonitorConfig)
                         .timeoutServiceConfig(timeoutServiceConfig)
@@ -159,11 +152,7 @@ public class ControllerServiceConfigTest {
         // If grpcServerConfig is present it should be non-null
         AssertExtensions.assertThrows(NullPointerException.class,
                 () -> ControllerServiceConfigImpl.builder()
-                        .serviceThreadPoolSize(3)
-                        .taskThreadPoolSize(3)
-                        .storeThreadPoolSize(3)
-                        .eventProcThreadPoolSize(3)
-                        .requestHandlerThreadPoolSize(3)
+                        .threadPoolSize(15)
                         .storeClientConfig(storeClientConfig)
                         .hostMonitorConfig(hostMonitorConfig)
                         .timeoutServiceConfig(timeoutServiceConfig)
@@ -175,11 +164,7 @@ public class ControllerServiceConfigTest {
         // If restServerConfig is present it should be non-null
         AssertExtensions.assertThrows(NullPointerException.class,
                 () -> ControllerServiceConfigImpl.builder()
-                        .serviceThreadPoolSize(3)
-                        .taskThreadPoolSize(3)
-                        .storeThreadPoolSize(3)
-                        .eventProcThreadPoolSize(3)
-                        .requestHandlerThreadPoolSize(3)
+                        .threadPoolSize(15)
                         .storeClientConfig(storeClientConfig)
                         .hostMonitorConfig(hostMonitorConfig)
                         .timeoutServiceConfig(timeoutServiceConfig)
@@ -188,21 +173,12 @@ public class ControllerServiceConfigTest {
                         .restServerConfig(Optional.of(null))
                         .build());
 
-        // If ControllerClusterListener is present, storeClient should be ZK.
-        ControllerClusterListenerConfig clusterListenerConfig =
-                ControllerClusterListenerConfigImpl.builder()
-                        .minThreads(1).maxThreads(1).idleTime(10).idleTimeUnit(TimeUnit.SECONDS).maxQueueSize(8).build();
-
         AssertExtensions.assertThrows(IllegalArgumentException.class,
                 () -> ControllerServiceConfigImpl.builder()
-                        .serviceThreadPoolSize(3)
-                        .taskThreadPoolSize(3)
-                        .storeThreadPoolSize(3)
-                        .eventProcThreadPoolSize(3)
-                        .requestHandlerThreadPoolSize(3)
+                        .threadPoolSize(15)
                         .storeClientConfig(storeClientConfig)
                         .hostMonitorConfig(hostMonitorConfig)
-                        .controllerClusterListenerConfig(Optional.of(clusterListenerConfig))
+                        .controllerClusterListenerEnabled(true)
                         .timeoutServiceConfig(timeoutServiceConfig)
                         .eventProcessorConfig(Optional.empty())
                         .grpcServerConfig(Optional.empty())

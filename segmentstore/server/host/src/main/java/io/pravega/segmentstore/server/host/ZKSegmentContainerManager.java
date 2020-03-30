@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,7 +33,6 @@ class ZKSegmentContainerManager implements SegmentContainerManager {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final Cluster cluster;
     private final ZKSegmentContainerMonitor containerMonitor;
-    private final ScheduledExecutorService executor;
 
     /**
      * Creates a new instance of the ZKSegmentContainerManager class.
@@ -48,10 +47,8 @@ class ZKSegmentContainerManager implements SegmentContainerManager {
         Preconditions.checkNotNull(containerRegistry, "containerRegistry");
         Preconditions.checkNotNull(zkClient, "zkClient");
         this.host = Preconditions.checkNotNull(pravegaServiceEndpoint, "pravegaServiceEndpoint");
-        this.executor = Preconditions.checkNotNull(executor, "executor");
-
         this.cluster = new ClusterZKImpl(zkClient, ClusterType.HOST);
-        this.containerMonitor = new ZKSegmentContainerMonitor(containerRegistry, zkClient, pravegaServiceEndpoint, this.executor);
+        this.containerMonitor = new ZKSegmentContainerMonitor(containerRegistry, zkClient, pravegaServiceEndpoint, executor);
     }
 
     @Override

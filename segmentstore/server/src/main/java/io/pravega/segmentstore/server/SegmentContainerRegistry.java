@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,9 +10,7 @@
 package io.pravega.segmentstore.server;
 
 import io.pravega.segmentstore.contracts.ContainerNotFoundException;
-
 import java.time.Duration;
-import java.util.Collection;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -21,13 +19,9 @@ import java.util.concurrent.CompletableFuture;
 public interface SegmentContainerRegistry extends AutoCloseable {
     /**
      * Gets the number of registered containers.
+     * @return The number of registered containers.
      */
     int getContainerCount();
-
-    /**
-     * Gets a read-only collection of registered container ids.
-     */
-    Collection<Integer> getRegisteredContainerIds();
 
     /**
      * Gets a reference to the SegmentContainer with given Id.

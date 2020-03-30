@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,23 +9,27 @@
  */
 package io.pravega.client.stream.mock;
 
+import com.google.common.base.Preconditions;
+import io.pravega.client.netty.impl.Flow;
+import io.pravega.client.netty.impl.ClientConnection;
+import io.pravega.client.netty.impl.ConnectionFactory;
+import io.pravega.common.concurrent.ExecutorServiceHelpers;
+import io.pravega.shared.protocol.netty.PravegaNodeUri;
+import io.pravega.shared.protocol.netty.ReplyProcessor;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import io.pravega.client.netty.impl.ClientConnection;
-import io.pravega.client.netty.impl.ConnectionFactory;
-import io.pravega.shared.protocol.netty.PravegaNodeUri;
-import io.pravega.shared.protocol.netty.ReplyProcessor;
-import com.google.common.base.Preconditions;
-
+import java.util.concurrent.ScheduledExecutorService;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 import lombok.Synchronized;
 
 @RequiredArgsConstructor
 public class MockConnectionFactoryImpl implements ConnectionFactory {
     Map<PravegaNodeUri, ClientConnection> connections = new HashMap<>();
     Map<PravegaNodeUri, ReplyProcessor> processors = new HashMap<>();
-    final PravegaNodeUri endpoint;
+    @Setter
+    ScheduledExecutorService executor = ExecutorServiceHelpers.newScheduledThreadPool(5, "testClientInternal");
 
     @Override
     @Synchronized
@@ -34,6 +38,17 @@ public class MockConnectionFactoryImpl implements ConnectionFactory {
         Preconditions.checkState(connection != null, "Unexpected Endpoint");
         processors.put(location, rp);
         return CompletableFuture.completedFuture(connection);
+    }
+
+    @Override
+    @Synchronized
+    public CompletableFuture<ClientConnection> establishConnection(Flow flow, PravegaNodeUri location, ReplyProcessor rp) {
+      return establishConnection(location, rp);
+    }
+
+    @Override
+    public ScheduledExecutorService getInternalExecutor() {
+        return executor;
     }
 
     @Synchronized
@@ -48,5 +63,6 @@ public class MockConnectionFactoryImpl implements ConnectionFactory {
 
     @Override
     public void close() {
+        ExecutorServiceHelpers.shutdown(executor);
     }
 }

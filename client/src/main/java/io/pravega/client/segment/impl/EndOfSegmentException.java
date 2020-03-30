@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,9 +13,30 @@ import java.io.IOException;
 
 /**
  * A segment has ended. No more events may be read from it.
+ * This exception is thrown when SegmentInputStream reaches
+ *    - end of a {@link Segment}
+ *    - configured end offset of a {@link Segment}.
  */
 public class EndOfSegmentException extends IOException {
 
     private static final long serialVersionUID = 1L;
 
+    private final ErrorType errorType;
+
+    public EndOfSegmentException() {
+        this.errorType = ErrorType.END_OF_SEGMENT_REACHED;
+    }
+
+    public EndOfSegmentException(ErrorType cause) {
+        this.errorType = cause;
+    }
+
+    public ErrorType getErrorType() {
+        return errorType;
+    }
+
+    public enum ErrorType {
+        END_OF_SEGMENT_REACHED,
+        END_OFFSET_REACHED
+    }
 }

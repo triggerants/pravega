@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,28 +9,32 @@
  */
 package io.pravega.segmentstore.server.logs;
 
-import io.pravega.common.Exceptions;
-import io.pravega.common.function.ConsumerWithException;
-import io.pravega.common.util.ByteArraySegment;
 import com.google.common.base.Preconditions;
-
+import io.pravega.common.Exceptions;
+import io.pravega.common.io.SerializationException;
+import io.pravega.common.util.ByteArraySegment;
 import java.io.IOException;
 import java.io.OutputStream;
-import java.util.function.Supplier;
+import java.util.function.Consumer;
+import javax.annotation.concurrent.NotThreadSafe;
+import lombok.Getter;
 
 /**
  * An OutputStream that abstracts writing to Data Frames. Allows writing arbitrary bytes, and seamlessly transitions
  * from one Data Frame to another if the previous Data Frame was full.
+ *
+ * Data written with this class can be read back using DataFrameInputStream.
  */
+@NotThreadSafe
 class DataFrameOutputStream extends OutputStream {
     //region Members
 
-    private final int maxDataFrameSize;
-    private final Supplier<Long> getPreviousFrameSequence;
-    private final ConsumerWithException<DataFrame, IOException> dataFrameCompleteCallback;
+    private final Consumer<DataFrame> dataFrameCompleteCallback;
     private DataFrame currentFrame;
     private boolean hasDataInCurrentFrame;
+    @Getter
     private boolean closed;
+    private final int maxDataFrameSize;
 
     //endregion
 
@@ -40,19 +44,16 @@ class DataFrameOutputStream extends OutputStream {
      * Creates a new instance of the DataFrameOutputStream class.
      *
      * @param maxDataFrameSize          The maximum size, in bytes, of a Data Frame.
-     * @param getPreviousFrameSequence  A method that retrieves the Frame Sequence for the previous frame.
      * @param dataFrameCompleteCallback A callback that will be invoked when a Data Frame is full.
      * @throws IllegalArgumentException If maxDataFrameSize is not a positive integer.
      * @throws NullPointerException     If any of the arguments are null.
      */
-    public DataFrameOutputStream(int maxDataFrameSize, Supplier<Long> getPreviousFrameSequence, ConsumerWithException<DataFrame, IOException> dataFrameCompleteCallback) {
-        Exceptions.checkArgument(maxDataFrameSize > 0, "maxDataFrameSize", "Must be a positive integer.");
-        Preconditions.checkNotNull(getPreviousFrameSequence, "getPreviousFrameSequence");
-        Preconditions.checkNotNull(dataFrameCompleteCallback, "dataFrameCompleteCallback");
+    DataFrameOutputStream(int maxDataFrameSize, Consumer<DataFrame> dataFrameCompleteCallback) {
+        Exceptions.checkArgument(maxDataFrameSize > DataFrame.MIN_ENTRY_LENGTH_NEEDED, "maxDataFrameSize",
+                "Must be a at least %s.", DataFrame.MIN_ENTRY_LENGTH_NEEDED);
 
         this.maxDataFrameSize = maxDataFrameSize;
-        this.getPreviousFrameSequence = getPreviousFrameSequence;
-        this.dataFrameCompleteCallback = dataFrameCompleteCallback;
+        this.dataFrameCompleteCallback = Preconditions.checkNotNull(dataFrameCompleteCallback, "dataFrameCompleteCallback");
     }
 
     //endregion
@@ -80,7 +81,7 @@ class DataFrameOutputStream extends OutputStream {
         }
 
         if (totalBytesWritten == 0) {
-            throw new IOException("Unable to make progress in serializing to DataFrame.");
+            throw new SerializationException("Unable to make progress in serializing to DataFrame.");
         }
     }
 
@@ -115,11 +116,9 @@ class DataFrameOutputStream extends OutputStream {
      * Seals the current frame (if any), and invokes the dataFrameCompleteCallback with the finished frame.
      * If the dataFrameCompleteCallback failed (and threw an exception), the current frame will be sealed and therefore
      * the DataFrameOutputStream may not be usable.
-     *
-     * @throws IOException If we were unable to publish the frame.
      */
     @Override
-    public void flush() throws IOException {
+    public void flush() {
         Exceptions.checkNotClosed(this.closed, this);
         if (!this.hasDataInCurrentFrame) {
             // Nothing to do.
@@ -158,10 +157,10 @@ class DataFrameOutputStream extends OutputStream {
      *
      * @throws IOException If we are unable to start a new record.
      */
-    public void startNewRecord() throws IOException {
+    void startNewRecord() throws IOException {
         Exceptions.checkNotClosed(this.closed, this);
 
-        // If there is any data in the current frame, seal it and ship it. And create a new one with StartMagic = Last.EndMagic.
+        // If there is any data in the current frame, seal it and ship it.
         if (this.currentFrame == null) {
             // No active frame, create a new one.
             createNewFrame();
@@ -177,7 +176,7 @@ class DataFrameOutputStream extends OutputStream {
     /**
      * Indicates to the stream that the currently open record is now ended.
      */
-    public void endRecord() {
+    void endRecord() {
         Exceptions.checkNotClosed(this.closed, this);
         if (this.currentFrame != null) {
             this.currentFrame.endEntry(true);
@@ -189,7 +188,7 @@ class DataFrameOutputStream extends OutputStream {
      * has multiple DataFrame Entries), the already committed entries will not be discarded. Instead, the DataFrameReader
      * will detect that such a record was discarded and skip over it upon reading.
      */
-    public void discardRecord() {
+    void discardRecord() {
         Exceptions.checkNotClosed(this.closed, this);
         if (this.currentFrame != null) {
             this.currentFrame.discardEntry();
@@ -199,7 +198,7 @@ class DataFrameOutputStream extends OutputStream {
     /**
      * Discards all the data currently accumulated in the current frame.
      */
-    public void reset() {
+    void reset() {
         Exceptions.checkNotClosed(this.closed, this);
         this.currentFrame = null;
         this.hasDataInCurrentFrame = false;
@@ -208,13 +207,13 @@ class DataFrameOutputStream extends OutputStream {
     private void createNewFrame() {
         Preconditions.checkState(this.currentFrame == null || this.currentFrame.isSealed(), "Cannot create a new frame if we currently have a non-sealed frame.");
 
-        this.currentFrame = new DataFrame(this.getPreviousFrameSequence.get(), this.maxDataFrameSize);
+        this.currentFrame = DataFrame.ofSize(this.maxDataFrameSize);
         this.hasDataInCurrentFrame = false;
     }
 
-    private void startNewRecordInCurrentFrame(boolean firstRecordEntry) throws IOException {
+    private void startNewRecordInCurrentFrame(boolean firstRecordEntry) throws SerializationException {
         if (!this.currentFrame.startNewEntry(firstRecordEntry)) {
-            throw new IOException("Unable to start a new record.");
+            throw new SerializationException("Unable to start a new record.");
         }
 
         this.hasDataInCurrentFrame = true;

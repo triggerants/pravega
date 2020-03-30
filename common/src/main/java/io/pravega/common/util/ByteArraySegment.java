@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,14 +9,16 @@
  */
 package io.pravega.common.util;
 
+import com.google.common.base.Preconditions;
 import io.pravega.common.Exceptions;
 import io.pravega.common.io.FixedByteArrayOutputStream;
-import io.pravega.common.io.StreamHelpers;
-import com.google.common.base.Preconditions;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 /**
  * Allows segmenting a byte array and operating only on that segment.
@@ -54,6 +56,17 @@ public class ByteArraySegment implements ArrayView {
      */
     public ByteArraySegment(byte[] array, int startOffset, int length) {
         this(array, startOffset, length, false);
+    }
+    
+    /**
+     * Creates a new instance of the ByteArraySegment class that wraps an array backed ByteBuffer.
+     *
+     * @param buff       The ByteBuffer to wrap.
+     * @throws NullPointerException           If the array is null.
+     * @throws UnsupportedOperationException  If buff is not backed by an array.
+     */
+    public ByteArraySegment(ByteBuffer buff) {
+        this(buff.array(), buff.arrayOffset() + buff.position(), buff.remaining(), false);
     }
 
     /**
@@ -112,6 +125,45 @@ public class ByteArraySegment implements ArrayView {
         return new ByteArrayInputStream(this.array, this.startOffset + offset, length);
     }
 
+    @Override
+    public ByteArraySegment slice(int offset, int length) {
+        return subSegment(offset, length, this.readOnly);
+    }
+
+    @Override
+    public byte[] getCopy() {
+        byte[] buffer = new byte[this.length];
+        System.arraycopy(this.array, this.startOffset, buffer, 0, this.length);
+        return buffer;
+    }
+
+    @Override
+    public void copyTo(byte[] target, int targetOffset, int length) {
+        Preconditions.checkElementIndex(length, this.length + 1, "length");
+        Exceptions.checkArrayRange(targetOffset, length, target.length, "index", "values.length");
+
+        System.arraycopy(this.array, this.startOffset, target, targetOffset, length);
+    }
+
+    @Override
+    public int copyTo(ByteBuffer target) {
+        int length = Math.min(this.length, target.remaining());
+        target.put(this.array, this.startOffset, length);
+        return length;
+    }
+
+    /**
+     * Writes the entire contents of this ByteArraySegment to the given OutputStream. Only copies the contents of the
+     * ByteArraySegment, and writes no other data (such as the length of the Segment or any other info).
+     *
+     * @param stream The OutputStream to write to.
+     * @throws IOException If the OutputStream threw one.
+     */
+    @Override
+    public void copyTo(OutputStream stream) throws IOException {
+        stream.write(this.array, this.startOffset, this.length);
+    }
+
     //endregion
 
     //region Operations
@@ -157,55 +209,22 @@ public class ByteArraySegment implements ArrayView {
     }
 
     /**
-     * Copies a specified number of bytes from this ByteArraySegment into the given target array.
+     * Copies a specified number of bytes from the given ByteArraySegment into this ByteArraySegment.
      *
-     * @param target       The target array.
-     * @param targetOffset The offset within the target array to start copying data at.
+     * @param source       The ByteArraySegment to copy bytes from.
+     * @param sourceOffset The offset within source to start copying from.
+     * @param targetOffset The offset within this ByteArraySegment to start copying at.
      * @param length       The number of bytes to copy.
+     * @throws IllegalStateException          If the ByteArraySegment is readonly.
      * @throws ArrayIndexOutOfBoundsException If targetOffset or length are invalid.
      */
-    public void copyTo(byte[] target, int targetOffset, int length) {
-        Preconditions.checkElementIndex(length, this.length + 1, "length");
-        Exceptions.checkArrayRange(targetOffset, length, target.length, "index", "values.length");
+    public void copyFrom(ByteArraySegment source, int sourceOffset, int targetOffset, int length) {
+        Preconditions.checkState(!this.readOnly, "Cannot modify a read-only ByteArraySegment.");
+        Exceptions.checkArrayRange(sourceOffset, length, source.length, "index", "values.length");
+        Exceptions.checkArrayRange(targetOffset, length, this.length, "index", "values.length");
+        Preconditions.checkElementIndex(length, source.getLength() + 1, "length");
 
-        System.arraycopy(this.array, this.startOffset, target, targetOffset, length);
-    }
-
-    /**
-     * Returns a copy of the contents of this ByteArraySegment.
-     *
-     * @return A byte array with the same length as this ByteArraySegment, containing a copy of the data within it.
-     */
-    public byte[] getCopy() {
-        byte[] buffer = new byte[this.length];
-        System.arraycopy(this.array, this.startOffset, buffer, 0, this.length);
-        return buffer;
-    }
-
-    /**
-     * Writes the entire contents of this ByteArraySegment to the given OutputStream. Only copies the contents of the
-     * ByteArraySegment, and writes no other data (such as the length of the Segment or any other info).
-     *
-     * @param stream The OutputStream to write to.
-     * @throws IOException If the OutputStream threw one.
-     */
-    public void writeTo(OutputStream stream) throws IOException {
-        stream.write(this.array, this.startOffset, this.length);
-    }
-
-    /**
-     * Attempts to read the contents of the InputStream and load it into this ByteArraySegment. Up to getLength() bytes
-     * will be read from the InputStream, but no guarantees are made that the entire ByteArraySegment will be populated.
-     * <p>
-     * Only attempts to read the data, and does not expect any other header/footer information in the InputStream. This
-     * method is the exact reverse of writeTo().
-     *
-     * @param stream The InputStream to read from.
-     * @return The number of bytes read. This will be less than or equal to getLength().
-     * @throws IOException If the InputStream threw one.
-     */
-    public int readFrom(InputStream stream) throws IOException {
-        return StreamHelpers.readAll(stream, this.array, this.startOffset, this.length);
+        System.arraycopy(source.array, source.startOffset + sourceOffset, this.array, this.startOffset + targetOffset, length);
     }
 
     /**
@@ -218,19 +237,6 @@ public class ByteArraySegment implements ArrayView {
     public OutputStream getWriter() {
         Preconditions.checkState(!this.readOnly, "Cannot modify a read-only ByteArraySegment.");
         return new FixedByteArrayOutputStream(this.array, this.startOffset, this.length);
-    }
-
-    /**
-     * Returns a new ByteArraySegment that is a sub-segment of this ByteArraySegment. The new ByteArraySegment wraps
-     * the same underlying byte array that this ByteArraySegment does.
-     *
-     * @param offset The offset within this ByteArraySegment where the new ByteArraySegment starts.
-     * @param length The length of the new ByteArraySegment.
-     * @return The new ByteArraySegment.
-     * @throws ArrayIndexOutOfBoundsException If offset or length are invalid.
-     */
-    public ByteArraySegment subSegment(int offset, int length) {
-        return subSegment(offset, length, this.readOnly);
     }
 
     /**
@@ -262,6 +268,17 @@ public class ByteArraySegment implements ArrayView {
             return this;
         } else {
             return new ByteArraySegment(this.array, this.startOffset, this.length, true);
+        }
+    }
+
+    @Override
+    public String toString() {
+        if (getLength() > 128) {
+            return String.format("Length = %s", getLength());
+        } else {
+            return String.format("{%s}", IntStream.range(arrayOffset(), arrayOffset() + getLength()).boxed()
+                    .map(i -> Byte.toString(this.array[i]))
+                    .collect(Collectors.joining(",")));
         }
     }
 

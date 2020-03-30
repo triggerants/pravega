@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,6 +43,7 @@ public abstract class ContainerException extends StreamingException {
 
     /**
      * Gets a value indicating the Container Id.
+     * @return the id of the container
      */
     public int getContainerId() {
         return this.containerId;

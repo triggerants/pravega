@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,7 +9,8 @@
  */
 package io.pravega.client.stream;
 
-import java.util.UUID;
+import io.pravega.client.stream.EventWriterConfig.EventWriterConfigBuilder;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * A writer can write events to a stream.
@@ -19,28 +20,30 @@ import java.util.UUID;
  * @param <Type> The type of events that go in this stream
  */
 public interface EventStreamWriter<Type> extends AutoCloseable {
-    
+
     /**
-     * Send an event to the stream. Events that are written should appear in the stream exactly once.
-     * 
+     * Send an event to the stream. Events that are written should appear in the stream exactly once. The
+     * maximum size of the serialized event supported is defined at {@link Serializer#MAX_EVENT_SIZE}.
+     *
      * Note that the implementation provides retry logic to handle connection failures and service host
      * failures. Internal retries will not violate the exactly once semantic so it is better to rely on them
      * than to wrap this with custom retry logic.
-     * 
+     *
      * @param event The event to be written to the stream (Null is disallowed)
-     * @return A future that will complete when the event has been durably stored on the configured number of
-     *         replicas, and is available for readers to see. This future may complete exceptionally if this
-     *         cannot happen, however these exceptions are not transient failures. Failures that occur as a
-     *         result of connection drops or host death are handled internally with multiple retires and
+     * @return A completableFuture that will complete when the event has been durably stored on the configured
+     *         number of replicas, and is available for readers to see. This future may complete exceptionally
+     *         if this cannot happen, however these exceptions are not transient failures. Failures that occur
+     *         as a result of connection drops or host death are handled internally with multiple retires and
      *         exponential backoff. So there is no need to attempt to retry in the event of an exception.
      */
-    AckFuture writeEvent(Type event);
+    CompletableFuture<Void> writeEvent(Type event);
     
     
     /**
      * Write an event to the stream. Similar to {@link #writeEvent(Object)} but provides a routingKey which is
      * used to specify ordering. Events written with the same routing key will be read by readers in exactly
-     * the same order they were written.  
+     * the same order they were written. The maximum size of the serialized event supported is defined at
+     * {@link Serializer#MAX_EVENT_SIZE}.
      *
      * Note that the implementation provides retry logic to handle connection failures and service
      * host failures. Internal retries will not violate the exactly once semantic so it is better to
@@ -50,36 +53,30 @@ public interface EventStreamWriter<Type> extends AutoCloseable {
      *        the same routingKey are guaranteed to be read in order. Two events with different routing keys
      *        may be read in parallel. 
      * @param event The event to be written to the stream (Null is disallowed)
-     * @return A future that will complete when the event has been durably stored on the configured number of
-     *         replicas, and is available for readers to see. This future may complete exceptionally if this
-     *         cannot happen, however these exceptions are not transient failures. Failures that occur as a
-     *         result of connection drops or host death are handled internally with multiple retires and
+     * @return A completableFuture that will complete when the event has been durably stored on the configured
+     *         number of replicas, and is available for readers to see. This future may complete exceptionally
+     *         if this cannot happen, however these exceptions are not transient failures. Failures that occur 
+     *         as a result of connection drops or host death are handled internally with multiple retires and
      *         exponential backoff. So there is no need to attempt to retry in the event of an exception.
      */
-    AckFuture writeEvent(String routingKey, Type event);
-
+    CompletableFuture<Void> writeEvent(String routingKey, Type event);
+    
     /**
-     * Start a new transaction on this stream.
+     * Notes a time that can be seen by readers which read from this stream by
+     * {@link EventStreamReader#getCurrentTimeWindow(Stream)}. The semantics or meaning of the timestamp
+     * is left to the application. Readers might expect timestamps to be monotonic. So this is
+     * recommended but not enforced.
      * 
-     * @param transactionTimeout The number of milliseconds after now, that if commit has not been called by, the
-     *            transaction may be aborted. Note that this should not be set unnecessarily high, as having long running
-     *            transactions may interfere with a streams to scale in response to a change in rate. For this reason
-     *            streams may configure an upper limit to this value.
-     * @param maxExecutionTime The maximum amount of time, in milliseconds, until which transaction timeout may be
-     *                         increased via the pingTransaction API.
-     * @param scaleGracePeriod The maximum amount of time, in milliseconds, until which transacition may remain active,
-     *                         after a scale operation has been initiated on the underlying stream.
-     * @return A transaction through which multiple events can be written atomically.
-     */
-    Transaction<Type> beginTxn(long transactionTimeout, long maxExecutionTime, long scaleGracePeriod);
-
-    /**
-     * Returns a previously created transaction.
+     * There is no requirement to call this method. Never doing so will result in readers invoking
+     * {@link EventStreamReader#getCurrentTimeWindow(Stream)} receiving a null for both upper and lower times.
      * 
-     * @param transactionId The result retained from calling {@link Transaction#getTxnId()}
-     * @return Transaction object with given UUID
+     * Calling this method can be automated by setting
+     * {@link EventWriterConfigBuilder#automaticallyNoteTime(boolean)} to true when creating a
+     * writer.
+     * 
+     * @param timestamp a timestamp that represents the current location in the stream.
      */
-    Transaction<Type> getTxn(UUID transactionId);
+    void noteTime(long timestamp);
 
     /**
      * Returns the configuration that this writer was create with.

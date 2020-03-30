@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,18 +9,11 @@
  */
 package io.pravega.controller.store.checkpoint;
 
-import io.pravega.common.util.Retry;
 import io.pravega.client.stream.Position;
+import io.pravega.client.stream.Serializer;
 import io.pravega.client.stream.impl.JavaSerializer;
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.Lombok;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.curator.framework.CuratorFramework;
-import org.apache.zookeeper.CreateMode;
-import org.apache.zookeeper.KeeperException;
-import org.apache.zookeeper.data.Stat;
-
+import io.pravega.common.Exceptions;
+import io.pravega.common.util.Retry;
 import java.io.Serializable;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -31,6 +24,13 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.data.Stat;
 
 /**
  * Zookeeper based checkpoint store.
@@ -40,12 +40,22 @@ class ZKCheckpointStore implements CheckpointStore {
 
     private static final String ROOT = "eventProcessors";
     private final CuratorFramework client;
-    private final JavaSerializer<Position> positionSerializer;
+    private final Serializer<Position> positionSerializer;
     private final JavaSerializer<ReaderGroupData> groupDataSerializer;
 
     ZKCheckpointStore(CuratorFramework client) {
         this.client = client;
-        this.positionSerializer = new JavaSerializer<>();
+        this.positionSerializer = new Serializer<Position>() {
+            @Override
+            public ByteBuffer serialize(Position value) {
+                return value.toBytes();
+            }
+            
+            @Override
+            public Position deserialize(ByteBuffer serializedValue) {
+                return Position.fromBytes(serializedValue);
+            }
+        };
         this.groupDataSerializer = new JavaSerializer<>();
     }
 
@@ -99,7 +109,8 @@ class ZKCheckpointStore implements CheckpointStore {
 
         } catch (KeeperException.NoNodeException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.NoNode, e);
-        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException e) {
+        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException
+                | KeeperException.SessionExpiredException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.Connectivity, e);
         } catch (Exception e) {
             throw new CheckpointStoreException(e);
@@ -145,12 +156,12 @@ class ZKCheckpointStore implements CheckpointStore {
 
             updateReaderGroupData(path, groupData -> {
                 if (groupData.getState() == ReaderGroupData.State.Sealed) {
-                    throw Lombok.sneakyThrow(new CheckpointStoreException(CheckpointStoreException.Type.Sealed,
+                    throw Exceptions.sneakyThrow(new CheckpointStoreException(CheckpointStoreException.Type.Sealed,
                             "ReaderGroup is sealed"));
                 }
                 List<String> list = groupData.getReaderIds();
                 if (list.contains(readerId)) {
-                    throw Lombok.sneakyThrow(new CheckpointStoreException(CheckpointStoreException.Type.NodeExists,
+                    throw Exceptions.sneakyThrow(new CheckpointStoreException(CheckpointStoreException.Type.NodeExists,
                             "Duplicate readerId"));
                 }
 
@@ -162,7 +173,8 @@ class ZKCheckpointStore implements CheckpointStore {
 
         } catch (KeeperException.NoNodeException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.NoNode, e);
-        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException e) {
+        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException
+                | KeeperException.SessionExpiredException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.Connectivity, e);
         } catch (CheckpointStoreException e) {
             throw e;
@@ -190,7 +202,8 @@ class ZKCheckpointStore implements CheckpointStore {
 
         } catch (KeeperException.NoNodeException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.NoNode, e);
-        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException e) {
+        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException
+                | KeeperException.SessionExpiredException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.Connectivity, e);
         } catch (CheckpointStoreException e) {
             throw e;
@@ -267,7 +280,8 @@ class ZKCheckpointStore implements CheckpointStore {
 
         } catch (KeeperException.NodeExistsException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.NodeExists, e);
-        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException e) {
+        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException
+                | KeeperException.SessionExpiredException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.Connectivity, e);
         } catch (Exception e) {
             throw new CheckpointStoreException(e);
@@ -283,7 +297,8 @@ class ZKCheckpointStore implements CheckpointStore {
             // Its ok if the node is already deleted, mask this exception.
         } catch (KeeperException.NotEmptyException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.NodeNotEmpty, e);
-        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException e) {
+        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException
+                | KeeperException.SessionExpiredException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.Connectivity, e);
         } catch (Exception e) {
             throw new CheckpointStoreException(e);
@@ -297,7 +312,8 @@ class ZKCheckpointStore implements CheckpointStore {
 
         } catch (KeeperException.NoNodeException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.NoNode, e);
-        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException e) {
+        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException
+                | KeeperException.SessionExpiredException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.Connectivity, e);
         } catch (Exception e) {
             throw new CheckpointStoreException(e);
@@ -312,7 +328,8 @@ class ZKCheckpointStore implements CheckpointStore {
         } catch (KeeperException.NoNodeException e) {
             // Return empty list for KeeperException.NoNodeException.
             return Collections.emptyList();
-        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException e) {
+        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException
+                | KeeperException.SessionExpiredException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.Connectivity, e);
         } catch (Exception e) {
             throw new CheckpointStoreException(e);
@@ -326,7 +343,8 @@ class ZKCheckpointStore implements CheckpointStore {
 
         } catch (KeeperException.NoNodeException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.NoNode, e);
-        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException e) {
+        } catch (KeeperException.ConnectionLossException | KeeperException.OperationTimeoutException
+                | KeeperException.SessionExpiredException e) {
             throw new CheckpointStoreException(CheckpointStoreException.Type.Connectivity, e);
         } catch (Exception e) {
             throw new CheckpointStoreException(e);

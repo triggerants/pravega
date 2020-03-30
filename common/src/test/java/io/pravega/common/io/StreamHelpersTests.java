@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,6 +10,7 @@
 package io.pravega.common.io;
 
 import io.pravega.test.common.AssertExtensions;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import org.junit.Assert;
@@ -64,7 +65,7 @@ public class StreamHelpersTests {
         AssertExtensions.assertThrows(
                 "readAll accepted a length higher than the given input stream length.",
                 () -> StreamHelpers.readAll(new TestInputStream(buffer), buffer.length + 1),
-                ex -> ex instanceof IllegalArgumentException);
+                ex -> ex instanceof EOFException);
     }
 
     private static class TestInputStream extends InputStream {

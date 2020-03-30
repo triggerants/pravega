@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ public interface SegmentTransaction<Type> extends AutoCloseable {
     UUID getId();
 
     /**
-     * Writes the provided event to this transaction on this segment. This operation is asyncronus, the item is not
+     * Writes the provided event to this transaction on this segment. This operation is asynchronous, the item is not
      * Guaranteed to be stored until after {@link #flush()} has been called.
      *
      * @param event The event to write.

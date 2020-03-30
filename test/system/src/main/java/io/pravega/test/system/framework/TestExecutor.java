@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,10 +25,9 @@ public interface TestExecutor {
     CompletableFuture<Void> startTestExecution(Method testMethod);
 
     /**
-     * Stop Test Execution given the testID.
-     *  @param testID testIdentifier indicating the test to be terminated.
-     *  @return a CompletableFuture which is completed once the test method execution is stopped.
+     * Stop Test Execution.
+     *
      */
-    CompletableFuture<Void> stopTestExecution(String testID);
+    void stopTestExecution();
 
 }

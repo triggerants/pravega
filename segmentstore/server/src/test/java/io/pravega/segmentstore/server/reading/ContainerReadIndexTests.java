@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,27 +9,36 @@
  */
 package io.pravega.segmentstore.server.reading;
 
-import io.pravega.common.concurrent.FutureHelpers;
+import io.pravega.common.Exceptions;
+import io.pravega.common.concurrent.Futures;
 import io.pravega.common.io.StreamHelpers;
-import io.pravega.common.segment.StreamSegmentNameUtils;
+import io.pravega.common.util.BufferView;
+import io.pravega.common.util.ByteArraySegment;
+import io.pravega.common.util.ReusableLatch;
 import io.pravega.segmentstore.contracts.ReadResult;
 import io.pravega.segmentstore.contracts.ReadResultEntry;
 import io.pravega.segmentstore.contracts.ReadResultEntryContents;
 import io.pravega.segmentstore.contracts.ReadResultEntryType;
 import io.pravega.segmentstore.contracts.StreamSegmentNotExistsException;
 import io.pravega.segmentstore.contracts.StreamSegmentSealedException;
+import io.pravega.segmentstore.contracts.StreamSegmentTruncatedException;
+import io.pravega.segmentstore.server.CachePolicy;
+import io.pravega.segmentstore.server.EvictableMetadata;
 import io.pravega.segmentstore.server.MetadataBuilder;
-import io.pravega.segmentstore.server.CacheKey;
-import io.pravega.segmentstore.server.ConfigHelpers;
 import io.pravega.segmentstore.server.SegmentMetadata;
+import io.pravega.segmentstore.server.TestCacheManager;
+import io.pravega.segmentstore.server.TestStorage;
 import io.pravega.segmentstore.server.UpdateableContainerMetadata;
 import io.pravega.segmentstore.server.UpdateableSegmentMetadata;
-import io.pravega.segmentstore.storage.Cache;
-import io.pravega.segmentstore.storage.CacheFactory;
-import io.pravega.segmentstore.storage.Storage;
-import io.pravega.segmentstore.storage.mocks.InMemoryCache;
+import io.pravega.segmentstore.server.containers.StreamSegmentMetadata;
+import io.pravega.segmentstore.storage.cache.CacheState;
+import io.pravega.segmentstore.storage.cache.CacheStorage;
+import io.pravega.segmentstore.storage.cache.DirectMemoryCache;
 import io.pravega.segmentstore.storage.mocks.InMemoryStorage;
+import io.pravega.shared.NameUtils;
 import io.pravega.test.common.AssertExtensions;
+import io.pravega.test.common.IntentionalException;
+import io.pravega.test.common.TestUtils;
 import io.pravega.test.common.ThreadPooledTestSuite;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -38,20 +47,30 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import lombok.Cleanup;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
 import lombok.val;
 import org.junit.Assert;
 import org.junit.Rule;
@@ -62,20 +81,21 @@ import org.junit.rules.Timeout;
  * Unit tests for ContainerReadIndex class.
  */
 public class ContainerReadIndexTests extends ThreadPooledTestSuite {
-    private static final int SEGMENT_COUNT = 100;
+    private static final int SEGMENT_COUNT = 10;
     private static final int TRANSACTIONS_PER_SEGMENT = 5;
-    private static final int APPENDS_PER_SEGMENT = 100;
+    private static final int APPENDS_PER_SEGMENT = 1000;
     private static final int CONTAINER_ID = 123;
 
-    private static final ReadIndexConfig DEFAULT_CONFIG = ConfigHelpers
-            .withInfiniteCachePolicy(ReadIndexConfig.builder()
-                                                    .with(ReadIndexConfig.MEMORY_READ_MIN_LENGTH, 0) // Default: Off (we have a special test for this).
-                                                    .with(ReadIndexConfig.STORAGE_READ_ALIGNMENT, 1024))
+    private static final ReadIndexConfig DEFAULT_CONFIG = ReadIndexConfig
+            .builder()
+            .with(ReadIndexConfig.MEMORY_READ_MIN_LENGTH, 0) // Default: Off (we have a special test for this).
+            .with(ReadIndexConfig.STORAGE_READ_ALIGNMENT, 1024)
             .build();
-    private static final Duration TIMEOUT = Duration.ofSeconds(5);
+    private static final Duration TIMEOUT = Duration.ofSeconds(20);
+    private static final Duration SHORT_TIMEOUT = Duration.ofMillis(20);
 
     @Rule
-    public Timeout globalTimeout = new Timeout(30, TimeUnit.SECONDS);
+    public Timeout globalTimeout = Timeout.seconds(TIMEOUT.getSeconds());
 
     @Override
     protected int getThreadPoolSize() {
@@ -104,6 +124,33 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
     }
 
     /**
+     * Tests the basic append-read functionality of the ContainerReadIndex using appends larger than the maximum allowed
+     * by the Cache Storage.
+     */
+    @Test
+    public void testLargeAppends() throws Exception {
+        final int maxEntryLength = 64 * 1024;
+        final int appendCount = 10;
+        final Random rnd = new Random(0);
+        @Cleanup
+        TestContext context = new TestContext();
+        context.cacheStorage.maxEntryLength = maxEntryLength;
+        long segmentId = createSegments(context).get(0);
+        HashMap<Long, ByteArrayOutputStream> segmentContents = new HashMap<>();
+
+        // Add a bunch of writes.
+        for (int i = 0; i < appendCount; i++) {
+            val data = new ByteArraySegment(new byte[maxEntryLength + i * 10240]);
+            rnd.nextBytes(data.array());
+
+            appendSingleWrite(segmentId, data, context);
+            recordAppend(segmentId, data, segmentContents);
+        }
+        // Check all the appended data.
+        checkReadIndex("PostAppend", segmentContents, context);
+    }
+
+    /**
      * Tests the ability for the ReadIndex to batch multiple index entries together into a bigger read. This test
      * writes a lot of very small appends to the index, then issues a full read (from the beginning) while configuring
      * the read index to return results of no less than a particular size. As an added bonus, it also forces a Storage
@@ -118,12 +165,10 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         final Random rnd = new Random(0);
         rnd.nextBytes(segmentData);
 
-        final ReadIndexConfig config = ConfigHelpers
-                .withInfiniteCachePolicy(ReadIndexConfig.builder().with(ReadIndexConfig.MEMORY_READ_MIN_LENGTH, minReadLength))
-                .build();
+        final ReadIndexConfig config = ReadIndexConfig.builder().with(ReadIndexConfig.MEMORY_READ_MIN_LENGTH, minReadLength).build();
 
         @Cleanup
-        TestContext context = new TestContext(config, config.getCachePolicy());
+        TestContext context = new TestContext(config, CachePolicy.INFINITE);
 
         // Create the segment in Storage and populate it with all the data (one segment is sufficient for this test).
         final long segmentId = createSegment(0, context);
@@ -143,7 +188,7 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
                 // Make another append.
                 byte[] appendData = new byte[appendLength];
                 System.arraycopy(segmentData, writtenLength, appendData, 0, appendLength);
-                appendSingleWrite(segmentId, appendData, context);
+                appendSingleWrite(segmentId, new ByteArraySegment(appendData), context);
                 writtenLength += appendLength;
                 remainingLength -= appendLength;
             } else {
@@ -152,7 +197,7 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
                 appendLength = remainingLength;
                 writtenLength += appendLength;
                 remainingLength = 0;
-                segmentMetadata.setDurableLogLength(writtenLength);
+                segmentMetadata.setLength(writtenLength);
             }
         }
 
@@ -210,23 +255,23 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         appendData(segmentIds, segmentContents, context);
 
         // Mark everything so far (minus a few bytes) as being written to storage.
-        segmentMetadata.setStorageLength(segmentMetadata.getDurableLogLength() - 100);
+        segmentMetadata.setStorageLength(segmentMetadata.getLength() - 100);
 
         // Now partially merge a second transaction
         final long mergedTxOffset = beginMergeTransaction(mergedTxId, segmentMetadata, segmentContents, context);
 
         // Add one more append after all of this.
-        final long endOfMergedDataOffset = segmentMetadata.getDurableLogLength();
+        final long endOfMergedDataOffset = segmentMetadata.getLength();
         byte[] appendData = new byte[randomAppendLength];
         new Random(0).nextBytes(appendData);
-        appendSingleWrite(segmentId, appendData, context);
-        recordAppend(segmentId, appendData, segmentContents);
+        appendSingleWrite(segmentId, new ByteArraySegment(appendData), context);
+        recordAppend(segmentId, new ByteArraySegment(appendData), segmentContents);
 
         // At this point, in our (parent) segment:
         // * [0 .. StorageLength): no reads allowed.
         // * [StorageLength .. mergedTxOffset): should be fully available.
         // * [mergedTxOffset .. endOfMergedDataOffset): no reads allowed
-        // * [endOfMergedDataOffset .. DurableLogLength): should be fully available.
+        // * [endOfMergedDataOffset .. Length): should be fully available.
 
         // Verify we are not allowed to read from the range which has already been committed to Storage (invalid arguments).
         for (AtomicLong offset = new AtomicLong(0); offset.get() < segmentMetadata.getStorageLength(); offset.incrementAndGet()) {
@@ -247,7 +292,12 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         BiConsumer<Long, Long> verifyReadResult = (startOffset, endOffset) -> {
             int readLength = (int) (endOffset - startOffset);
             while (readLength > 0) {
-                InputStream actualDataStream = context.readIndex.readDirect(segmentId, startOffset, readLength);
+                InputStream actualDataStream;
+                try {
+                    actualDataStream = context.readIndex.readDirect(segmentId, startOffset, readLength);
+                } catch (StreamSegmentNotExistsException ex) {
+                    throw new CompletionException(ex);
+                }
                 Assert.assertNotNull(
                         String.format("Unexpected result when data is readily available for Offset = %s, Length = %s.", startOffset, readLength),
                         actualDataStream);
@@ -279,7 +329,78 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         verifyReadResult.accept(segmentMetadata.getStorageLength(), mergedTxOffset);
 
         // Verify that we can read the cached data just after the merged transaction but before the end of the segment.
-        verifyReadResult.accept(endOfMergedDataOffset, segmentMetadata.getDurableLogLength());
+        verifyReadResult.accept(endOfMergedDataOffset, segmentMetadata.getLength());
+    }
+
+    /**
+     * Tests a scenario of truncation that does not happen concurrently with reading (segments are pre-truncated).
+     */
+    @Test
+    public void testTruncate() throws Exception {
+        @Cleanup
+        TestContext context = new TestContext(DEFAULT_CONFIG, new CachePolicy(Long.MAX_VALUE, Duration.ofMillis(1000000), Duration.ofMillis(10000)));
+        ArrayList<Long> segmentIds = createSegments(context);
+        HashMap<Long, ByteArrayOutputStream> segmentContents = new HashMap<>();
+        appendData(segmentIds, segmentContents, context);
+
+        // Truncate all segments at their mid-points.
+        for (int i = 0; i < segmentIds.size(); i++) {
+            val sm = context.metadata.getStreamSegmentMetadata(segmentIds.get(i));
+            sm.setStartOffset(sm.getLength() / 2);
+            if (i % 2 == 0) {
+                sm.setStorageLength(sm.getStartOffset());
+            } else {
+                sm.setStorageLength(sm.getStartOffset() / 2);
+            }
+        }
+
+        // Check all the appended data. This includes verifying access to already truncated offsets.
+        checkReadIndex("PostTruncate", segmentContents, context);
+        checkReadIndexDirect(segmentContents, context);
+
+        // Verify that truncated data is eligible for eviction, by checking that at least one Cache Entry is being removed.
+        for (long segmentId : segmentIds) {
+            val sm = context.metadata.getStreamSegmentMetadata(segmentId);
+            sm.setStorageLength(sm.getLength()); // We need to set this in order to verify cache evictions.
+        }
+
+        HashSet<Integer> deletedEntries = new HashSet<>();
+        context.cacheStorage.deleteCallback = deletedEntries::add;
+        context.cacheManager.applyCachePolicy();
+        AssertExtensions.assertGreaterThan("Expected at least one cache entry to be removed.", 0, deletedEntries.size());
+    }
+
+    /**
+     * Tests a scenario of truncation that happens concurrently with reading (segment is truncated while reading).
+     */
+    @Test
+    public void testTruncateConcurrently() throws Exception {
+        @Cleanup
+        TestContext context = new TestContext();
+        List<Long> segmentIds = createSegments(context).subList(0, 1);
+        long segmentId = segmentIds.get(0);
+        ByteArrayOutputStream segmentContents = new ByteArrayOutputStream();
+        appendData(segmentIds, Collections.singletonMap(segmentId, segmentContents), context);
+
+        // Begin a read result.
+        UpdateableSegmentMetadata sm = context.metadata.getStreamSegmentMetadata(segmentId);
+        @Cleanup
+        ReadResult rr = context.readIndex.read(segmentId, 0, (int) sm.getLength(), TIMEOUT);
+        ReadResultEntry firstEntry = rr.next();
+        firstEntry.requestContent(TIMEOUT);
+        int firstEntryLength = firstEntry.getContent().join().getLength();
+        AssertExtensions.assertLessThan("Unexpected length of the first read result entry.", sm.getLength(), firstEntryLength);
+
+        // Truncate the segment just after the end of the first returned read result.
+        sm.setStartOffset(firstEntryLength + 1);
+        ReadResultEntry secondEntry = rr.next();
+        Assert.assertTrue("Unexpected ReadResultEntryType.isTerminal of truncated result entry.", secondEntry.getType().isTerminal());
+        Assert.assertEquals("Unexpected ReadResultEntryType of truncated result entry.", ReadResultEntryType.Truncated, secondEntry.getType());
+        AssertExtensions.assertSuppliedFutureThrows(
+                "Expecting getContent() to return a failed CompletableFuture.",
+                secondEntry::getContent,
+                ex -> ex instanceof StreamSegmentTruncatedException);
+        Assert.assertFalse("Unexpected result from hasNext after processing terminal result entry.", rr.hasNext());
     }
 
     /**
@@ -299,6 +420,29 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
 
         // Add a bunch of writes.
         appendData(allSegmentIds, segmentContents, context);
+
+        // Begin-merge all Transactions (part 1/2), and check contents.
+        beginMergeTransactions(transactionsBySegment, segmentContents, context);
+        checkReadIndex("BeginMerge", segmentContents, context);
+
+        // Complete the merger (part 2/2), and check contents.
+        completeMergeTransactions(transactionsBySegment, context);
+        checkReadIndex("CompleteMerge", segmentContents, context);
+    }
+
+    /**
+     * Tests the merging of empty Segments.
+     */
+    @Test
+    public void testMergeEmptySegment() throws Exception {
+        @Cleanup
+        TestContext context = new TestContext();
+        Collection<Long> segmentIds = Collections.singleton(createSegment(0, context));
+        HashMap<Long, ArrayList<Long>> transactionsBySegment = createTransactions(segmentIds, 1, context);
+        HashMap<Long, ByteArrayOutputStream> segmentContents = new HashMap<>();
+
+        // Add a bunch of writes.
+        appendData(segmentIds, segmentContents, context);
 
         // Begin-merge all Transactions (part 1/2), and check contents.
         beginMergeTransactions(transactionsBySegment, segmentContents, context);
@@ -378,11 +522,11 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         for (int i = 0; i < 5; i++) {
             for (long segmentId : segmentIds) {
                 UpdateableSegmentMetadata segmentMetadata = context.metadata.getStreamSegmentMetadata(segmentId);
-                byte[] data = getAppendData(segmentMetadata.getName(), segmentId, i, writeCount.incrementAndGet());
+                ByteArraySegment data = getAppendData(segmentMetadata.getName(), segmentId, i, writeCount.incrementAndGet());
 
-                // Make sure we increase the DurableLogLength prior to appending; the ReadIndex checks for this.
-                long offset = segmentMetadata.getDurableLogLength();
-                segmentMetadata.setDurableLogLength(offset + data.length);
+                // Make sure we increase the Length prior to appending; the ReadIndex checks for this.
+                long offset = segmentMetadata.getLength();
+                segmentMetadata.setLength(offset + data.getLength());
                 context.readIndex.append(segmentId, offset, data);
                 recordAppend(segmentId, data, segmentContents);
                 triggerFutureReadsCallback.run();
@@ -396,7 +540,7 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         context.readIndex.triggerFutureReads(segmentIds);
 
         // Now wait for all the reads to complete, and verify their results against the expected output.
-        FutureHelpers.allOf(entryHandlers.values().stream().map(TestReadResultHandler::getCompleted).collect(Collectors.toList())).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        Futures.allOf(entryHandlers.values().stream().map(TestReadResultHandler::getCompleted).collect(Collectors.toList())).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         readProcessors.forEach(AsyncReadResultProcessor::close);
 
         // Check to see if any errors got thrown (and caught) during the reading process).
@@ -422,6 +566,69 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
             Assert.assertEquals("Unexpected read length for segment " + expectedData.length, expectedLength, actualData.length);
             AssertExtensions.assertArrayEquals("Unexpected read contents for segment " + segmentId, expectedData, 0, actualData, 0, actualData.length);
         }
+
+        // Finally, pick a non-sealed segment, issue a Future Read from it and then close the index - verify the Future
+        // Read is cancelled.
+        Long notSealedId = segmentIds.stream().filter(id -> !segmentsToSeal.contains(id)).findFirst().orElse(null);
+        Assert.assertNotNull("Expecting at least one non-sealed segment.", notSealedId);
+        @Cleanup
+        ReadResult rr = context.readIndex.read(notSealedId, context.metadata.getStreamSegmentMetadata(notSealedId).getLength(), 1, TIMEOUT);
+        ReadResultEntry fe = rr.next();
+        Assert.assertEquals("Expecting a Future Read.", ReadResultEntryType.Future, fe.getType());
+        Assert.assertFalse("Not expecting Future Read to be completed.", fe.getContent().isDone());
+        context.readIndex.close();
+        Assert.assertTrue("Expected the Future Read to have been cancelled when the ReadIndex was closed.", fe.getContent().isCancelled());
+    }
+
+    /**
+     * Tests the behavior of Future Reads on an empty index that is sealed.
+     */
+    @Test
+    public void testFutureReadsEmptyIndex() throws Exception {
+        @Cleanup
+        TestContext context = new TestContext();
+
+        // Create an empty segment. This is the easiest way to ensure the Read Index is empty.
+        long segmentId = createSegment(0, context);
+        @Cleanup
+        val rr = context.readIndex.read(segmentId, 0, 1, TIMEOUT);
+        val futureReadEntry = rr.next();
+        Assert.assertEquals("Unexpected entry type.", ReadResultEntryType.Future, futureReadEntry.getType());
+        Assert.assertFalse("ReadResultEntry is completed.", futureReadEntry.getContent().isDone());
+
+        // Seal the segment. This should complete all future reads.
+        context.metadata.getStreamSegmentMetadata(segmentId).markSealed();
+        context.readIndex.triggerFutureReads(Collections.singleton(segmentId));
+        Assert.assertTrue("Expected future read to be failed after sealing.", futureReadEntry.getContent().isCompletedExceptionally());
+        AssertExtensions.assertSuppliedFutureThrows(
+                "Expected future read to be failed with appropriate exception.",
+                futureReadEntry::getContent,
+                ex -> ex instanceof StreamSegmentSealedException);
+    }
+
+
+    /**
+     * Tests the ability to auto-unregister Future Reads if they are cancelled externally.
+     */
+    @Test
+    public void testFutureReadsCancelled() throws Exception {
+        @Cleanup
+        TestContext context = new TestContext();
+
+        // Create an empty segment. This is the easiest way to ensure the Read Index is empty.
+        long segmentId = createSegment(0, context);
+        @Cleanup
+        val rr = context.readIndex.read(segmentId, 0, 1, TIMEOUT);
+        val futureReadEntry = rr.next();
+        Assert.assertEquals("Unexpected entry type.", ReadResultEntryType.Future, futureReadEntry.getType());
+        Assert.assertFalse("ReadResultEntry is completed.", futureReadEntry.getContent().isDone());
+
+        rr.close();
+        Assert.assertTrue(futureReadEntry.getContent().isCancelled());
+
+        AssertExtensions.assertEventuallyEquals("FutureReadResultEntry not unregistered after owning ReadResult closed.",
+                0, () -> context.readIndex.getIndex(segmentId).getFutureReadCount(),
+                10, TIMEOUT.toMillis());
     }
 
     /**
@@ -443,36 +650,36 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         initializeSegment(segmentId, context);
 
         long transactionId = segmentId + 1;
-        String transactionName = StreamSegmentNameUtils.getTransactionNameFromId(segmentName, UUID.randomUUID());
-        context.metadata.mapStreamSegmentId(transactionName, transactionId, segmentId);
+        String transactionName = NameUtils.getTransactionNameFromId(segmentName, UUID.randomUUID());
+        context.metadata.mapStreamSegmentId(transactionName, transactionId);
         initializeSegment(transactionId, context);
 
-        byte[] appendData = "foo".getBytes();
+        ByteArraySegment appendData = new ByteArraySegment("foo".getBytes());
         UpdateableSegmentMetadata segmentMetadata = context.metadata.getStreamSegmentMetadata(segmentId);
-        long segmentOffset = segmentMetadata.getDurableLogLength();
-        segmentMetadata.setDurableLogLength(segmentOffset + appendData.length);
+        long segmentOffset = segmentMetadata.getLength();
+        segmentMetadata.setLength(segmentOffset + appendData.getLength());
         context.readIndex.append(segmentId, segmentOffset, appendData);
 
         UpdateableSegmentMetadata transactionMetadata = context.metadata.getStreamSegmentMetadata(transactionId);
-        long transactionOffset = transactionMetadata.getDurableLogLength();
-        transactionMetadata.setDurableLogLength(transactionOffset + appendData.length);
+        long transactionOffset = transactionMetadata.getLength();
+        transactionMetadata.setLength(transactionOffset + appendData.getLength());
         context.readIndex.append(transactionId, transactionOffset, appendData);
 
         // 1. Appends at wrong offsets.
         AssertExtensions.assertThrows(
                 "append did not throw the correct exception when provided with an offset beyond the Segment's DurableLogOffset.",
-                () -> context.readIndex.append(segmentId, Integer.MAX_VALUE, "foo".getBytes()),
+                () -> context.readIndex.append(segmentId, Integer.MAX_VALUE, appendData),
                 ex -> ex instanceof IllegalArgumentException);
 
         AssertExtensions.assertThrows(
                 "append did not throw the correct exception when provided with invalid offset.",
-                () -> context.readIndex.append(segmentId, 0, "foo".getBytes()),
+                () -> context.readIndex.append(segmentId, 0, appendData),
                 ex -> ex instanceof IllegalArgumentException);
 
         // 2. Appends or reads with wrong SegmentIds
         AssertExtensions.assertThrows(
                 "append did not throw the correct exception when provided with invalid SegmentId.",
-                () -> context.readIndex.append(transactionId + 1, 0, "foo".getBytes()),
+                () -> context.readIndex.append(transactionId + 1, 0, appendData),
                 ex -> ex instanceof IllegalArgumentException);
 
         AssertExtensions.assertThrows(
@@ -508,12 +715,12 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
                 ex -> ex instanceof IllegalArgumentException);
 
         transactionMetadata.markSealed();
-        long mergeOffset = segmentMetadata.getDurableLogLength();
-        segmentMetadata.setDurableLogLength(mergeOffset + transactionMetadata.getLength());
+        long mergeOffset = segmentMetadata.getLength();
+        segmentMetadata.setLength(mergeOffset + transactionMetadata.getLength());
         context.readIndex.beginMerge(segmentId, mergeOffset, transactionId);
         AssertExtensions.assertThrows(
                 "append did not throw the correct exception when called on a Transaction that was already sealed.",
-                () -> context.readIndex.append(transactionId, transactionMetadata.getLength(), "foo".getBytes()),
+                () -> context.readIndex.append(transactionId, transactionMetadata.getLength(), appendData),
                 ex -> ex instanceof IllegalArgumentException);
     }
 
@@ -554,6 +761,185 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
     }
 
     /**
+     * Tests a scenario where two concurrent Storage reads for the same offset execute, and the second ends up overwriting
+     * the first one.
+     */
+    @Test
+    public void testStorageReadsConcurrentWithOverwrite() throws Exception {
+        testStorageReadsConcurrentWithOverwrite(0);
+        testStorageReadsConcurrentWithOverwrite(1);
+    }
+
+    private void testStorageReadsConcurrentWithOverwrite(int offsetDeltaBetweenReads) throws Exception {
+        testConcurrentStorageReads(offsetDeltaBetweenReads, 1,
+                (context, metadata) -> {
+                    // Do nothing.
+                },
+                (context, metadata) -> {
+                    // Check all the appended data. It must not have been overridden.
+                    Assert.assertEquals("Not expecting any extra data in this test.", metadata.getLength(), metadata.getStorageLength());
+                    val readResult = context.readIndex.read(metadata.getId(), 0, (int) metadata.getStorageLength(), TIMEOUT);
+
+                    // Read from segment.
+                    byte[] segmentData = new byte[(int) metadata.getStorageLength()];
+                    readResult.readRemaining(segmentData, TIMEOUT);
+
+                    // Then from Storage.
+                    byte[] storageData = new byte[segmentData.length];
+                    context.storage.openRead(metadata.getName())
+                            .thenCompose(handle -> context.storage.read(handle, 0, storageData, 0, storageData.length, TIMEOUT))
+                            .join();
+
+                    Assert.assertArrayEquals("Unexpected appended data read back.", storageData, segmentData);
+
+                    // The cleanup is async, so we must keep trying to check until it is done.
+                    AssertExtensions.assertEventuallyEquals("Unexpected number of bytes in the cache.",
+                            (long) storageData.length,
+                            () -> context.cacheStorage.getState().getStoredBytes(),
+                            10, TIMEOUT.toMillis());
+
+                });
+    }
+
+    /**
+     * Tests a scenario where two concurrent Storage reads for the same offset execute, but the first one completes first,
+     * then a new append is added to the segment, and when the second read completes it should be discarded (as opposed
+     * from overwriting the Read Index Entry).
+     */
+    @Test
+    public void testStorageReadsConcurrentNoOverwrite() throws Exception {
+        testStorageReadsConcurrentNoOverwrite(0);
+        testStorageReadsConcurrentNoOverwrite(1);
+    }
+
+    private void testStorageReadsConcurrentNoOverwrite(int offsetDeltaBetweenReads) throws Exception {
+        val appendedData = new AtomicReference<ByteArraySegment>();
+        testConcurrentStorageReads(offsetDeltaBetweenReads, 0,
+                (context, metadata) -> {
+                    // Now perform an append.
+                    appendedData.set(getAppendData(metadata.getName(), metadata.getId(), 1, 1));
+                    metadata.setLength(metadata.getLength() + appendedData.get().getLength());
+                    context.readIndex.append(metadata.getId(), metadata.getStorageLength(), appendedData.get());
+                },
+                (context, metadata) -> {
+                    // Check all the appended data. It must not have been overridden.
+                    val appendedDataStream = context.readIndex.readDirect(metadata.getId(), metadata.getStorageLength(), appendedData.get().getLength());
+                    Assert.assertNotNull("Unable to read appended data.", appendedDataStream);
+                    val actualAppendedData = StreamHelpers.readAll(appendedDataStream, appendedData.get().getLength());
+                    AssertExtensions.assertArrayEquals("Unexpected appended data read back.",
+                            appendedData.get().array(), 0, actualAppendedData, 0, appendedData.get().getLength());
+
+                    // The cleanup is async, so we must keep trying to check until it is done.
+                    AssertExtensions.assertEventuallyEquals("Unexpected number of bytes in the cache.",
+                            metadata.getLength(),
+                            () -> context.cacheStorage.getState().getStoredBytes(),
+                            10, TIMEOUT.toMillis());
+                });
+    }
+
+    private void testConcurrentStorageReads(
+            int offsetDeltaBetweenReads,
+            int extraAllowedStorageReads,
+            BiConsumerWithException<TestContext, UpdateableSegmentMetadata> executeBetweenReads,
+            BiConsumerWithException<TestContext, UpdateableSegmentMetadata> finalCheck) throws Exception {
+        val maxAllowedStorageReads = 2 + extraAllowedStorageReads;
+        val cachePolicy = new CachePolicy(100, 0.01, 1.0, Duration.ofMillis(10), Duration.ofMillis(10));
+        @Cleanup
+        TestContext context = new TestContext(DEFAULT_CONFIG, cachePolicy);
+
+        // Create the segment
+        val segmentId = createSegment(0, context);
+        val metadata = context.metadata.getStreamSegmentMetadata(segmentId);
+        context.storage.create(metadata.getName(), TIMEOUT).join();
+
+        // Append some data to the Read Index.
+        val dataInStorage = getAppendData(metadata.getName(), segmentId, 0, 0);
+        metadata.setLength(dataInStorage.getLength());
+        context.readIndex.append(segmentId, 0, dataInStorage);
+
+        // Then write to Storage.
+        context.storage.openWrite(metadata.getName())
+                .thenCompose(handle -> context.storage.write(handle, 0, dataInStorage.getReader(), dataInStorage.getLength(), TIMEOUT))
+                .join();
+        metadata.setStorageLength(dataInStorage.getLength());
+
+        // Then evict it from the cache.
+        boolean evicted = context.cacheManager.applyCachePolicy();
+        Assert.assertTrue("Expected an eviction.", evicted);
+
+        @Cleanup("release")
+        val firstReadBlocker = new ReusableLatch();
+        @Cleanup("release")
+        val firstRead = new ReusableLatch();
+        @Cleanup("release")
+        val secondReadBlocker = new ReusableLatch();
+        @Cleanup("release")
+        val secondRead = new ReusableLatch();
+        val cacheInsertCount = new AtomicInteger();
+        context.cacheStorage.insertCallback = address -> {
+            if (cacheInsertCount.incrementAndGet() > 1) {
+                Assert.fail("Too many cache inserts.");
+            }
+        };
+
+        val storageReadCount = new AtomicInteger();
+        context.storage.setReadInterceptor((segment, wrappedStorage) -> {
+            int readCount = storageReadCount.incrementAndGet();
+            if (readCount == 1) {
+                firstRead.release();
+                Exceptions.handleInterrupted(firstReadBlocker::await);
+            } else if (readCount == 2) {
+                secondRead.release();
+                Exceptions.handleInterrupted(secondReadBlocker::await);
+            } else if (readCount > maxAllowedStorageReads) {
+                Assert.fail("Too many storage reads. Max allowed = " + maxAllowedStorageReads);
+            }
+        });
+
+        // Initiate the first Storage Read.
+        val read1Result = context.readIndex.read(segmentId, 0, dataInStorage.getLength(), TIMEOUT);
+        val read1Data = new byte[dataInStorage.getLength()];
+        val read1Future = CompletableFuture.runAsync(() -> read1Result.readRemaining(read1Data, TIMEOUT), executorService());
+
+        // Wait for it to process.
+        firstRead.await();
+
+        // Initiate the second storage read.
+        val read2Length = dataInStorage.getLength() - offsetDeltaBetweenReads;
+        val read2Result = context.readIndex.read(segmentId, offsetDeltaBetweenReads, read2Length, TIMEOUT);
+        val read2Data = new byte[read2Length];
+        val read2Future = CompletableFuture.runAsync(() -> read2Result.readRemaining(read2Data, TIMEOUT), executorService());
+
+        secondRead.await();
+
+        // Unblock the first Storage Read and wait for it to complete.
+        firstReadBlocker.release();
+        read1Future.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        // Wait for the data from the first read to be fully added to the cache. Without this the subsequent append will not write to this entry.
+        TestUtils.await(
+                () -> {
+                    try {
+                        return context.readIndex.read(0, 0, dataInStorage.getLength(), TIMEOUT).next().getType() == ReadResultEntryType.Cache;
+                    } catch (StreamSegmentNotExistsException ex) {
+                        throw new CompletionException(ex);
+                    }
+                }, 10, TIMEOUT.toMillis());
+
+        // If there's anything to do between the two reads, do it now.
+        executeBetweenReads.accept(context, metadata);
+
+        // Unblock second Storage Read.
+        secondReadBlocker.release();
+        read2Future.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        // Perform final check.
+        finalCheck.accept(context, metadata);
+        Assert.assertEquals("Unexpected number of storage reads.", maxAllowedStorageReads, storageReadCount.get());
+        Assert.assertEquals("Unexpected number of cache inserts.", 1, cacheInsertCount.get());
+    }
+
+    /**
      * Tests the ability to handle Storage read failures.
      */
     @Test
@@ -568,7 +954,7 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         long testSegmentId = segmentIds.get(0);
         UpdateableSegmentMetadata sm = context.metadata.getStreamSegmentMetadata(testSegmentId);
         sm.setStorageLength(1024 * 1024);
-        sm.setDurableLogLength(1024 * 1024);
+        sm.setLength(1024 * 1024);
 
         AssertExtensions.assertThrows(
                 "Unexpected exception when attempting to read beyond the Segment length in Storage.",
@@ -598,6 +984,51 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
                     entry.getContent().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                 },
                 ex -> ex instanceof StreamSegmentNotExistsException);
+    }
+
+    /**
+     * Tests the ability to handle Cache/Index Update failures post a successful Storage Read.
+     */
+    @Test
+    public void testStorageFailedCacheInsert() throws Exception {
+        final int segmentLength = 1024;
+        // Create a segment and write some data in Storage for it.
+        @Cleanup
+        TestContext context = new TestContext();
+        ArrayList<Long> segmentIds = createSegments(context);
+        createSegmentsInStorage(context);
+        val testSegmentId = segmentIds.get(0);
+        UpdateableSegmentMetadata sm = context.metadata.getStreamSegmentMetadata(testSegmentId);
+        sm.setStorageLength(segmentLength);
+        sm.setLength(segmentLength);
+        context.storage.openWrite(sm.getName())
+                .thenCompose(handle -> context.storage.write(handle, 0, new ByteArrayInputStream(new byte[segmentLength]), segmentLength, TIMEOUT))
+                .join();
+
+        // Keep track of inserted/deleted calls to the Cache, and "fail" the insert call.
+        val inserted = new ReusableLatch();
+        val insertedAddress = new AtomicInteger(CacheStorage.NO_ADDRESS);
+        val deletedAddress = new AtomicInteger(Integer.MAX_VALUE);
+        context.cacheStorage.insertCallback = address -> {
+            context.cacheStorage.delete(address); // Immediately delete this data (prevent leaks).
+            Assert.assertTrue(insertedAddress.compareAndSet(CacheStorage.NO_ADDRESS, address));
+            inserted.release();
+            throw new IntentionalException();
+        };
+        context.cacheStorage.deleteCallback = deletedAddress::set;
+
+        // Trigger a read. The first read call will be served with data directly from Storage, so we expect it to be successful.
+        @Cleanup
+        ReadResult readResult = context.readIndex.read(testSegmentId, 0, segmentLength, TIMEOUT);
+        ReadResultEntry entry = readResult.next();
+        Assert.assertEquals("Unexpected ReadResultEntryType.", ReadResultEntryType.Storage, entry.getType());
+        entry.requestContent(TIMEOUT);
+        entry.getContent().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS); // This should complete without issues.
+
+        // Verify that the cache insert attempt has been made
+        inserted.await();
+        Assert.assertNotEquals("Expected an insert attempt to have been made.", CacheStorage.NO_ADDRESS, insertedAddress.get());
+        AssertExtensions.assertEventuallyEquals(CacheStorage.NO_ADDRESS, deletedAddress::get, TIMEOUT.toMillis());
     }
 
     /**
@@ -632,10 +1063,10 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
      * Tests the ability to evict entries from the ReadIndex under various conditions:
      * * If an entry is aged out
      * * If an entry is pushed out because of cache space pressure.
-     * <p>
+     *
      * This also verifies that certain entries, such as RedirectReadIndexEntries and entries after the Storage Offset are
      * not removed.
-     * <p>
+     *
      * The way this test goes is as follows (it's pretty subtle, because there aren't many ways to hook into the ReadIndex and see what it's doing)
      * 1. It creates a bunch of segments, and populates them in storage (each) up to offset N/2-1 (this is called pre-storage)
      * 2. It populates the ReadIndex for each of those segments from offset N/2 to offset N-1 (this is called post-storage)
@@ -660,22 +1091,26 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
     public void testCacheEviction() throws Exception {
         // Create a CachePolicy with a set number of generations and a known max size.
         // Each generation contains exactly one entry, so the number of generations is also the number of entries.
-        final int appendSize = 100;
+        // We append one byte at each time. This allows us to test edge cases as well by having the finest precision when
+        // it comes to selecting which bytes we want evicted and which kept.
+        final int appendSize = 1;
         final int entriesPerSegment = 100; // This also doubles as number of generations (each generation, we add one append for each segment).
         final int cacheMaxSize = SEGMENT_COUNT * entriesPerSegment * appendSize;
         final int postStorageEntryCount = entriesPerSegment / 4; // 25% of the entries are beyond the StorageOffset
         final int preStorageEntryCount = entriesPerSegment - postStorageEntryCount; // 75% of the entries are before the StorageOffset.
-        CachePolicy cachePolicy = new CachePolicy(cacheMaxSize, Duration.ofMillis(1000 * 2 * entriesPerSegment), Duration.ofMillis(1000));
+        CachePolicy cachePolicy = new CachePolicy(cacheMaxSize, 1.0, 1.0, Duration.ofMillis(1000 * 2 * entriesPerSegment), Duration.ofMillis(1000));
 
         // To properly test this, we want predictable storage reads.
-        ReadIndexConfig config = ConfigHelpers
-                .withInfiniteCachePolicy(ReadIndexConfig.builder().with(ReadIndexConfig.STORAGE_READ_ALIGNMENT, appendSize))
-                .build();
+        ReadIndexConfig config = ReadIndexConfig.builder().with(ReadIndexConfig.STORAGE_READ_ALIGNMENT, appendSize).build();
 
-        ArrayList<CacheKey> removedKeys = new ArrayList<>();
+        ArrayList<Integer> removedEntries = new ArrayList<>();
         @Cleanup
         TestContext context = new TestContext(config, cachePolicy);
-        context.cacheFactory.cache.removeCallback = removedKeys::add; // Record every cache removal.
+        // To ease our testing, we disable appends and instruct the TestCache to report the same value for UsedBytes as it
+        // has for StoredBytes. This shields us from having to know internal details about the layout of the cache.
+        context.cacheStorage.usedBytesSameAsStoredBytes = true;
+        context.cacheStorage.disableAppends = true;
+        context.cacheStorage.deleteCallback = removedEntries::add; // Record every cache removal.
 
         // Create the segments (metadata + storage).
         ArrayList<Long> segmentIds = createSegments(context);
@@ -688,16 +1123,23 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
             val handle = context.storage.openWrite(sm.getName()).join();
             context.storage.write(handle, 0, new ByteArrayInputStream(preStorageData), preStorageData.length, TIMEOUT).join();
             sm.setStorageLength(preStorageData.length);
-            sm.setDurableLogLength(preStorageData.length);
+            sm.setLength(preStorageData.length);
         }
+
+        val cacheMappings = new HashMap<Integer, SegmentOffset>();
 
         // Callback that appends one entry at the end of the given segment id.
         Consumer<Long> appendOneEntry = segmentId -> {
             UpdateableSegmentMetadata sm = context.metadata.getStreamSegmentMetadata(segmentId);
             byte[] data = new byte[appendSize];
-            long offset = sm.getDurableLogLength();
-            sm.setDurableLogLength(offset + data.length);
-            context.readIndex.append(segmentId, offset, data);
+            long offset = sm.getLength();
+            sm.setLength(offset + data.length);
+            try {
+                context.cacheStorage.insertCallback = address -> cacheMappings.put(address, new SegmentOffset(segmentId, offset));
+                context.readIndex.append(segmentId, offset, new ByteArraySegment(data));
+            } catch (StreamSegmentNotExistsException ex) {
+                throw new CompletionException(ex);
+            }
         };
 
         // Populate the ReadIndex with the Append entries (post-StorageOffset)
@@ -716,16 +1158,24 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
                 ReadResult result = context.readIndex.read(segmentId, offset, appendSize, TIMEOUT);
                 ReadResultEntry resultEntry = result.next();
                 Assert.assertEquals("Unexpected type of ReadResultEntry when trying to load up data into the ReadIndex Cache.", ReadResultEntryType.Storage, resultEntry.getType());
+                CompletableFuture<Void> insertedInCache = new CompletableFuture<>();
+                context.cacheStorage.insertCallback = address -> {
+                    cacheMappings.put(address, new SegmentOffset(segmentId, offset));
+                    insertedInCache.complete(null);
+                };
                 resultEntry.requestContent(TIMEOUT);
                 ReadResultEntryContents contents = resultEntry.getContent().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                 Assert.assertFalse("Not expecting more data to be available for reading.", result.hasNext());
                 Assert.assertEquals("Unexpected ReadResultEntry length when trying to load up data into the ReadIndex Cache.", appendSize, contents.getLength());
+
+                // Wait for the entry to be inserted into the cache before moving on.
+                insertedInCache.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
             }
 
             context.cacheManager.applyCachePolicy();
         }
 
-        Assert.assertEquals("Not expecting any removed Cache entries at this point (cache is not full).", 0, removedKeys.size());
+        Assert.assertEquals("Not expecting any removed Cache entries at this point (cache is not full).", 0, removedEntries.size());
 
         // Append more data (equivalent to all post-storage entries), and verify that NO entries are being evicted (we cannot evict post-storage entries).
         for (int i = 0; i < postStorageEntryCount; i++) {
@@ -733,7 +1183,7 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
             context.cacheManager.applyCachePolicy();
         }
 
-        Assert.assertEquals("Not expecting any removed Cache entries at this point (only eligible entries were post-storage).", 0, removedKeys.size());
+        Assert.assertEquals("Not expecting any removed Cache entries at this point (only eligible entries were post-storage).", 0, removedEntries.size());
 
         // 'Touch' the first few entries read from storage. This should move them to the back of the queue (they won't be the first ones to be evicted).
         int touchCount = preStorageEntryCount / 3;
@@ -753,19 +1203,19 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
             context.cacheManager.applyCachePolicy();
         }
 
-        Assert.assertEquals("Not expecting any removed Cache entries at this point (we touched old entries and they now have the newest generation).", 0, removedKeys.size());
+        Assert.assertEquals("Not expecting any removed Cache entries at this point (we touched old entries and they now have the newest generation).", 0, removedEntries.size());
 
         // Increment the generations so that we are caught up to just before the generation where the "touched" items now live.
         context.cacheManager.applyCachePolicy();
 
         // We expect all but the 'touchCount' pre-Storage entries to be removed.
         int expectedRemovalCount = (preStorageEntryCount - touchCount) * SEGMENT_COUNT;
-        Assert.assertEquals("Unexpected number of removed entries after having forced out all pre-storage entries.", expectedRemovalCount, removedKeys.size());
+        Assert.assertEquals("Unexpected number of removed entries after having forced out all pre-storage entries.", expectedRemovalCount, removedEntries.size());
 
         // Now update the metadata and indicate that all the post-storage data has been moved to storage.
         segmentIds.forEach(segmentId -> {
             UpdateableSegmentMetadata sm = context.metadata.getStreamSegmentMetadata(segmentId);
-            sm.setStorageLength(sm.getDurableLogLength());
+            sm.setStorageLength(sm.getLength());
         });
 
         // We add one artificial entry, which we'll be touching forever and ever; this forces the CacheManager to
@@ -776,18 +1226,21 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         // Now evict everything (whether by size of by aging out).
         for (int i = 0; i < cachePolicy.getMaxGenerations(); i++) {
             @Cleanup
-            ReadResult result = context.readIndex.read(readSegment.getId(), readSegment.getDurableLogLength() - appendSize, appendSize, TIMEOUT);
+            ReadResult result = context.readIndex.read(readSegment.getId(), readSegment.getLength() - appendSize, appendSize, TIMEOUT);
             result.next();
             context.cacheManager.applyCachePolicy();
         }
 
         int expectedRemovalCountPerSegment = entriesPerSegment + touchCount + postStorageEntryCount;
         int expectedTotalRemovalCount = SEGMENT_COUNT * expectedRemovalCountPerSegment;
-        Assert.assertEquals("Unexpected number of removed entries after having forced out all the entries.", expectedTotalRemovalCount, removedKeys.size());
+        Assert.assertEquals("Unexpected number of removed entries after having forced out all the entries.", expectedTotalRemovalCount, removedEntries.size());
 
         // Finally, verify that the evicted items are in the correct order (for each segment). See this test's description for details.
         for (long segmentId : segmentIds) {
-            List<CacheKey> segmentRemovedKeys = removedKeys.stream().filter(key -> key.getStreamSegmentId() == segmentId).collect(Collectors.toList());
+            List<SegmentOffset> segmentRemovedKeys = removedEntries.stream()
+                    .map(cacheMappings::get)
+                    .filter(e -> e.segmentId == segmentId)
+                    .collect(Collectors.toList());
             Assert.assertEquals("Unexpected number of removed entries for segment " + segmentId, expectedRemovalCountPerSegment, segmentRemovedKeys.size());
 
             // The correct order of eviction (N=entriesPerSegment) is: 0.25N-0.75N, 0.75N..N, N..1.25N, 0..0.25N, 1.25N..1.5N.
@@ -801,6 +1254,58 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
             //1.25N..1.5N
             checkOffsets(segmentRemovedKeys, segmentId, entriesPerSegment + entriesPerSegment / 4, entriesPerSegment / 4, (int) (entriesPerSegment * appendSize * 1.25), appendSize);
         }
+    }
+
+    /**
+     * Tests the {@link ContainerReadIndex#cleanup} method as well as its handling of inactive segments.
+     */
+    @Test
+    public void testCleanup() throws Exception {
+        // Create all the segments in the metadata.
+        @Cleanup
+        TestContext context = new TestContext();
+        ArrayList<Long> segmentIds = createSegments(context);
+
+        final long activeSegmentId = segmentIds.get(0); // Always stays active.
+        final long inactiveSegmentId1 = segmentIds.get(1); // Becomes inactive - used for cleanup()
+        final long inactiveSegmentId2 = segmentIds.get(2); // Becomes inactive - used for getOrCreateIndex() (any op).
+        final long reactivatedSegmentId1 = segmentIds.get(3); // Becomes inactive and then active again (for cleanup)
+        final long reactivatedSegmentId2 = segmentIds.get(4); // Becomes inactive and then active again (for getOrCreateIndex()).
+
+        // Add a zero-byte append, which ensures the Segments' Read Indices are initialized.
+        for (val id : segmentIds) {
+            context.readIndex.append(id, 0, new ByteArraySegment(new byte[0]));
+        }
+
+        // Mark 2 segments as inactive, but do not evict them yet. We simulate a concurrent eviction, when the segment is
+        // first marked as inactive and the Read Index receives a request for it before it gets evicted.
+        markInactive(inactiveSegmentId1, context);
+        markInactive(inactiveSegmentId2, context);
+
+        // Evict 2 segments (which also marks them as inactive), then re-map them as active segments (which gives them
+        // new instances of their Segment Metadatas).
+        val reactivatedSegment2OldIndex = context.readIndex.getIndex(reactivatedSegmentId2);
+        evict(reactivatedSegmentId1, context);
+        evict(reactivatedSegmentId2, context);
+        createSegment(reactivatedSegmentId1, context);
+        createSegment(reactivatedSegmentId2, context);
+
+        // Test cleanup().
+        context.readIndex.cleanup(Arrays.asList(activeSegmentId, inactiveSegmentId1, reactivatedSegmentId1));
+        Assert.assertNotNull("Active segment's index removed during cleanup.", context.readIndex.getIndex(activeSegmentId));
+        Assert.assertNull("Inactive segment's index not removed during cleanup.", context.readIndex.getIndex(inactiveSegmentId1));
+        Assert.assertNull("Reactivated segment's index not removed during cleanup.", context.readIndex.getIndex(reactivatedSegmentId1));
+
+        // Test getOrCreateIndex() via append() (any other operation could be used for this, but this is the simplest to setup).
+        AssertExtensions.assertThrows(
+                "Appending to inactive segment succeeded.",
+                () -> context.readIndex.append(inactiveSegmentId2, 0, new ByteArraySegment(new byte[0])),
+                ex -> ex instanceof IllegalArgumentException);
+
+        // This should re-create the index.
+        context.readIndex.append(reactivatedSegmentId2, 0, new ByteArraySegment(new byte[0]));
+        Assert.assertNotEquals("Reactivated Segment's ReadIndex was not re-created.",
+                reactivatedSegment2OldIndex, context.readIndex.getIndex(reactivatedSegmentId2));
     }
 
     // region Scenario-based tests
@@ -826,39 +1331,39 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
 
         // Create parent segment and one transaction
         long parentId = createSegment(0, context);
-        UpdateableSegmentMetadata parentMetadata = context.metadata.getStreamSegmentMetadata(parentId);
-        long transactionId = createTransaction(parentMetadata, 1, context);
-        UpdateableSegmentMetadata transactionMetadata = context.metadata.getStreamSegmentMetadata(transactionId);
+        long transactionId = createTransaction(1, context);
         createSegmentsInStorage(context);
         ByteArrayOutputStream writtenStream = new ByteArrayOutputStream();
 
         // Write something to the transaction, and make sure it also makes its way to Storage.
-        byte[] transactionWriteData = getAppendData(transactionMetadata.getName(), transactionId, 0, 0);
+        UpdateableSegmentMetadata parentMetadata = context.metadata.getStreamSegmentMetadata(parentId);
+        UpdateableSegmentMetadata transactionMetadata = context.metadata.getStreamSegmentMetadata(transactionId);
+        ByteArraySegment transactionWriteData = getAppendData(transactionMetadata.getName(), transactionId, 0, 0);
         appendSingleWrite(transactionId, transactionWriteData, context);
         val handle = context.storage.openWrite(transactionMetadata.getName()).join();
-        context.storage.write(handle, 0, new ByteArrayInputStream(transactionWriteData), transactionWriteData.length, TIMEOUT).join();
-        transactionMetadata.setStorageLength(transactionMetadata.getDurableLogLength());
+        context.storage.write(handle, 0, transactionWriteData.getReader(), transactionWriteData.getLength(), TIMEOUT).join();
+        transactionMetadata.setStorageLength(transactionMetadata.getLength());
 
         // Write some data to the parent, and make sure it is more than what we write to the transaction (hence the 10).
         for (int i = 0; i < 10; i++) {
-            byte[] parentWriteData = getAppendData(parentMetadata.getName(), parentId, i, i);
+            ByteArraySegment parentWriteData = getAppendData(parentMetadata.getName(), parentId, i, i);
             appendSingleWrite(parentId, parentWriteData, context);
-            writtenStream.write(parentWriteData);
+            parentWriteData.copyTo(writtenStream);
         }
 
         // Seal & Begin-merge the transaction (do not seal in storage).
         transactionMetadata.markSealed();
-        long mergeOffset = parentMetadata.getDurableLogLength();
-        parentMetadata.setDurableLogLength(mergeOffset + transactionMetadata.getDurableLogLength());
+        long mergeOffset = parentMetadata.getLength();
+        parentMetadata.setLength(mergeOffset + transactionMetadata.getLength());
         context.readIndex.beginMerge(parentId, mergeOffset, transactionId);
         transactionMetadata.markMerged();
-        writtenStream.write(transactionWriteData);
+        transactionWriteData.copyTo(writtenStream);
 
         // Clear the cache.
         context.cacheManager.applyCachePolicy();
 
         // Issue read from the parent.
-        ReadResult rr = context.readIndex.read(parentId, mergeOffset, transactionWriteData.length, TIMEOUT);
+        ReadResult rr = context.readIndex.read(parentId, mergeOffset, transactionWriteData.getLength(), TIMEOUT);
         Assert.assertTrue("Parent Segment read indicates no data available.", rr.hasNext());
         ByteArrayOutputStream readStream = new ByteArrayOutputStream();
         long expectedOffset = mergeOffset;
@@ -877,7 +1382,7 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         }
 
         byte[] readData = readStream.toByteArray();
-        Assert.assertArrayEquals("Unexpected data read back.", transactionWriteData, readData);
+        Assert.assertArrayEquals("Unexpected data read back.", transactionWriteData.getCopy(), readData);
     }
 
     /**
@@ -899,67 +1404,286 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
 
         // Create parent segment and one transaction
         long parentId = createSegment(0, context);
-        UpdateableSegmentMetadata parentMetadata = context.metadata.getStreamSegmentMetadata(parentId);
-        long transactionId = createTransaction(parentMetadata, 1, context);
-        UpdateableSegmentMetadata transactionMetadata = context.metadata.getStreamSegmentMetadata(transactionId);
+        long transactionId = createTransaction(1, context);
         createSegmentsInStorage(context);
 
+        ByteArraySegment writeData = getAppendData(context.metadata.getStreamSegmentMetadata(transactionId).getName(), transactionId, 0, 0);
+        ReadResultEntry entry = setupMergeRead(parentId, transactionId, writeData.getCopy(), context);
+        context.readIndex.completeMerge(parentId, transactionId);
+
+        ReadResultEntryContents contents = entry.getContent().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        byte[] readData = new byte[contents.getLength()];
+        StreamHelpers.readAll(contents.getData(), readData, 0, readData.length);
+
+        Assert.assertArrayEquals("Unexpected data read from parent segment.", writeData.getCopy(), readData);
+    }
+
+    /**
+     * Tests a scenario where a call to {@link StreamSegmentReadIndex#completeMerge} executes concurrently with a
+     * CacheManager eviction. The Cache Manager must not evict the data for recently transferred entries, even if they
+     * would otherwise be eligible for eviction in the source segment.
+     */
+    @Test
+    public void testConcurrentEvictionTransactionStorageMerge() throws Exception {
+        val mergeOffset = 1;
+        val appendLength = 1;
+        CachePolicy cachePolicy = new CachePolicy(1, Duration.ZERO, Duration.ofMillis(1));
+        @Cleanup
+        TestContext context = new TestContext(DEFAULT_CONFIG, cachePolicy);
+
+        // Create parent segment and one transaction
+        long targetId = createSegment(0, context);
+        long sourceId = createTransaction(1, context);
+        val targetMetadata = context.metadata.getStreamSegmentMetadata(targetId);
+        val sourceMetadata = context.metadata.getStreamSegmentMetadata(sourceId);
+        createSegmentsInStorage(context);
+
+        // Write something to the parent segment.
+        appendSingleWrite(targetId, new ByteArraySegment(new byte[mergeOffset]), context);
+        context.storage.openWrite(targetMetadata.getName())
+                .thenCompose(handle -> context.storage.write(handle, 0, new ByteArrayInputStream(new byte[mergeOffset]), mergeOffset, TIMEOUT)).join();
+
+        // Write something to the transaction, but do not write anything in Storage - we want to verify we don't even
+        // try to reach in there.
+        val sourceContents = getAppendData(context.metadata.getStreamSegmentMetadata(sourceId).getName(), sourceId, 0, 0);
+        appendSingleWrite(sourceId, sourceContents, context);
+        sourceMetadata.setStorageLength(sourceMetadata.getLength());
+
+        // Seal & Begin-merge the transaction (do not seal in storage).
+        sourceMetadata.markSealed();
+        targetMetadata.setLength(sourceMetadata.getLength() + mergeOffset);
+        context.readIndex.beginMerge(targetId, mergeOffset, sourceId);
+        sourceMetadata.markMerged();
+        sourceMetadata.markDeleted();
+
+        // Trigger a Complete Merge. We want to intercept and pause it immediately before it is unregistered from the
+        // Cache Manager.
+        @Cleanup("release")
+        val unregisterCalled = new ReusableLatch();
+        @Cleanup("release")
+        val unregisterBlocker = new ReusableLatch();
+        context.cacheManager.setUnregisterInterceptor(c -> {
+            unregisterCalled.release();
+            Exceptions.handleInterrupted(unregisterBlocker::await);
+        });
+
+        val completeMerge = CompletableFuture.runAsync(() -> {
+            try {
+                context.readIndex.completeMerge(targetId, sourceId);
+            } catch (Exception ex) {
+                throw new CompletionException(ex);
+            }
+        }, executorService());
+
+        // Clear the cache. The source Read index is still registered in the Cache Manager - we want to ensure that any
+        // eviction happening at this point will not delete anything from the Cache that we don't want deleted.
+        unregisterCalled.await();
+        context.cacheManager.applyCachePolicy();
+
+        // Wait for the operation to complete.
+        unregisterBlocker.release();
+        completeMerge.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        // Verify that we can append (appending will modify the last cache entry; if it had been modified this would not
+        // work anymore).
+        val appendOffset = (int) targetMetadata.getLength();
+        val appendData = new byte[appendLength];
+        appendData[0] = (byte) 23;
+        targetMetadata.setLength(appendOffset + appendLength);
+        context.readIndex.append(targetId, appendOffset, new ByteArraySegment(appendData));
+
+        // Issue a read and verify we can read everything that we wrote. If it had been evicted or erroneously deleted
+        // from the cache this would result in an error.
+        byte[] expectedData = new byte[appendOffset + appendLength];
+        sourceContents.copyTo(expectedData, mergeOffset, sourceContents.getLength());
+        System.arraycopy(appendData, 0, expectedData, appendOffset, appendLength);
+
+        ReadResult rr = context.readIndex.read(targetId, 0, expectedData.length, TIMEOUT);
+        Assert.assertTrue("Parent Segment read indicates no data available.", rr.hasNext());
+        byte[] actualData = new byte[expectedData.length];
+        rr.readRemaining(actualData, TIMEOUT);
+        Assert.assertArrayEquals("Unexpected data read back.", expectedData, actualData);
+    }
+
+    /**
+     * Verifies that any FutureRead that resulted from a partial merge operation is cancelled when the ReadIndex is closed.
+     */
+    @Test
+    public void testMergeReadCancelledOnClose() throws Exception {
+        CachePolicy cachePolicy = new CachePolicy(1, Duration.ZERO, Duration.ofMillis(1));
+        @Cleanup
+        TestContext context = new TestContext(DEFAULT_CONFIG, cachePolicy);
+
+        // Create parent segment and one transaction
+        long parentId = createSegment(0, context);
+        long transactionId = createTransaction(1, context);
+        createSegmentsInStorage(context);
+
+        ByteArraySegment writeData = getAppendData(context.metadata.getStreamSegmentMetadata(transactionId).getName(), transactionId, 0, 0);
+        RedirectedReadResultEntry entry = (RedirectedReadResultEntry) setupMergeRead(parentId, transactionId, writeData.getCopy(), context);
+
+        // There are a number of async tasks going on here. One of them is in RedirectedReadResultEntry which needs to switch
+        // from the first attempt to a second one. Since we have no hook to know when that happens exactly, the only thing
+        // we can do is check periodically until that is done.
+        TestUtils.await(entry::hasSecondEntrySet, 10, TIMEOUT.toMillis());
+
+        // Close the index.
+        context.readIndex.close();
+
+        // Verify the entry is cancelled. Invoke get() since the cancellation is asynchronous so it may not yet have
+        // been executed; get() will block until that happens.
+        AssertExtensions.assertThrows(
+                "Expected entry to have been cancelled upon closing",
+                () -> entry.getContent().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS),
+                ex -> ex instanceof CancellationException);
+    }
+
+    /**
+     * Sets up a partial-merge Future Read for the two segments:
+     * 1. Writes some data to transactionId (both Read Index and Storage).
+     * 2. Calls beginMerge(parentId, transactionId)
+     * 3. Executes a Storage concat (transactionId -> parentId)
+     * 4. Clears the cache and returns a ReadResultEntry that requests data at the first offset of the merged transaction.
+     * NOTE: this does not call completeMerge().
+     */
+    private ReadResultEntry setupMergeRead(long parentId, long transactionId, byte[] txnData, TestContext context) throws Exception {
+        int mergeOffset = 1;
+        UpdateableSegmentMetadata parentMetadata = context.metadata.getStreamSegmentMetadata(parentId);
+        UpdateableSegmentMetadata transactionMetadata = context.metadata.getStreamSegmentMetadata(transactionId);
+        appendSingleWrite(parentId, new ByteArraySegment(new byte[mergeOffset]), context);
+        context.storage.openWrite(parentMetadata.getName())
+                       .thenCompose(handle -> context.storage.write(handle, 0, new ByteArrayInputStream(new byte[mergeOffset]), mergeOffset, TIMEOUT)).join();
+
         // Write something to the transaction, and make sure it also makes its way to Storage.
-        byte[] writeData = getAppendData(transactionMetadata.getName(), transactionId, 0, 0);
-        appendSingleWrite(transactionId, writeData, context);
+        appendSingleWrite(transactionId, new ByteArraySegment(txnData), context);
         val transactionWriteHandle = context.storage.openWrite(transactionMetadata.getName()).join();
-        context.storage.write(transactionWriteHandle, 0, new ByteArrayInputStream(writeData), writeData.length, TIMEOUT).join();
-        transactionMetadata.setStorageLength(transactionMetadata.getDurableLogLength());
+        context.storage.write(transactionWriteHandle, 0, new ByteArrayInputStream(txnData), txnData.length, TIMEOUT).join();
+        transactionMetadata.setStorageLength(transactionMetadata.getLength());
 
         // Seal & Begin-merge the transaction (do not seal in storage).
         transactionMetadata.markSealed();
-        parentMetadata.setDurableLogLength(transactionMetadata.getDurableLogLength());
-        context.readIndex.beginMerge(parentId, 0, transactionId);
+        parentMetadata.setLength(transactionMetadata.getLength() + mergeOffset);
+        context.readIndex.beginMerge(parentId, mergeOffset, transactionId);
         transactionMetadata.markMerged();
 
         // Clear the cache.
         context.cacheManager.applyCachePolicy();
 
         // Issue read from the parent and fetch the first entry (there should only be one).
-        ReadResult rr = context.readIndex.read(parentId, 0, writeData.length, TIMEOUT);
+        ReadResult rr = context.readIndex.read(parentId, mergeOffset, txnData.length, TIMEOUT);
         Assert.assertTrue("Parent Segment read indicates no data available.", rr.hasNext());
         ReadResultEntry entry = rr.next();
-        Assert.assertEquals("Unexpected offset for read result entry.", 0, entry.getStreamSegmentOffset());
+        Assert.assertEquals("Unexpected offset for read result entry.", mergeOffset, entry.getStreamSegmentOffset());
         Assert.assertEquals("Served read result entry is not from storage.", ReadResultEntryType.Storage, entry.getType());
 
-        // Merge the transaction in storage & complete-merge it.
+        // Merge the transaction in storage. Do not complete-merge it.
         transactionMetadata.markSealed();
         transactionMetadata.markSealedInStorage();
         transactionMetadata.markDeleted();
         context.storage.seal(transactionWriteHandle, TIMEOUT).join();
         val parentWriteHandle = context.storage.openWrite(parentMetadata.getName()).join();
-        context.storage.concat(parentWriteHandle, 0, transactionWriteHandle.getSegmentName(), TIMEOUT).join();
-        parentMetadata.setStorageLength(parentMetadata.getDurableLogLength());
-
-        context.readIndex.completeMerge(parentId, transactionId);
+        context.storage.concat(parentWriteHandle, 1, transactionWriteHandle.getSegmentName(), TIMEOUT).join();
+        parentMetadata.setStorageLength(parentMetadata.getLength());
 
         // Attempt to extract data from the read.
         entry.requestContent(TIMEOUT);
-        ReadResultEntryContents contents = entry.getContent().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-        byte[] readData = new byte[contents.getLength()];
-        StreamHelpers.readAll(contents.getData(), readData, 0, readData.length);
+        Assert.assertFalse("Not expecting the read to be completed.", entry.getContent().isDone());
+        return entry;
+    }
 
-        Assert.assertArrayEquals("Unexpected data read from parent segment.", writeData, readData);
+    /**
+     * Tests a scenario where a call to {@link StreamSegmentReadIndex#append} executes concurrently with a Cache Manager
+     * eviction. In particular, this tests the following scenario:
+     * - We have a Cache Entry E1 with Generation G1, and its entire contents is in Storage.
+     * - E1 maps to the end of the Segment.
+     * - We initiate an append A1, which will update the contents of E1.
+     * - The Cache Manager executes.
+     * - E1 would be eligible for eviction prior to the Cache Manager run, but not after.
+     * - We need to validate that E1 is not evicted and that A2 is immediately available for reading, and so is the data
+     * prior to it.
+     */
+    @Test
+    public void testConcurrentEvictAppend() throws Exception {
+        val rnd = new Random(0);
+        CachePolicy cachePolicy = new CachePolicy(1, Duration.ZERO, Duration.ofMillis(1));
+        @Cleanup
+        TestContext context = new TestContext(DEFAULT_CONFIG, cachePolicy);
+        final int blockSize = context.cacheStorage.getBlockAlignment();
+        context.cacheStorage.appendReturnBlocker = null; // Not blocking anything now.
+
+        // Create segment and make one append, less than the cache block size.
+        long segmentId = createSegment(0, context);
+        val segmentMetadata = context.metadata.getStreamSegmentMetadata(segmentId);
+        createSegmentsInStorage(context);
+        val append1 = new ByteArraySegment(new byte[blockSize / 2]);
+        rnd.nextBytes(append1.array());
+        segmentMetadata.setLength(append1.getLength());
+        context.readIndex.append(segmentId, 0, append1);
+        segmentMetadata.setStorageLength(append1.getLength());
+
+        // Block further cache appends. This will give us time to execute cache eviction.
+        context.cacheStorage.appendReturnBlocker = new ReusableLatch();
+        context.cacheStorage.appendComplete = new ReusableLatch();
+
+        // Initiate append 2. The append should be written to the Cache Storage, but its invocation should block until
+        // we release the above latch.
+        val append2 = new ByteArraySegment(new byte[blockSize - append1.getLength() - 1]);
+        rnd.nextBytes(append2.array());
+        segmentMetadata.setLength(append1.getLength() + append2.getLength());
+        val append2Future = CompletableFuture.runAsync(() -> {
+            try {
+                context.readIndex.append(segmentId, append1.getLength(), append2);
+            } catch (Exception ex) {
+                throw new CompletionException(ex);
+            }
+        }, executorService());
+        context.cacheStorage.appendComplete.await();
+
+        // Execute cache eviction. Append 2 is suspended at the point when we return from the cache call. This is the
+        // closest we can come to simulating eviction racing with appending.
+        val evictionFuture = CompletableFuture.supplyAsync(context.cacheManager::applyCachePolicy, this.executorService());
+
+        // We want to verify that the cache eviction is blocked on the append - they should not run concurrently. The only
+        // "elegant" way of verifying this is by waiting a short amount of time and checking that it didn't execute.
+        AssertExtensions.assertThrows(
+                "Expecting cache eviction to block.",
+                () -> evictionFuture.get(SHORT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS),
+                ex -> ex instanceof TimeoutException);
+
+        // Release the second append, which should not error out.
+        context.cacheStorage.appendReturnBlocker.release();
+        append2Future.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+        // Verify that no cache eviction happened.
+        boolean evicted = evictionFuture.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        Assert.assertFalse("Not expected a cache eviction to happen.", evicted);
+
+        // Validate data read back is as expected.
+        // readDirect() should return an InputStream for the second append range.
+        val readData = context.readIndex.readDirect(segmentId, append1.getLength(), append2.getLength());
+        Assert.assertNotNull("Expected append2 to be read back.", readData);
+        AssertExtensions.assertStreamEquals("Unexpected data read back from append2.", append2.getReader(), readData, append2.getLength());
+
+        // Reading the whole segment should work well too.
+        byte[] allData = new byte[append1.getLength() + append2.getLength()];
+        context.readIndex.read(segmentId, 0, allData.length, TIMEOUT).readRemaining(allData, TIMEOUT);
+        AssertExtensions.assertArrayEquals("Unexpected data read back from segment.", append1.array(), 0, allData, 0, append1.getLength());
+        AssertExtensions.assertArrayEquals("Unexpected data read back from segment.", append2.array(), 0, allData, append1.getLength(), append2.getLength());
     }
 
     //endregion
 
     //region Helpers
 
-    private void checkOffsets(List<CacheKey> removedKeys, long segmentId, int startIndex, int count, int startOffset, int stepIncrease) {
+    private void checkOffsets(List<SegmentOffset> removedKeys, long segmentId, int startIndex, int count, int startOffset, int stepIncrease) {
         int expectedStartOffset = startOffset;
         for (int i = 0; i < count; i++) {
             int listIndex = startIndex + i;
-            CacheKey currentKey = removedKeys.get(startIndex + i);
+            SegmentOffset currentEntry = removedKeys.get(startIndex + i);
             Assert.assertEquals(
                     String.format("Unexpected CacheKey.SegmentOffset at index %d for SegmentId %d.", listIndex, segmentId),
                     expectedStartOffset,
-                    currentKey.getOffset());
+                    currentEntry.offset);
             expectedStartOffset += stepIncrease;
         }
     }
@@ -971,16 +1695,16 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         }
     }
 
-    private void appendData(Collection<Long> segmentIds, HashMap<Long, ByteArrayOutputStream> segmentContents, TestContext context) {
+    private void appendData(Collection<Long> segmentIds, Map<Long, ByteArrayOutputStream> segmentContents, TestContext context) throws Exception {
         appendData(segmentIds, segmentContents, context, null);
     }
 
-    private void appendData(Collection<Long> segmentIds, HashMap<Long, ByteArrayOutputStream> segmentContents, TestContext context, Runnable callback) {
+    private void appendData(Collection<Long> segmentIds, Map<Long, ByteArrayOutputStream> segmentContents, TestContext context, Runnable callback) throws Exception {
         int writeId = 0;
         for (int i = 0; i < APPENDS_PER_SEGMENT; i++) {
             for (long segmentId : segmentIds) {
                 UpdateableSegmentMetadata segmentMetadata = context.metadata.getStreamSegmentMetadata(segmentId);
-                byte[] data = getAppendData(segmentMetadata.getName(), segmentId, i, writeId);
+                ByteArraySegment data = getAppendData(segmentMetadata.getName(), segmentId, i, writeId);
                 writeId++;
 
                 appendSingleWrite(segmentId, data, context);
@@ -992,32 +1716,32 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         }
     }
 
-    private void appendSingleWrite(long segmentId, byte[] data, TestContext context) {
+    private void appendSingleWrite(long segmentId, ByteArraySegment data, TestContext context) throws Exception {
         UpdateableSegmentMetadata segmentMetadata = context.metadata.getStreamSegmentMetadata(segmentId);
 
-        // Make sure we increase the DurableLogLength prior to appending; the ReadIndex checks for this.
-        long offset = segmentMetadata.getDurableLogLength();
-        segmentMetadata.setDurableLogLength(offset + data.length);
+        // Make sure we increase the Length prior to appending; the ReadIndex checks for this.
+        long offset = segmentMetadata.getLength();
+        segmentMetadata.setLength(offset + data.getLength());
         context.readIndex.append(segmentId, offset, data);
     }
 
-    private void appendDataInStorage(TestContext context, HashMap<Long, ByteArrayOutputStream> segmentContents) {
+    private void appendDataInStorage(TestContext context, HashMap<Long, ByteArrayOutputStream> segmentContents) throws IOException {
         int writeId = 0;
         for (int i = 0; i < APPENDS_PER_SEGMENT; i++) {
             for (long segmentId : context.metadata.getAllStreamSegmentIds()) {
                 UpdateableSegmentMetadata sm = context.metadata.getStreamSegmentMetadata(segmentId);
-                byte[] data = getAppendData(sm.getName(), segmentId, i, writeId);
+                ByteArraySegment data = getAppendData(sm.getName(), segmentId, i, writeId);
                 writeId++;
 
-                // Make sure we increase the DurableLogLength prior to appending; the ReadIndex checks for this.
+                // Make sure we increase the Length prior to appending; the ReadIndex checks for this.
                 long offset = context.storage.getStreamSegmentInfo(sm.getName(), TIMEOUT).join().getLength();
                 val handle = context.storage.openWrite(sm.getName()).join();
-                context.storage.write(handle, offset, new ByteArrayInputStream(data), data.length, TIMEOUT).join();
+                context.storage.write(handle, offset, data.getReader(), data.getLength(), TIMEOUT).join();
 
                 // Update metadata appropriately.
-                sm.setStorageLength(offset + data.length);
-                if (sm.getStorageLength() > sm.getDurableLogLength()) {
-                    sm.setDurableLogLength(sm.getStorageLength());
+                sm.setStorageLength(offset + data.getLength());
+                if (sm.getStorageLength() > sm.getLength()) {
+                    sm.setLength(sm.getStorageLength());
                 }
 
                 recordAppend(segmentId, data, segmentContents);
@@ -1025,11 +1749,11 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         }
     }
 
-    private byte[] getAppendData(String segmentName, long segmentId, int segmentAppendSeq, int writeId) {
-        return String.format("SegmentName=%s,SegmentId=_%d,AppendSeq=%d,WriteId=%d", segmentName, segmentId, segmentAppendSeq, writeId).getBytes();
+    private ByteArraySegment getAppendData(String segmentName, long segmentId, int segmentAppendSeq, int writeId) {
+        return new ByteArraySegment(String.format("SegmentName=%s,SegmentId=_%d,AppendSeq=%d,WriteId=%d", segmentName, segmentId, segmentAppendSeq, writeId).getBytes());
     }
 
-    private void completeMergeTransactions(HashMap<Long, ArrayList<Long>> transactionsBySegment, TestContext context) {
+    private void completeMergeTransactions(HashMap<Long, ArrayList<Long>> transactionsBySegment, TestContext context) throws Exception {
         for (Map.Entry<Long, ArrayList<Long>> e : transactionsBySegment.entrySet()) {
             long parentId = e.getKey();
             for (long transactionId : e.getValue()) {
@@ -1056,8 +1780,8 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         transactionMetadata.markSealed();
 
         // Update parent length.
-        long mergeOffset = parentMetadata.getDurableLogLength();
-        parentMetadata.setDurableLogLength(mergeOffset + transactionMetadata.getDurableLogLength());
+        long mergeOffset = parentMetadata.getLength();
+        parentMetadata.setLength(mergeOffset + transactionMetadata.getLength());
 
         // Do the ReadIndex merge.
         context.readIndex.beginMerge(parentMetadata.getId(), mergeOffset, transactionId);
@@ -1066,19 +1790,37 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         transactionMetadata.markMerged();
 
         // Update parent contents.
-        segmentContents.get(parentMetadata.getId()).write(segmentContents.get(transactionId).toByteArray());
-        segmentContents.remove(transactionId);
+        if (segmentContents.containsKey(transactionId)) {
+            segmentContents.get(parentMetadata.getId()).write(segmentContents.get(transactionId).toByteArray());
+            segmentContents.remove(transactionId);
+        }
         return mergeOffset;
     }
 
     private void checkReadIndex(String testId, HashMap<Long, ByteArrayOutputStream> segmentContents, TestContext context) throws Exception {
         for (long segmentId : segmentContents.keySet()) {
-            long segmentLength = context.metadata.getStreamSegmentMetadata(segmentId).getDurableLogLength();
+            long startOffset = context.metadata.getStreamSegmentMetadata(segmentId).getStartOffset();
+            long segmentLength = context.metadata.getStreamSegmentMetadata(segmentId).getLength();
             byte[] expectedData = segmentContents.get(segmentId).toByteArray();
 
-            long expectedCurrentOffset = 0;
+            if (startOffset > 0) {
+                @Cleanup
+                ReadResult truncatedResult = context.readIndex.read(segmentId, 0, 1, TIMEOUT);
+                val first = truncatedResult.next();
+                Assert.assertEquals("Read request for a truncated offset did not start with a Truncated ReadResultEntryType.",
+                        ReadResultEntryType.Truncated, first.getType());
+                AssertExtensions.assertSuppliedFutureThrows(
+                        "Truncate ReadResultEntryType did not throw when getContent() was invoked.",
+                        () -> {
+                            first.requestContent(TIMEOUT);
+                            return first.getContent();
+                        },
+                        ex -> ex instanceof StreamSegmentTruncatedException);
+            }
+
+            long expectedCurrentOffset = startOffset;
             @Cleanup
-            ReadResult readResult = context.readIndex.read(segmentId, expectedCurrentOffset, (int) segmentLength, TIMEOUT);
+            ReadResult readResult = context.readIndex.read(segmentId, expectedCurrentOffset, (int) (segmentLength - expectedCurrentOffset), TIMEOUT);
             Assert.assertTrue(testId + ": Empty read result for segment " + segmentId, readResult.hasNext());
 
             while (readResult.hasNext()) {
@@ -1104,24 +1846,45 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
                 AssertExtensions.assertArrayEquals(testId + ": Unexpected data read from segment " + segmentId + " at offset " + expectedCurrentOffset, expectedData, (int) expectedCurrentOffset, actualData, 0, readEntryContents.getLength());
 
                 expectedCurrentOffset += readEntryContents.getLength();
+                if (readEntry.getType() == ReadResultEntryType.Storage) {
+                    AssertExtensions.assertLessThanOrEqual("Misaligned storage read.",
+                            context.maxExpectedStorageReadLength, readEntryContents.getLength());
+                }
             }
 
             Assert.assertTrue(testId + ": ReadResult was not closed post-full-consumption for segment" + segmentId, readResult.isClosed());
         }
     }
 
-    private <T> void recordAppend(T segmentIdentifier, byte[] data, HashMap<T, ByteArrayOutputStream> segmentContents) {
+    private void checkReadIndexDirect(HashMap<Long, ByteArrayOutputStream> segmentContents, TestContext context) throws Exception {
+        for (long segmentId : segmentContents.keySet()) {
+            val sm = context.metadata.getStreamSegmentMetadata(segmentId);
+            long segmentLength = sm.getLength();
+            long startOffset = Math.min(sm.getStartOffset(), sm.getStorageLength());
+            byte[] expectedData = segmentContents.get(segmentId).toByteArray();
+
+            if (startOffset > 0) {
+                AssertExtensions.assertThrows(
+                        "Read request for a truncated offset was not rejected.",
+                        () -> context.readIndex.readDirect(segmentId, 0, 1),
+                        ex -> ex instanceof IllegalArgumentException);
+            }
+
+            int readLength = (int) (segmentLength - startOffset);
+            InputStream readData = context.readIndex.readDirect(segmentId, startOffset, readLength);
+            byte[] actualData = StreamHelpers.readAll(readData, readLength);
+            AssertExtensions.assertArrayEquals("Unexpected data read.", expectedData, (int) startOffset, actualData, 0, actualData.length);
+        }
+    }
+
+    private <T> void recordAppend(T segmentIdentifier, ByteArraySegment data, Map<T, ByteArrayOutputStream> segmentContents) throws IOException {
         ByteArrayOutputStream contents = segmentContents.getOrDefault(segmentIdentifier, null);
         if (contents == null) {
             contents = new ByteArrayOutputStream();
             segmentContents.put(segmentIdentifier, contents);
         }
 
-        try {
-            contents.write(data);
-        } catch (IOException ex) {
-            Assert.fail(ex.toString());
-        }
+        data.copyTo(contents);
     }
 
     private ArrayList<Long> createSegments(TestContext context) {
@@ -1133,7 +1896,7 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         return segmentIds;
     }
 
-    private long createSegment(int id, TestContext context) {
+    private long createSegment(long id, TestContext context) {
         String name = getSegmentName(id);
         context.metadata.mapStreamSegmentId(name, id);
         initializeSegment(id, context);
@@ -1151,10 +1914,9 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         for (long parentId : segmentIds) {
             ArrayList<Long> segmentTransactions = new ArrayList<>();
             transactions.put(parentId, segmentTransactions);
-            SegmentMetadata parentMetadata = context.metadata.getStreamSegmentMetadata(parentId);
 
             for (int i = 0; i < transactionsPerSegment; i++) {
-                segmentTransactions.add(createTransaction(parentMetadata, transactionId, context));
+                segmentTransactions.add(createTransaction(transactionId, context));
                 transactionId++;
             }
         }
@@ -1162,21 +1924,33 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         return transactions;
     }
 
-    private long createTransaction(SegmentMetadata parentMetadata, long transactionId, TestContext context) {
-        String transactionName = StreamSegmentNameUtils.getTransactionNameFromId(parentMetadata.getName(), UUID.randomUUID());
-        context.metadata.mapStreamSegmentId(transactionName, transactionId, parentMetadata.getId());
+    private long createTransaction(long transactionId, TestContext context) {
+        String transactionName = "Txn" + UUID.randomUUID().toString();
+        context.metadata.mapStreamSegmentId(transactionName, transactionId);
         initializeSegment(transactionId, context);
         return transactionId;
     }
 
-    private String getSegmentName(int id) {
+    private String getSegmentName(long id) {
         return "Segment_" + id;
     }
 
     private void initializeSegment(long segmentId, TestContext context) {
         UpdateableSegmentMetadata metadata = context.metadata.getStreamSegmentMetadata(segmentId);
-        metadata.setDurableLogLength(0);
+        metadata.setLength(0);
         metadata.setStorageLength(0);
+    }
+
+    private void markInactive(long segmentId, TestContext context) {
+        ((StreamSegmentMetadata) context.metadata.getStreamSegmentMetadata(segmentId)).markInactive();
+    }
+
+    private void evict(long segmentId, TestContext context) {
+        val candidates = Collections.singleton((SegmentMetadata) context.metadata.getStreamSegmentMetadata(segmentId));
+        val em = (EvictableMetadata) context.metadata;
+        val sn = context.metadata.getOperationSequenceNumber() + 1;
+        context.metadata.removeTruncationMarkers(sn);
+        em.cleanup(candidates, sn);
     }
 
     //endregion
@@ -1187,66 +1961,133 @@ public class ContainerReadIndexTests extends ThreadPooledTestSuite {
         final UpdateableContainerMetadata metadata;
         final ContainerReadIndex readIndex;
         final TestCacheManager cacheManager;
-        final TestCacheFactory cacheFactory;
-        final Storage storage;
+        final TestCacheStorage cacheStorage;
+        final TestStorage storage;
+        final int maxExpectedStorageReadLength;
 
         TestContext() {
-            this(DEFAULT_CONFIG, DEFAULT_CONFIG.getCachePolicy());
+            this(DEFAULT_CONFIG, CachePolicy.INFINITE);
         }
 
         TestContext(ReadIndexConfig readIndexConfig, CachePolicy cachePolicy) {
-            this.cacheFactory = new TestCacheFactory();
+            this.cacheStorage = new TestCacheStorage(Integer.MAX_VALUE);
             this.metadata = new MetadataBuilder(CONTAINER_ID).build();
-            this.storage = new InMemoryStorage();
+            this.storage = new TestStorage(new InMemoryStorage(), executorService());
             this.storage.initialize(1);
-            this.cacheManager = new TestCacheManager(cachePolicy, executorService());
-            this.readIndex = new ContainerReadIndex(readIndexConfig, this.metadata, this.cacheFactory, this.storage, this.cacheManager, executorService());
+            this.cacheManager = new TestCacheManager(cachePolicy, this.cacheStorage, executorService());
+            this.readIndex = new ContainerReadIndex(readIndexConfig, this.metadata, this.storage, this.cacheManager, executorService());
+            this.maxExpectedStorageReadLength = calculateMaxStorageReadLength();
+        }
+
+        private int calculateMaxStorageReadLength() {
+            int a = this.cacheManager.getCacheStorage().getBlockAlignment();
+            return DEFAULT_CONFIG.getStorageReadAlignment() +
+                    (DEFAULT_CONFIG.getStorageReadAlignment() % a == 0 ? 0 : a - DEFAULT_CONFIG.getStorageReadAlignment() % a);
         }
 
         @Override
+        @SneakyThrows
         public void close() {
             this.readIndex.close();
-            this.cacheFactory.close();
+            AssertExtensions.assertEventuallyEquals("MEMORY LEAK: Read Index did not delete all CacheStorage entries after closing.",
+                    0L, () -> this.cacheStorage.getState().getStoredBytes(), 10, TIMEOUT.toMillis());
             this.storage.close();
             this.cacheManager.close();
+            this.cacheStorage.close();
         }
     }
 
     //endregion
 
-    //region TestCache
+    //region TestCacheStorage
 
-    private static class TestCache extends InMemoryCache {
-        Consumer<CacheKey> removeCallback;
+    private static class TestCacheStorage extends DirectMemoryCache {
+        Consumer<Integer> insertCallback;
+        Consumer<Integer> deleteCallback;
+        boolean disableAppends;
+        boolean usedBytesSameAsStoredBytes;
+        ReusableLatch appendComplete; // If set, will invoke ReusableLatch.release() when append is done (before appendReturnBlocker).
+        ReusableLatch appendReturnBlocker; // If set, blocks append calls from returning AFTER the append has been executed.
+        @Getter
+        int maxEntryLength;
 
-        TestCache(String id) {
-            super(id);
+        TestCacheStorage(long maxSizeBytes) {
+            super(maxSizeBytes);
+            this.maxEntryLength = super.getMaxEntryLength();
         }
 
         @Override
-        public void remove(Cache.Key key) {
-            Consumer<CacheKey> callback = this.removeCallback;
+        public int getAppendableLength(int currentLength) {
+            return this.disableAppends ? 0 : super.getAppendableLength(currentLength);
+        }
+
+        @Override
+        public int insert(BufferView data) {
+            int r = super.insert(data);
+            Consumer<Integer> callback = this.insertCallback;
             if (callback != null) {
-                callback.accept((CacheKey) key);
+                callback.accept(r);
             }
 
-            super.remove(key);
-        }
-    }
-
-    private static class TestCacheFactory implements CacheFactory {
-        final TestCache cache = new TestCache("Test");
-
-        @Override
-        public Cache getCache(String id) {
-            return this.cache;
+            return r;
         }
 
         @Override
-        public void close() {
-            this.cache.close();
+        public int append(int address, int expectedLength, BufferView data) {
+            if (this.disableAppends) {
+                return 0;
+            }
+
+            int result = super.append(address, expectedLength, data);
+
+            ReusableLatch complete = this.appendComplete;
+            if (complete != null) {
+                complete.release();
+            }
+
+            // Blocker hits after the append is done.
+            ReusableLatch blocker = this.appendReturnBlocker;
+            if (blocker != null) {
+                blocker.awaitUninterruptibly();
+            }
+
+            return result;
+        }
+
+        @Override
+        public void delete(int address) {
+            super.delete(address);
+            Consumer<Integer> callback = this.deleteCallback;
+            if (callback != null) {
+                callback.accept(address);
+            }
+        }
+
+        @Override
+        public CacheState getState() {
+            val s = super.getState();
+            if (this.usedBytesSameAsStoredBytes) {
+                return new CacheState(s.getStoredBytes(), s.getStoredBytes(), s.getReservedBytes(), s.getAllocatedBytes(), s.getMaxBytes());
+            } else {
+                return s;
+            }
         }
     }
 
     //endregion
+
+    //region SegmentOffset
+
+    @RequiredArgsConstructor
+    private static class SegmentOffset {
+        final long segmentId;
+        final long offset;
+    }
+
+    //endregion
+
+    @FunctionalInterface
+    private interface BiConsumerWithException<T, U> {
+        void accept(T var1, U var2) throws Exception;
+    }
 }

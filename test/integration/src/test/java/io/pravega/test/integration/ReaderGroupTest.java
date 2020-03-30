@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,24 +9,24 @@
  */
 package io.pravega.test.integration;
 
-import io.pravega.client.ClientFactory;
-import io.pravega.segmentstore.contracts.StreamSegmentStore;
-import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
-import io.pravega.segmentstore.server.store.ServiceBuilder;
-import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
+import io.pravega.client.EventStreamClientFactory;
 import io.pravega.client.stream.EventStreamReader;
 import io.pravega.client.stream.EventStreamWriter;
 import io.pravega.client.stream.EventWriterConfig;
 import io.pravega.client.stream.ReaderConfig;
 import io.pravega.client.stream.ReaderGroupConfig;
 import io.pravega.client.stream.ScalingPolicy;
-import io.pravega.client.stream.Sequence;
+import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
 import io.pravega.client.stream.impl.JavaSerializer;
 import io.pravega.client.stream.mock.MockClientFactory;
 import io.pravega.client.stream.mock.MockStreamManager;
+import io.pravega.segmentstore.contracts.StreamSegmentStore;
+import io.pravega.segmentstore.contracts.tables.TableStore;
+import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
+import io.pravega.segmentstore.server.store.ServiceBuilder;
+import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
 import io.pravega.test.common.TestUtils;
-import java.util.Collections;
 import java.util.concurrent.atomic.AtomicReference;
 import lombok.Cleanup;
 import lombok.Data;
@@ -43,7 +43,7 @@ public class ReaderGroupTest {
         private static final int READ_TIMEOUT = 60000;
         private final int eventsToRead;
         private final String readerId;
-        private final ClientFactory clientFactory;
+        private final EventStreamClientFactory clientFactory;
         private final AtomicReference<Exception> exception = new AtomicReference<>(null);
 
         @Override
@@ -75,23 +75,25 @@ public class ReaderGroupTest {
         ServiceBuilder serviceBuilder = ServiceBuilder.newInMemoryBuilder(ServiceBuilderConfig.getDefaultConfig());
         serviceBuilder.initialize();
         StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
+        TableStore tableStore = serviceBuilder.createTableStoreService();
         @Cleanup
-        PravegaConnectionListener server = new PravegaConnectionListener(false, servicePort, store);
+        PravegaConnectionListener server = new PravegaConnectionListener(false, servicePort, store, tableStore);
         server.startListening();
 
         @Cleanup
         MockStreamManager streamManager = new MockStreamManager(SCOPE, endpoint, servicePort);
         streamManager.createScope(SCOPE);
         streamManager.createStream(SCOPE, STREAM_NAME, StreamConfiguration.builder()
-                                                                   .scope(SCOPE)
-                                                                   .streamName(STREAM_NAME)
                                                                    .scalingPolicy(ScalingPolicy.fixed(2))
                                                                    .build());
         @Cleanup
         MockClientFactory clientFactory = streamManager.getClientFactory();
 
-        ReaderGroupConfig groupConfig = ReaderGroupConfig.builder().startingPosition(Sequence.MIN_VALUE).build();
-        streamManager.createReaderGroup(READER_GROUP, groupConfig, Collections.singleton(STREAM_NAME));
+        ReaderGroupConfig groupConfig = ReaderGroupConfig.builder()
+                                                         .automaticCheckpointIntervalMillis(-1)
+                                                         .stream(Stream.of(SCOPE, STREAM_NAME))
+                                                         .build();
+        streamManager.createReaderGroup(READER_GROUP, groupConfig);
 
         writeEvents(100, clientFactory);
         ReaderThread r1 = new ReaderThread(20, "Reader1", clientFactory);
@@ -108,9 +110,10 @@ public class ReaderGroupTest {
         if (r2.exception.get() != null) {
             throw r2.exception.get();
         }
+        streamManager.deleteReaderGroup(READER_GROUP);
     }
     
-    @Test
+    @Test(timeout = 10000)
     public void testMultiSegmentsPerReader() throws Exception {
         String endpoint = "localhost";
         int servicePort = TestUtils.getAvailableListenPort();
@@ -118,29 +121,33 @@ public class ReaderGroupTest {
         ServiceBuilder serviceBuilder = ServiceBuilder.newInMemoryBuilder(ServiceBuilderConfig.getDefaultConfig());
         serviceBuilder.initialize();
         StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
+        TableStore tableStore = serviceBuilder.createTableStoreService();
+
         @Cleanup
-        PravegaConnectionListener server = new PravegaConnectionListener(false, servicePort, store);
+        PravegaConnectionListener server = new PravegaConnectionListener(false, servicePort, store, tableStore);
         server.startListening();
 
         @Cleanup
         MockStreamManager streamManager = new MockStreamManager(SCOPE, endpoint, servicePort);
         streamManager.createScope(SCOPE);
         streamManager.createStream(SCOPE, STREAM_NAME, StreamConfiguration.builder()
-                                                                   .scope(SCOPE)
-                                                                   .streamName(STREAM_NAME)
                                                                    .scalingPolicy(ScalingPolicy.fixed(2))
                                                                    .build());
         @Cleanup
         MockClientFactory clientFactory = streamManager.getClientFactory();
 
-        ReaderGroupConfig groupConfig = ReaderGroupConfig.builder().startingPosition(Sequence.MIN_VALUE).build();
-        streamManager.createReaderGroup(READER_GROUP, groupConfig, Collections.singleton(STREAM_NAME));
+        ReaderGroupConfig groupConfig = ReaderGroupConfig.builder()
+                                                         .automaticCheckpointIntervalMillis(-1)
+                                                         .stream(Stream.of(SCOPE, STREAM_NAME))
+                                                         .build();
+        streamManager.createReaderGroup(READER_GROUP, groupConfig);
 
         writeEvents(100, clientFactory);
         new ReaderThread(100, "Reader", clientFactory).run();
+        streamManager.deleteReaderGroup(READER_GROUP);
     }
     
-    public void writeEvents(int eventsToWrite, ClientFactory clientFactory) {
+    public void writeEvents(int eventsToWrite, EventStreamClientFactory clientFactory) {
         @Cleanup
         EventStreamWriter<String> writer = clientFactory.createEventWriter(STREAM_NAME,
                                                                            new JavaSerializer<>(),

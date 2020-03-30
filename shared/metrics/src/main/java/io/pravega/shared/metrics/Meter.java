@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@ package io.pravega.shared.metrics;
 /**
  * A meter metric which measures mean throughput and exponentially-weighted moving average throughput.
  */
-public interface Meter {
+public interface Meter extends Metric {
     /**
      * Record the occurrence of an event in Meter.
      */
@@ -26,16 +26,9 @@ public interface Meter {
     void recordEvents(long n);
 
     /**
-     * Returns the number of events which have been marked.
+     * Returns the total number of events which have been marked.
      *
      * @return the count
      */
     long getCount();
-
-    /**
-     * Gets name.
-     *
-     * @return the name of Gauge
-     */
-    String getName();
 }

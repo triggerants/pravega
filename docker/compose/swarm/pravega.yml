@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+# Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,8 +24,14 @@ services:
       - "10080:10080"
     environment:
       WAIT_FOR: ${ZK_URL:-zookeeper:2181}
-      ZK_URL: ${ZK_URL:-zookeeper:2181}
-      JAVA_OPTS: -Dconfig.controller.metricenableCSVReporter=false -Xmx512m
+      JAVA_OPTS: |
+        -Dcontroller.zk.url=${ZK_URL:-zookeeper:2181}
+        -Dconfig.controller.metricenableCSVReporter=false
+        -Xmx512m
+        -XX:OnError="kill -9 p%"
+        -XX:+ExitOnOutOfMemoryError
+        -XX:+CrashOnOutOfMemoryError
+        -XX:+HeapDumpOnOutOfMemoryError
 
   segmentstore:
     image: pravega/pravega
@@ -35,6 +41,19 @@ services:
     environment:
       WAIT_FOR: bookkeeper:3181,${HDFS_URL:-hdfs:8020}
       HDFS_URL: hdfs://${HDFS_URL:-hdfs:8020}
+      TIER2_STORAGE: HDFS
+      HDFS_REPLICATION: 1
       ZK_URL: ${ZK_URL:-zookeeper:2181}
       CONTROLLER_URL: tcp://controller:9090
-      JAVA_OPTS: -Dmetrics.enableCSVReporter=false -Dpravegaservice.publishedIPAddress=${PUBLISHED_ADDRESS} -Dpravegaservice.listeningIPAddress=${LISTENING_ADDRESS} -Xmx900m
+      JAVA_OPTS: |
+        -Dmetrics.enableCSVReporter=false
+        -Dpravegaservice.publishedIPAddress=${PUBLISHED_ADDRESS}
+        -Dpravegaservice.listeningIPAddress=${LISTENING_ADDRESS}
+        -Dbookkeeper.bkEnsembleSize=2
+        -Dbookkeeper.bkAckQuorumSize=2
+        -Dbookkeeper.bkWriteQuorumSize=2
+        -Xmx900m
+        -XX:OnError="kill -9 p%"
+        -XX:+ExitOnOutOfMemoryError
+        -XX:+CrashOnOutOfMemoryError
+        -XX:+HeapDumpOnOutOfMemoryError

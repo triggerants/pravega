@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,11 +9,17 @@
  */
 package io.pravega.segmentstore.server.writer;
 
+import io.pravega.segmentstore.contracts.Attributes;
+import io.pravega.segmentstore.contracts.BadAttributeUpdateException;
+import io.pravega.segmentstore.contracts.StreamSegmentNotExistsException;
+import io.pravega.segmentstore.server.SegmentMetadata;
 import io.pravega.segmentstore.server.UpdateableSegmentMetadata;
 import io.pravega.segmentstore.server.logs.operations.Operation;
 import java.io.InputStream;
 import java.time.Duration;
 import java.util.Iterator;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -36,6 +42,55 @@ interface WriterDataSource {
     CompletableFuture<Void> acknowledge(long upToSequence, Duration timeout);
 
     /**
+     * Instructs the Data Source to durably persist the given Attributes, which have been collected for recently flushed
+     * appends.
+     *
+     * @param streamSegmentId The Id of the StreamSegment to persist for.
+     * @param attributes      The Attributes to persist (Key=AttributeId, Value=Attribute Value).
+     * @param timeout         Timeout for the operation.
+     * @return A CompletableFuture that, when completed, will indicate that the operation completed and contain a value
+     * that would need to be passed to {@link #notifyAttributesPersisted}. If the operation failed, this Future
+     * will complete with the appropriate exception.
+     */
+    CompletableFuture<Long> persistAttributes(long streamSegmentId, Map<UUID, Long> attributes, Duration timeout);
+
+    /**
+     * Indicates that a batch of Attributes for a Segment have been durably persisted in Storage (after an invocation of
+     * {@link #persistAttributes}) and updates the required Segment's Core Attributes to keep track of the state.
+     * of the current
+     *
+     * @param segmentId          The Id of the Segment to persist for.
+     * @param rootPointer        The Root Pointer to set as {@link Attributes#ATTRIBUTE_SEGMENT_ROOT_POINTER} for the segment.
+     * @param lastSequenceNumber The Sequence number of the last Operation that updated attributes. This will be set as
+     *                           {@link Attributes#ATTRIBUTE_SEGMENT_PERSIST_SEQ_NO} for the segment.
+     * @param timeout            Timeout for the operation.
+     * @return A CompletableFuture that, when completed, will indicate that the operation completed. If the operation
+     * failed, this Future will complete with the appropriate exception. Notable exceptions:
+     * - {@link BadAttributeUpdateException}: If the rootPointer is less than the current value for {@link Attributes#ATTRIBUTE_SEGMENT_ROOT_POINTER}.
+     */
+    CompletableFuture<Void> notifyAttributesPersisted(long segmentId, long rootPointer, long lastSequenceNumber, Duration timeout);
+
+    /**
+     * Instructs the DataSource to seal and compact the Attribute Index for the given Segment.
+     *
+     * @param streamSegmentId The Id of the StreamSegment to seal Attributes for.
+     * @param timeout         Timeout for the operation.
+     * @return A CompletableFuture that, when completed, will indicate that the operation completed. If the operation
+     * failed, the Future will complete with the appropriate exception.
+     */
+    CompletableFuture<Void> sealAttributes(long streamSegmentId, Duration timeout);
+
+    /**
+     * Instructs the DataSource to delete the Attribute Index for the given Segment.
+     *
+     * @param segmentMetadata The metadata for the Segment to delete attributes for.
+     * @param timeout         Timeout for the operation.
+     * @return A CompletableFuture that, when completed, will indicate that the operation completed. If the operation
+     * failed, the Future will complete with the appropriate exception.
+     */
+    CompletableFuture<Void> deleteAllAttributes(SegmentMetadata segmentMetadata, Duration timeout);
+
+    /**
      * Reads a number of entries from the Data Source.
      *
      * @param afterSequence The Sequence of the last entry before the first one to read.
@@ -51,8 +106,9 @@ interface WriterDataSource {
      *
      * @param targetStreamSegmentId The Id of the StreamSegment to merge into.
      * @param sourceStreamSegmentId The Id of the StreamSegment to merge.
+     * @throws StreamSegmentNotExistsException If targetStreamSegmentId is mapped to a Segment that is marked as Deleted.
      */
-    void completeMerge(long targetStreamSegmentId, long sourceStreamSegmentId);
+    void completeMerge(long targetStreamSegmentId, long sourceStreamSegmentId) throws StreamSegmentNotExistsException;
 
     /**
      * Gets an InputStream representing uncommitted data in a Segment.
@@ -78,13 +134,6 @@ interface WriterDataSource {
      * @param operationSequenceNumber The Sequence number to query.
      */
     long getClosestValidTruncationPoint(long operationSequenceNumber);
-
-    /**
-     * Marks the StreamSegment as deleted in the Container Metadata.
-     *
-     * @param streamSegmentName The name of the StreamSegment to delete.
-     */
-    void deleteStreamSegment(String streamSegmentName);
 
     /**
      * Gets the StreamSegmentMetadata mapped to the given StreamSegment Id.

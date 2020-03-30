@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,11 +9,9 @@
  */
 package io.pravega.segmentstore.server.store;
 
-import io.pravega.segmentstore.storage.Storage;
 import io.pravega.segmentstore.storage.mocks.InMemoryDurableDataLogFactory;
 import io.pravega.segmentstore.storage.mocks.InMemoryStorageFactory;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.atomic.AtomicReference;
 import org.junit.After;
 import org.junit.Before;
 
@@ -44,13 +42,13 @@ public class StreamSegmentServiceTests extends StreamSegmentStoreTestBase {
     }
 
     @Override
-    protected synchronized ServiceBuilder createBuilder(ServiceBuilderConfig builderConfig, AtomicReference<Storage> storage) {
-        return ServiceBuilder.newInMemoryBuilder(builderConfig)
-                             .withStorageFactory(setup -> new ListenableStorageFactory(this.storageFactory, storage::set))
+    protected ServiceBuilder createBuilder(ServiceBuilderConfig.Builder builderConfig, int instanceId) {
+        return ServiceBuilder.newInMemoryBuilder(builderConfig.build())
+                             .withStorageFactory(setup -> this.storageFactory)
                              .withDataLogFactory(setup -> this.durableDataLogFactory);
     }
 
-    private static class PermanentDurableDataLogFactory extends InMemoryDurableDataLogFactory {
+    public static class PermanentDurableDataLogFactory extends InMemoryDurableDataLogFactory {
         PermanentDurableDataLogFactory(ScheduledExecutorService executorService) {
             super(executorService);
         }

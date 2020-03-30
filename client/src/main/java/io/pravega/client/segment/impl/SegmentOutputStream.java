@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -11,7 +11,7 @@ package io.pravega.client.segment.impl;
 
 import io.pravega.client.stream.impl.PendingEvent;
 
-import java.util.Collection;
+import java.util.List;
 
 /**
  * Defines an OutputStream for a segment.
@@ -27,21 +27,17 @@ public interface SegmentOutputStream extends AutoCloseable {
     public abstract String getSegmentName();
     
     /**
-     * Writes the provided data to the SegmentOutputStream. If
-     * {@link PendingEvent#getExpectedOffset()} the data will be written only if the
-     * SegmentOutputStream is currently of expectedLength.
+     * Writes the provided data to the SegmentOutputStream.
      * 
      * The associated callback will be invoked when the operation is complete.
      * 
      * @param event The event to be added to the segment.
-     * @throws SegmentSealedException If the segment is closed for modifications.
      */
-    public abstract void write(PendingEvent event) throws SegmentSealedException;
+    public abstract void write(PendingEvent event);
 
     /**
      * Flushes and then closes the output stream.
      * Frees any resources associated with it.
-     *
      * @throws SegmentSealedException If the segment is closed for modifications.
      */
     @Override
@@ -49,14 +45,24 @@ public interface SegmentOutputStream extends AutoCloseable {
 
     /**
      * Block on all writes that have not yet completed.
-     *
      * @throws SegmentSealedException If the segment is closed for modifications.
      */
     public abstract void flush() throws SegmentSealedException;
 
     /**
-     * Returns a collection of all the events that have been passed to write but have not yet been
-     * acknowledged as written. The iteration order in the collection is from oldest to newest.
+     * Change the state of SegmentOutputStream to sealed to prevent future writes and return the list of unackedEvents.
+     * This is invoked by the segmentSealed callback to fetch the unackedEvents to be resent to the right
+     * SegmentOutputStreams.
+     *
+     * @return List of all the events that have been passed to write but have not yet been
+     * acknowledged as written. The iteration order in the List is from oldest to newest.
      */
-    public abstract Collection<PendingEvent> getUnackedEvents();
+    public abstract List<PendingEvent> getUnackedEventsOnSeal();
+    
+    /**
+     * This returns the write offset of a segment that was most recently observed from an Ack.
+     * This may not be the same as the current write offset. 
+     * If no acks have been observed on this segment it returns -1. 
+     */
+    public abstract long getLastObservedWriteOffset();
 }

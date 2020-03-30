@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@ import java.time.Duration;
  * Provides a customizable way of measuring elapsed time.
  */
 public abstract class AbstractTimer {
-    protected static final int NANOS_TO_MILLIS = 1000 * 1000;
+    public static final int NANOS_TO_MILLIS = 1000 * 1000;
 
     /**
      * Gets the elapsed time, in nanoseconds.

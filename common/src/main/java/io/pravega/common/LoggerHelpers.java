@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -108,6 +108,22 @@ public final class LoggerHelpers {
             log.trace("LEAVE {}::{}@{} (elapsed={}us).", context, method, traceEnterId, ELAPSED_MICRO.apply(traceEnterId));
         } else {
             log.trace("LEAVE {}::{}@{} {} (elapsed={}us).", context, method, traceEnterId, args, ELAPSED_MICRO.apply(traceEnterId));
+        }
+    }
+
+    /**
+     * Returns either the given {@link Throwable} or its message, depending on the current logging context.
+     *
+     * @param log The {@link Logger} to query.
+     * @param e   The {@link Throwable} to return or process.
+     * @return The given {@link Throwable}, if {@link Logger#isDebugEnabled()} is true for log, or {@link Throwable#toString()}
+     * otherwise (which should output only the name of the exception).
+     */
+    public static Object exceptionSummary(Logger log, Throwable e) {
+        if (log.isDebugEnabled()) {
+            return e;
+        } else {
+            return e.toString();
         }
     }
 }

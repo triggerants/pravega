@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,12 +9,12 @@
  */
 package io.pravega.segmentstore.server;
 
+import io.pravega.common.util.BufferView;
 import io.pravega.segmentstore.contracts.ReadResult;
-
+import io.pravega.segmentstore.contracts.StreamSegmentNotExistsException;
 import java.io.InputStream;
 import java.time.Duration;
 import java.util.Collection;
-import java.util.Iterator;
 
 /**
  * Defines a ReadIndex for StreamSegments, that allows adding data only at the end.
@@ -27,39 +27,42 @@ public interface ReadIndex extends AutoCloseable {
      * @param offset          The offset in the StreamSegment where to write this append. The offset must be at the end
      *                        of the StreamSegment as it exists in the ReadIndex.
      * @param data            The data to append.
+     * @throws StreamSegmentNotExistsException If streamSegmentId is mapped to a Segment that is marked as Deleted.
      * @throws IllegalArgumentException If the offset does not match the expected value (end of StreamSegment in ReadIndex).
-     * @throws IllegalArgumentException If the offset + data.length exceeds the metadata DurableLogLength of the StreamSegment.
+     * @throws IllegalArgumentException If the offset + data.length exceeds the metadata Length of the StreamSegment.
      */
-    void append(long streamSegmentId, long offset, byte[] data);
+    void append(long streamSegmentId, long offset, BufferView data) throws StreamSegmentNotExistsException;
 
     /**
      * Executes Step 1 of the 2-Step Merge Process.
      * <ol>
-     * <li>Step 1: The StreamSegments are merged (Source->Target@Offset) in Metadata and a ReadIndex Redirection is put in place.
+     * <li>Step 1: The StreamSegments are merged (Source-$gt;Target@Offset) in Metadata and a ReadIndex Redirection is put in place.
      * At this stage, the Source still exists as a physical object in Storage, and we need to keep its ReadIndex around, pointing
-     * to the old object.
+     * to the old object. </li>
      * <li>Step 2: The StreamSegments are physically merged in the Storage. The Source StreamSegment does not exist anymore.
-     * The ReadIndex entries of the two Streams are actually joined together.
+     * The ReadIndex entries of the two Streams are actually joined together. </li>
      * </ol>
      *
      * @param targetStreamSegmentId The Id of the StreamSegment to merge into.
      * @param offset                The offset in the Target StreamSegment where to merge the Source StreamSegment.
      *                              The offset must be at the end of the StreamSegment as it exists in the ReadIndex.
      * @param sourceStreamSegmentId The Id of the StreamSegment to merge.
+     * @throws StreamSegmentNotExistsException If sourceStreamSegmentId is mapped to a Segment that is marked as Deleted.
      * @throws IllegalArgumentException If the offset does not match the expected value (end of StreamSegment in ReadIndex).
-     * @throws IllegalArgumentException If the offset + SourceStreamSegment.length exceeds the metadata DurableLogLength
+     * @throws IllegalArgumentException If the offset + SourceStreamSegment.length exceeds the metadata Length
      *                                  of the target StreamSegment.
      */
-    void beginMerge(long targetStreamSegmentId, long offset, long sourceStreamSegmentId);
+    void beginMerge(long targetStreamSegmentId, long offset, long sourceStreamSegmentId) throws StreamSegmentNotExistsException;
 
     /**
      * Executes Step 2 of the 2-Step Merge Process. See 'beginMerge' for the description of the Merge Process.
      *
      * @param targetStreamSegmentId The Id of the StreamSegment to merge into.
      * @param sourceStreamSegmentId The Id of the StreamSegment to merge.
+     * @throws StreamSegmentNotExistsException If targetStreamSegmentId is mapped to a Segment that is marked as Deleted.
      * @throws IllegalArgumentException If the 'beginMerge' method was not called for the pair before.
      */
-    void completeMerge(long targetStreamSegmentId, long sourceStreamSegmentId);
+    void completeMerge(long targetStreamSegmentId, long sourceStreamSegmentId) throws StreamSegmentNotExistsException;
 
     /**
      * Reads a contiguous sequence of bytes of the given length starting at the given offset from the given Segment.
@@ -81,10 +84,11 @@ public interface ReadIndex extends AutoCloseable {
      * @param startOffset     The offset in the StreamSegment where to start reading.
      * @param length          The number of bytes to read.
      * @return An InputStream containing the requested data, or null if all of the conditions of this read cannot be met.
+     * @throws StreamSegmentNotExistsException If streamSegmentId is mapped to a Segment that is marked as Deleted.
      * @throws IllegalStateException    If the read index is in recovery mode.
      * @throws IllegalArgumentException If the parameters are invalid (offset, length or offset+length are not in the Segment's range).
      */
-    InputStream readDirect(long streamSegmentId, long startOffset, int length);
+    InputStream readDirect(long streamSegmentId, long startOffset, int length) throws StreamSegmentNotExistsException;
 
     /**
      * Reads a number of bytes from the StreamSegment ReadIndex.
@@ -93,9 +97,10 @@ public interface ReadIndex extends AutoCloseable {
      * @param offset          The offset in the StreamSegment where to start reading from.
      * @param maxLength       The maximum number of bytes to read.
      * @param timeout         Timeout for the operation.
+     * @throws StreamSegmentNotExistsException If streamSegmentId is mapped to a Segment that is marked as Deleted.
      * @return A ReadResult containing the data to be read.
      */
-    ReadResult read(long streamSegmentId, long offset, int maxLength, Duration timeout);
+    ReadResult read(long streamSegmentId, long offset, int maxLength, Duration timeout) throws StreamSegmentNotExistsException;
 
     /**
      * Triggers all eligible pending Future Reads for the given StreamSegmentIds.
@@ -116,10 +121,10 @@ public interface ReadIndex extends AutoCloseable {
      * Removes all internal indices that point to the given StreamSegments, but only if they are marked as Deleted in
      * the metadata or missing metadata altogether (i.e., they have been recycled).
      *
-     * @param segmentIds An Iterator of SegmentIds for the Segments to clean up. If this is null, then all the Segment Ids
+     * @param segmentIds A Collection of SegmentIds for the Segments to clean up. If this is null, then all the Segment Ids
      *                   registered in this ReadIndex are eligible for removal.
      */
-    void cleanup(Iterator<Long> segmentIds);
+    void cleanup(Collection<Long> segmentIds);
 
     /**
      * Puts the ReadIndex in Recovery Mode. Some operations may not be available in Recovery Mode.
@@ -143,6 +148,14 @@ public interface ReadIndex extends AutoCloseable {
      *                                 the Read Index or it has conflicting information about it.
      */
     void exitRecoveryMode(boolean successfulRecovery) throws DataCorruptionException;
+
+    /**
+     * Gets the {@link CacheUtilizationProvider} shared across all Segment Containers hosted in this process that can
+     * be used to query the Cache State.
+     *
+     * @return The {@link CacheUtilizationProvider}.
+     */
+    CacheUtilizationProvider getCacheUtilizationProvider();
 
     @Override
     void close();

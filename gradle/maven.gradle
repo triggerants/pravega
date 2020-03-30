@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,13 @@ plugins.withId('maven') {
                         }
                         snapshotRepository(url: "https://oss.sonatype.org/content/repositories/snapshots/") {
                             authentication(userName: publishUsername, password: publishPassword)
+                        }
+                    }
+                    else if (publishUrl == "jcenterSnapshot") {
+                        repository(url: "https://oss.jfrog.org/artifactory/oss-snapshot-local/") {
+                            if (project.hasProperty("publishUsername") && project.hasProperty("publishPassword")) {
+                                authentication(userName: publishUsername, password: publishPassword)
+                            }
                         }
                     }
                     else {

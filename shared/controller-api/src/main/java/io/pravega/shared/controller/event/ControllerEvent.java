@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,12 +9,14 @@
  */
 package io.pravega.shared.controller.event;
 
-import java.io.Serializable;
+import java.util.concurrent.CompletableFuture;
 
-public interface ControllerEvent extends Serializable {
+public interface ControllerEvent {
     /**
      * Method to get routing key for the event.
      * @return return the routing key that should be used.
      */
     String getKey();
+
+    CompletableFuture<Void> process(RequestProcessor processor);
 }

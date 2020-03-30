@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,8 +47,8 @@ public enum AttributeUpdateType {
     /**
      * Any updates will replace the current attribute value, but only if the existing value matches
      * an expected value. If the value is different the update will fail. This can be used to
-     * perform compare and set operations. The value {@link SegmentMetadata#NULL_ATTRIBUTE_VALUE} is
-     * used to indicate a non value. IE: to remove the attribute or if the value is expected not to
+     * perform compare and set operations. The value {io.pravega.segmentstore.contracts.Attributes.NULL_ATTRIBUTE_VALUE}
+     * is used to indicate a non value, i.e., to remove the attribute or if the value is expected not to
      * exist.
      */
     ReplaceIfEquals((byte) 4);

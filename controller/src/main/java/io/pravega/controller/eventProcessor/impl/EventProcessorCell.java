@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,6 +9,8 @@
  */
 package io.pravega.controller.eventProcessor.impl;
 
+import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import io.pravega.common.LoggerHelpers;
 import io.pravega.controller.eventProcessor.CheckpointConfig;
 import io.pravega.controller.store.checkpoint.CheckpointStore;
@@ -30,6 +32,7 @@ import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
 import javax.annotation.concurrent.NotThreadSafe;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * This is an internal class that embeds the following.
@@ -52,8 +55,10 @@ class EventProcessorCell<T extends ControllerEvent> {
     private final CheckpointStore checkpointStore;
     private final String process;
     private final String readerGroupName;
+    @Getter(AccessLevel.PACKAGE)
     private final String readerId;
     private final String objectId;
+    private final AtomicReference<Position> lastCheckpoint;
 
     @VisibleForTesting
     @Getter(value = AccessLevel.PACKAGE)
@@ -107,7 +112,6 @@ class EventProcessorCell<T extends ControllerEvent> {
                     handleException(e);
                 }
             }
-
         }
 
         @Override
@@ -127,11 +131,19 @@ class EventProcessorCell<T extends ControllerEvent> {
 
                 // First close the reader, which implicitly notifies reader position to the reader group
                 log.info("Closing reader for {}", objectId);
-                reader.close();
+                try {
+                    reader.closeAt(getCheckpoint());
+                } catch (Exception e) {
+                    log.info("Exception while closing EventProcessorCell reader from checkpointStore: {}.", e.getMessage());
+                }
 
                 // Next, clean up the reader and its position from checkpoint store
                 log.info("Cleaning up checkpoint store for {}", objectId);
-                checkpointStore.removeReader(process, readerGroupName, readerId);
+                try {
+                    checkpointStore.removeReader(process, readerGroupName, readerId);
+                } catch (Exception e) {
+                    log.info("Exception while removing reader from checkpointStore: {}.", e.getMessage());
+                }
             }
         }
 
@@ -230,15 +242,19 @@ class EventProcessorCell<T extends ControllerEvent> {
                        final String readerId,
                        final int index,
                        final CheckpointStore checkpointStore) {
-        this.reader = reader;
-        this.selfWriter = selfWriter;
-        this.checkpointStore = checkpointStore;
+        Preconditions.checkNotNull(eventProcessorConfig);
+        Preconditions.checkArgument(!Strings.isNullOrEmpty(process));
+        Preconditions.checkArgument(!Strings.isNullOrEmpty(readerId));
+        this.reader = Preconditions.checkNotNull(reader);
+        this.selfWriter = Preconditions.checkNotNull(selfWriter);
+        this.checkpointStore = Preconditions.checkNotNull(checkpointStore);
         this.process = process;
         this.readerGroupName = eventProcessorConfig.getConfig().getReaderGroupName();
         this.readerId = readerId;
-        this.objectId = String.format("EventProcessor[%s:%s]", this.readerGroupName, index);
+        this.objectId = String.format("EventProcessor[%s:%d:%s]", this.readerGroupName, index, readerId);
         this.actor = createEventProcessor(eventProcessorConfig);
         this.delegate = new Delegate(eventProcessorConfig);
+        this.lastCheckpoint = new AtomicReference<>();
     }
 
     final void startAsync() {
@@ -254,6 +270,7 @@ class EventProcessorCell<T extends ControllerEvent> {
         long traceId = LoggerHelpers.traceEnterWithContext(log, this.objectId, "stopAsync");
         try {
             delegate.stopAsync();
+            log.info("Event processor cell {} SHUTDOWN issued", this.objectId);
         } finally {
             LoggerHelpers.traceLeave(log, this.objectId, "stopAsync", traceId);
         }
@@ -276,16 +293,23 @@ class EventProcessorCell<T extends ControllerEvent> {
 
     final void awaitTerminated() {
         delegate.awaitTerminated();
+        log.info("Event processor cell {} Terminated", this.objectId);
     }
 
     private EventProcessor<T> createEventProcessor(final EventProcessorConfig<T> eventProcessorConfig) {
         EventProcessor<T> eventProcessor = eventProcessorConfig.getSupplier().get();
-        eventProcessor.checkpointer = (Position position) ->
-                checkpointStore.setPosition(process, readerGroupName, readerId, position);
+        eventProcessor.checkpointer = (Position position) -> {
+            checkpointStore.setPosition(process, readerGroupName, readerId, position);
+            lastCheckpoint.set(position);
+        };
         eventProcessor.selfWriter = selfWriter::writeEvent;
         return eventProcessor;
     }
 
+    Position getCheckpoint() {
+        return lastCheckpoint.get();    
+    }
+    
     @Override
     public String toString() {
         return String.format("%s[%s]", objectId, this.delegate.state());

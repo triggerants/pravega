@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,6 +10,7 @@
 package io.pravega.client.state.impl;
 
 public class CorruptedStateException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
 
     /**
      * Constructor for corrupted state exception with message.

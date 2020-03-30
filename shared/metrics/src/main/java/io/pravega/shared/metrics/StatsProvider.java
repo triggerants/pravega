@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,14 @@ public interface StatsProvider extends AutoCloseable {
      * Initialize the stats provider.
      */
     void start();
+
+    /**
+     * Initialize the stats provider with SimpleMeterRegistry only which is memory based without exporting.
+     * Note different Micrometer registry may behave inconsistently from storage perspective (e.g. same metric
+     * may return different value from different registry).
+     * To keep things consistent, particularly for unit tests, only SimpleMeterRegistry is bound here.
+     */
+    void startWithoutExporting();
 
     /**
      * Close the stats provider.

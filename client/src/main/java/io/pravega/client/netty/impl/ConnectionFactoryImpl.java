@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,131 +9,91 @@
  */
 package io.pravega.client.netty.impl;
 
-
-import java.security.NoSuchAlgorithmException;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicBoolean;
-import javax.net.ssl.SSLException;
-import io.pravega.common.Exceptions;
-import io.pravega.shared.protocol.netty.AppendBatchSizeTracker;
-import io.pravega.shared.protocol.netty.CommandDecoder;
-import io.pravega.shared.protocol.netty.CommandEncoder;
-import io.pravega.shared.protocol.netty.ExceptionLoggingHandler;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import io.pravega.client.ClientConfig;
+import io.pravega.common.concurrent.ExecutorServiceHelpers;
 import io.pravega.shared.protocol.netty.PravegaNodeUri;
 import io.pravega.shared.protocol.netty.ReplyProcessor;
-import com.google.common.base.Preconditions;
-
-import io.netty.bootstrap.Bootstrap;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelFutureListener;
-import io.netty.channel.ChannelInitializer;
-import io.netty.channel.ChannelOption;
-import io.netty.channel.ChannelPipeline;
-import io.netty.channel.EventLoopGroup;
-import io.netty.channel.epoll.EpollEventLoopGroup;
-import io.netty.channel.epoll.EpollSocketChannel;
-import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.SocketChannel;
-import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
-import io.netty.handler.ssl.SslContext;
-import io.netty.handler.ssl.SslContextBuilder;
-import io.netty.handler.ssl.util.FingerprintTrustManagerFactory;
-import io.pravega.shared.protocol.netty.WireCommands;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 
+/**
+ * A Connection factory implementation used to create {@link ClientConnection}s by creating new Flow over existing connection pool.
+ *
+ */
 @Slf4j
 public final class ConnectionFactoryImpl implements ConnectionFactory {
 
-    private final boolean ssl;
-    private EventLoopGroup group;
-    private boolean nio = false;
+    private static final AtomicInteger POOLCOUNT = new AtomicInteger();
+    
+    private final ClientConfig clientConfig;
+    private final ScheduledExecutorService executor;
+    @VisibleForTesting
+    @Getter
+    private final ConnectionPool connectionPool;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    /**
-     * Actual implementation of ConnectionFactory interface.
-     *
-     * @param ssl Whether connection should use SSL or not.
-     */
-    public ConnectionFactoryImpl(boolean ssl) {
-        this.ssl = ssl;
-        try {
-            this.group = new EpollEventLoopGroup();
-        } catch (ExceptionInInitializerError | NoClassDefFoundError e) {
-            log.warn("Epoll not available. Falling back on NIO.");
-            nio = true;
-            this.group = new NioEventLoopGroup();
-        }
+    public ConnectionFactoryImpl(ClientConfig clientConfig) {
+        this(clientConfig, new ConnectionPoolImpl(clientConfig), (Integer) null);
+    }
+
+    @VisibleForTesting
+    public ConnectionFactoryImpl(ClientConfig clientConfig, ConnectionPool connectionPool, Integer numThreadsInPool) {
+        this.clientConfig = Preconditions.checkNotNull(clientConfig, "clientConfig");
+        this.connectionPool = Preconditions.checkNotNull(connectionPool);
+        this.executor = ExecutorServiceHelpers.newScheduledThreadPool(getThreadPoolSize(numThreadsInPool),
+                                                                      "clientInternal-" + POOLCOUNT.incrementAndGet());
+    }
+
+    @VisibleForTesting
+    public ConnectionFactoryImpl(ClientConfig clientConfig, ConnectionPool connectionPool, ScheduledExecutorService executor) {
+        this.clientConfig = Preconditions.checkNotNull(clientConfig, "clientConfig");
+        this.connectionPool = connectionPool;
+        this.executor = executor;
     }
 
     @Override
-    public CompletableFuture<ClientConnection> establishConnection(PravegaNodeUri location, ReplyProcessor rp) {
-        Preconditions.checkNotNull(location);
-        Exceptions.checkNotClosed(closed.get(), this);
-        final SslContext sslCtx;
-        if (ssl) {
-            try {
-                sslCtx = SslContextBuilder.forClient()
-                                          .trustManager(FingerprintTrustManagerFactory
-                                                  .getInstance(FingerprintTrustManagerFactory.getDefaultAlgorithm()))
-                                          .build();
-            } catch (SSLException | NoSuchAlgorithmException e) {
-                throw new RuntimeException(e);
-            }
-        } else {
-            sslCtx = null;
-        }
-        AppendBatchSizeTracker batchSizeTracker = new AppendBatchSizeTrackerImpl();
-        ClientConnectionInboundHandler handler = new ClientConnectionInboundHandler(location.getEndpoint(), rp, batchSizeTracker);
-        Bootstrap b = new Bootstrap();
-        b.group(group)
-         .channel(nio ? NioSocketChannel.class : EpollSocketChannel.class)
-         .option(ChannelOption.TCP_NODELAY, true)
-         .handler(new ChannelInitializer<SocketChannel>() {
-             @Override
-             public void initChannel(SocketChannel ch) throws Exception {
-                 ChannelPipeline p = ch.pipeline();
-                 if (sslCtx != null) {
-                     p.addLast(sslCtx.newHandler(ch.alloc(), location.getEndpoint(), location.getPort()));
-                 }
-                 // p.addLast(new LoggingHandler(LogLevel.INFO));
-                 p.addLast(new ExceptionLoggingHandler(location.getEndpoint()),
-                         new CommandEncoder(batchSizeTracker),
-                         new LengthFieldBasedFrameDecoder(WireCommands.MAX_WIRECOMMAND_SIZE, 4, 4),
-                         new CommandDecoder(),
-                         handler);
-             }
-         });
+    public CompletableFuture<ClientConnection> establishConnection(Flow flow, PravegaNodeUri endpoint, ReplyProcessor rp) {
+        return connectionPool.getClientConnection(flow, endpoint, rp);
+    }
 
-        // Start the client.
-        CompletableFuture<ClientConnection> result = new CompletableFuture<>();
-        try {
-            b.connect(location.getEndpoint(), location.getPort()).addListener(new ChannelFutureListener() {
-                @Override
-                public void operationComplete(ChannelFuture future) {
-                    if (future.isSuccess()) {
-                        result.complete(handler);
-                    } else {
-                        result.completeExceptionally(future.cause());
-                    }
-                }
-            });
-        } catch (Exception e) {
-            result.completeExceptionally(e);
-        }
-        return result;
+    @Override
+    public CompletableFuture<ClientConnection> establishConnection(PravegaNodeUri endpoint, ReplyProcessor rp) {
+        return connectionPool.getClientConnection(endpoint, rp);
+    }
+
+    @Override
+    public ScheduledExecutorService getInternalExecutor() {
+        return executor;
     }
 
     @Override
     public void close() {
+        log.info("Shutting down connection factory");
         if (closed.compareAndSet(false, true)) {
-            // Shut down the event loop to terminate all threads.
-            group.shutdownGracefully();
+            ExecutorServiceHelpers.shutdown(executor);
+            connectionPool.close();
         }
     }
 
-    @Override
-    protected void finalize() {
-        close();
+    @VisibleForTesting
+    public int getActiveChannelCount() {
+       return connectionPool.getActiveChannelCount();
+    }
+
+    private int getThreadPoolSize(Integer threadCount) {
+        if (threadCount != null) {
+            return threadCount;
+        }
+        String configuredThreads = System.getProperty("pravega.client.internal.threadpool.size", null);
+        if (configuredThreads != null) {
+            return Integer.parseInt(configuredThreads);
+        }
+        return Runtime.getRuntime().availableProcessors();
     }
 }

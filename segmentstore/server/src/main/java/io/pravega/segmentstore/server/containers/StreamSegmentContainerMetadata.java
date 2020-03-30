@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,23 +9,23 @@
  */
 package io.pravega.segmentstore.server.containers;
 
-import io.pravega.common.Exceptions;
-import io.pravega.segmentstore.server.ContainerMetadata;
-import io.pravega.segmentstore.server.UpdateableContainerMetadata;
-import io.pravega.segmentstore.server.UpdateableSegmentMetadata;
-import io.pravega.segmentstore.server.EvictableMetadata;
-import io.pravega.segmentstore.server.SegmentMetadata;
-import io.pravega.segmentstore.server.logs.operations.Operation;
-import io.pravega.segmentstore.storage.LogAddress;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import io.pravega.common.Exceptions;
+import io.pravega.segmentstore.server.EvictableMetadata;
+import io.pravega.segmentstore.server.SegmentMetadata;
+import io.pravega.segmentstore.server.SegmentStoreMetrics;
+import io.pravega.segmentstore.server.UpdateableContainerMetadata;
+import io.pravega.segmentstore.server.UpdateableSegmentMetadata;
+import io.pravega.segmentstore.server.logs.operations.Operation;
+import io.pravega.segmentstore.storage.LogAddress;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -33,7 +33,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.ThreadSafe;
-
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -63,6 +62,7 @@ public class StreamSegmentContainerMetadata implements UpdateableContainerMetada
     @GuardedBy("truncationMarkers")
     private final TreeSet<Long> truncationPoints;
     private final Object lock = new Object();
+    private final SegmentStoreMetrics.Metadata metrics;
 
     //endregion
 
@@ -87,6 +87,8 @@ public class StreamSegmentContainerMetadata implements UpdateableContainerMetada
         this.recoveryMode = new AtomicBoolean();
         this.lastTruncatedSequenceNumber = new AtomicLong();
         this.epoch = new AtomicLong(NO_EPOCH);
+        this.metrics = new SegmentStoreMetrics.Metadata(this.streamSegmentContainerId);
+        this.metrics.segmentCount(0);
     }
 
     //endregion
@@ -154,87 +156,38 @@ public class StreamSegmentContainerMetadata implements UpdateableContainerMetada
     @Override
     public UpdateableSegmentMetadata mapStreamSegmentId(String streamSegmentName, long streamSegmentId) {
         StreamSegmentMetadata segmentMetadata;
+        int count;
         synchronized (this.lock) {
-            validateNewMapping(streamSegmentName, streamSegmentId);
+            Exceptions.checkArgument(!this.metadataByName.containsKey(streamSegmentName), "streamSegmentName",
+                    "StreamSegment '%s' is already mapped.", streamSegmentName);
+            Exceptions.checkArgument(!this.metadataById.containsKey(streamSegmentId), "streamSegmentId",
+                    "StreamSegment Id %d is already mapped.", streamSegmentId);
+            if (!this.recoveryMode.get()) {
+                // We enforce the max active segment count only in non-recovery mode. If for some reason we manage to recover
+                // more than this number of segments, then we shouldn't block recovery for that (it likely means we have a problem
+                // somewhere else though).
+                Preconditions.checkState(this.metadataById.size() < this.maxActiveSegmentCount,
+                        "StreamSegment '%s' cannot be mapped because the maximum allowed number of mapped segments (%s)has been reached.",
+                        streamSegmentName, this.maxActiveSegmentCount);
+            }
+
             segmentMetadata = new StreamSegmentMetadata(streamSegmentName, streamSegmentId, getContainerId());
             this.metadataByName.put(streamSegmentName, segmentMetadata);
             this.metadataById.put(streamSegmentId, segmentMetadata);
+            count = this.metadataById.size();
         }
 
         segmentMetadata.setLastUsed(getOperationSequenceNumber());
-        log.info("{}: MapStreamSegment Id = {}, Name = '{}'", this.traceObjectId, streamSegmentId, streamSegmentName);
+        log.info("{}: MapStreamSegment SegmentId = {}, Name = '{}', Active = {}", this.traceObjectId, streamSegmentId, streamSegmentName, count);
+        this.metrics.segmentCount(count);
         return segmentMetadata;
-    }
-
-    @Override
-    public UpdateableSegmentMetadata mapStreamSegmentId(String streamSegmentName, long streamSegmentId, long parentStreamSegmentId) {
-        StreamSegmentMetadata segmentMetadata;
-        synchronized (this.lock) {
-            validateNewMapping(streamSegmentName, streamSegmentId);
-            StreamSegmentMetadata parentMetadata = this.metadataById.getOrDefault(parentStreamSegmentId, null);
-            Exceptions.checkArgument(parentMetadata != null, "parentStreamSegmentId", "Invalid Parent Stream Id.");
-            Exceptions.checkArgument(parentMetadata.getParentId() == ContainerMetadata.NO_STREAM_SEGMENT_ID,
-                    "parentStreamSegmentId", "Cannot create a transaction StreamSegment for another transaction StreamSegment.");
-
-            segmentMetadata = new StreamSegmentMetadata(streamSegmentName, streamSegmentId, parentStreamSegmentId, getContainerId());
-            this.metadataByName.put(streamSegmentName, segmentMetadata);
-            this.metadataById.put(streamSegmentId, segmentMetadata);
-        }
-
-        segmentMetadata.setLastUsed(getOperationSequenceNumber());
-        log.info("{}: MapTransactionStreamSegment ParentId = {}, Id = {}, Name = '{}'", this.traceObjectId, parentStreamSegmentId, streamSegmentId, streamSegmentName);
-        return segmentMetadata;
-    }
-
-    @GuardedBy("lock")
-    private void validateNewMapping(String streamSegmentName, long streamSegmentId) {
-        Exceptions.checkArgument(!this.metadataByName.containsKey(streamSegmentName), "streamSegmentName",
-                "StreamSegment '%s' is already mapped.", streamSegmentName);
-        Exceptions.checkArgument(!this.metadataById.containsKey(streamSegmentId), "streamSegmentId",
-                "StreamSegment Id %d is already mapped.", streamSegmentId);
-        if (!this.recoveryMode.get()) {
-            // We enforce the max active segment count only in non-recovery mode. If for some reason we manage to recover
-            // more than this number of segments, then we shouldn't block recovery for that (it likely means we have a problem
-            // somewhere else though).
-            Preconditions.checkState(this.metadataById.size() < this.maxActiveSegmentCount,
-                    "StreamSegment '%s' cannot be mapped because the maximum allowed number of mapped segments (%s)has been reached.",
-                    streamSegmentName, this.maxActiveSegmentCount);
-        }
     }
 
     @Override
     public Collection<Long> getAllStreamSegmentIds() {
-        return this.metadataById.keySet();
-    }
-
-    @Override
-    public Collection<SegmentMetadata> deleteStreamSegment(String streamSegmentName) {
-        Collection<SegmentMetadata> result = new ArrayList<>();
         synchronized (this.lock) {
-            StreamSegmentMetadata segmentMetadata = this.metadataByName.getOrDefault(streamSegmentName, null);
-            if (segmentMetadata == null) {
-                // We have no knowledge in our metadata about this StreamSegment. This means it has no transactions associated
-                // with it, so no need to do anything else.
-                log.info("{}: DeleteStreamSegments (nothing)", this.traceObjectId);
-                return result;
-            }
-
-            // Mark this segment as deleted.
-            result.add(segmentMetadata);
-            segmentMetadata.markDeleted();
-
-            // Find any transactions that point to this StreamSegment (as a parent).
-            this.metadataById
-                    .values().stream()
-                    .filter(m -> m.getParentId() == segmentMetadata.getId())
-                    .forEach(m -> {
-                        m.markDeleted();
-                        result.add(m);
-                    });
+            return new HashSet<>(this.metadataById.keySet());
         }
-
-        log.info("{}: DeleteStreamSegments {}", this.traceObjectId, result);
-        return result;
     }
 
     @Override
@@ -270,13 +223,9 @@ public class StreamSegmentContainerMetadata implements UpdateableContainerMetada
         long adjustedCutoff = Math.min(sequenceNumberCutoff, this.lastTruncatedSequenceNumber.get());
         List<SegmentMetadata> candidates;
         synchronized (this.lock) {
-            // Find those segments that have active transactions associated with them.
-            Set<Long> activeTransactions = getSegmentsWithActiveTransactions(adjustedCutoff);
-
-            // The result is all segments that are eligible for removal but that do not have any active transactions.
             candidates = this.metadataById
                     .values().stream()
-                    .filter(m -> isEligibleForEviction(m, adjustedCutoff) && !activeTransactions.contains(m.getId()))
+                    .filter(m -> isEligibleForEviction(m, adjustedCutoff))
                     .collect(Collectors.toList());
         }
 
@@ -293,45 +242,51 @@ public class StreamSegmentContainerMetadata implements UpdateableContainerMetada
     public Collection<SegmentMetadata> cleanup(Collection<SegmentMetadata> evictionCandidates, long sequenceNumberCutoff) {
         long adjustedCutoff = Math.min(sequenceNumberCutoff, this.lastTruncatedSequenceNumber.get());
         Collection<SegmentMetadata> evictedSegments = new ArrayList<>(evictionCandidates.size());
+        int count;
         synchronized (this.lock) {
-            // Find those segments that have active transactions associated with them.
-            Set<Long> activeTransactions = getSegmentsWithActiveTransactions(adjustedCutoff);
-
-            // Remove those candidates that are still eligible for removal and which do not have any active transactions.
             evictionCandidates
                     .stream()
-                    .filter(m -> isEligibleForEviction(m, adjustedCutoff) && !activeTransactions.contains(m.getId()))
+                    .filter(m -> isEligibleForEviction(m, adjustedCutoff))
                     .forEach(m -> {
                         StreamSegmentMetadata removedMetadata = this.metadataById.remove(m.getId());
                         removedMetadata.markInactive();
                         this.metadataByName.remove(m.getName());
                         evictedSegments.add(m);
                     });
+            count = this.metadataById.size();
         }
 
-        log.info("{}: EvictedStreamSegments {}", this.traceObjectId, evictedSegments);
+        if (evictedSegments.size() > 0) {
+            log.info("{}: EvictedStreamSegments Count = {}, Active = {}", this.traceObjectId, evictedSegments.size(), count);
+            this.metrics.segmentCount(count);
+        }
+
         return evictedSegments;
     }
 
-    /**
-     * Gets a Set of Segment Ids that have active transactions referring to them.
-     *
-     * @param sequenceNumberCutoff A Sequence Number that indicates the cutoff threshold. A Segment is eligible for eviction
-     *                             if it has a LastUsed value smaller than this threshold.
-     * @return A Set of Segment Ids that have active transactions referring to them.
-     */
-    @GuardedBy("lock")
-    private Set<Long> getSegmentsWithActiveTransactions(long sequenceNumberCutoff) {
-        return this.metadataById
-                .values().stream()
-                .filter(m -> m.getParentId() != ContainerMetadata.NO_STREAM_SEGMENT_ID
-                        && !isEligibleForEviction(m, sequenceNumberCutoff))
-                .map(SegmentMetadata::getParentId)
-                .collect(Collectors.toSet());
+    @Override
+    public int cleanupExtendedAttributes(int maximumAttributeCount, long sequenceNumberCutoff) {
+        ArrayList<StreamSegmentMetadata> metadatas;
+        synchronized (this.lock) {
+            metadatas = new ArrayList<>(this.metadataById.values());
+        }
+
+        long adjustedCutoff = Math.min(sequenceNumberCutoff, this.lastTruncatedSequenceNumber.get());
+        int count = 0;
+        for (StreamSegmentMetadata sm : metadatas) {
+            count += sm.cleanupAttributes(maximumAttributeCount, adjustedCutoff);
+        }
+
+        if (count > 0) {
+            log.info("{}: EvictedExtendedAttributes Count = {}", this.traceObjectId, count);
+        }
+
+        return count;
     }
 
     /**
      * Determines whether the Segment with given metadata can be evicted, based on the the given Sequence Number Threshold.
+     * A Segment will not be chosen for eviction if {@link SegmentMetadata#isPinned()} is true.
      *
      * @param metadata             The Metadata for the Segment that is considered for eviction.
      * @param sequenceNumberCutoff A Sequence Number that indicates the cutoff threshold. A Segment is eligible for eviction
@@ -340,8 +295,9 @@ public class StreamSegmentContainerMetadata implements UpdateableContainerMetada
      * @return True if the Segment can be evicted, false otherwise.
      */
     private boolean isEligibleForEviction(SegmentMetadata metadata, long sequenceNumberCutoff) {
-        return metadata.getLastUsed() < sequenceNumberCutoff
-                || metadata.isDeleted() && metadata.getLastUsed() <= this.lastTruncatedSequenceNumber.get();
+        return !metadata.isPinned()
+                && (metadata.getLastUsed() < sequenceNumberCutoff
+                || metadata.isDeleted() && metadata.getLastUsed() <= this.lastTruncatedSequenceNumber.get());
     }
 
     //endregion
@@ -395,10 +351,14 @@ public class StreamSegmentContainerMetadata implements UpdateableContainerMetada
 
     @Override
     public void recordTruncationMarker(long operationSequenceNumber, LogAddress address) {
-        Exceptions.checkArgument(operationSequenceNumber >= 0, "operationSequenceNumber", "Operation Sequence Number must be a positive number.");
+        Exceptions.checkArgument(operationSequenceNumber >= 0, "operationSequenceNumber",
+                "Operation Sequence Number must be a positive number.");
         Preconditions.checkNotNull(address, "address");
         synchronized (this.truncationMarkers) {
-            this.truncationMarkers.put(operationSequenceNumber, address);
+            LogAddress existing = this.truncationMarkers.getOrDefault(operationSequenceNumber, null);
+            if (existing == null || existing.getSequence() < address.getSequence()) {
+                this.truncationMarkers.put(operationSequenceNumber, address);
+            }
         }
     }
 

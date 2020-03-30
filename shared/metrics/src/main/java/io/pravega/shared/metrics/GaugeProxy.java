@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,21 +9,22 @@
  */
 package io.pravega.shared.metrics;
 
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 
-public class GaugeProxy implements Gauge {
-    private final AtomicReference<Gauge> instance = new AtomicReference<>();
+class GaugeProxy extends MetricProxy<Gauge> implements Gauge {
 
-    GaugeProxy(Gauge gauge) {
-        instance.set(gauge);
-    }
-
-    void setGauge(Gauge gauge) {
-        instance.set(gauge);
+    GaugeProxy(Gauge gauge, String proxyName, Consumer<String> closeCallback) {
+        super(gauge, proxyName, closeCallback);
     }
 
     @Override
-    public String getName() {
-        return instance.get().getName();
+    public void setSupplier(Supplier<Number> supplier) {
+        getInstance().setSupplier(supplier);
+    }
+
+    @Override
+    public Supplier<Number> getSupplier() {
+        return getInstance().getSupplier();
     }
 }

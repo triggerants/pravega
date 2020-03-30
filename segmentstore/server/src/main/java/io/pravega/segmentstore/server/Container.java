@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,8 +18,18 @@ import com.google.common.util.concurrent.Service;
 public interface Container extends Service, AutoCloseable {
     /**
      * Gets a value indicating the Id of this container.
+     * @return The Id of this container.
      */
     int getId();
+
+    /**
+     * Gets a value indicating whether the Container is in an Offline state. When in such a state, even if state() == Service.State.RUNNING,
+     * all operations invoked on it will fail with ContainerOfflineException.
+     *
+     * @return True if the Container is Offline, false if Online.
+     */
+    boolean isOffline();
+
 
     @Override
     void close();

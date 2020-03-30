@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,6 +9,7 @@
  */
 package io.pravega.test.system.framework;
 
+import io.pravega.common.Exceptions;
 import io.pravega.test.system.framework.TestExecutorFactory.TestExecutorType;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.internal.runners.model.EachTestNotifier;
@@ -23,6 +24,10 @@ import org.junit.runners.model.Statement;
 import java.lang.reflect.Method;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+import static io.pravega.common.Exceptions.unwrap;
+import static io.pravega.test.system.framework.Utils.getConfig;
 
 /**
  * SystemTestRunner this is used to execute all the systemTests.
@@ -60,13 +65,15 @@ public class SystemTestRunner extends BlockJUnit4ClassRunner {
         } else {
             //read the type of testExecutor from system property. This is sent by the gradle task. By default
             //the tests are executed locally.
-            TestExecutorType executionType = TestExecutorType.valueOf(System.getProperty("execType", "LOCAL"));
+            TestExecutorType executionType = TestExecutorType.valueOf(getConfig("execType", "LOCAL"));
+            //sleep for 15 seconds before running tests, remove once pravega/pravega/issues/1665 is resolved
+            Exceptions.handleInterrupted(() -> TimeUnit.SECONDS.sleep(15));
             invokeTest(notifier, executionType, method);
         }
     }
 
     private CompletableFuture<Void> execute(TestExecutorType type, Method method) throws Exception {
-        return TestExecutorFactory.getTestExecutor(type).startTestExecution(method);
+        return new TestExecutorFactory().getTestExecutor(type).startTestExecution(method);
     }
 
     private void invokeTest(RunNotifier notifier, TestExecutorType type, FrameworkMethod method) {
@@ -78,7 +85,8 @@ public class SystemTestRunner extends BlockJUnit4ClassRunner {
                 eachNotifier.fireTestStarted();
                 execute(type, method.getMethod()).get();
             } catch (Throwable e) {
-                eachNotifier.addFailure(e);
+                log.error("Test " + method + " failed with exception ", e);
+                eachNotifier.addFailure(unwrap(e));
             } finally {
                 eachNotifier.fireTestFinished();
             }

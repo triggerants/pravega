@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,23 +9,21 @@
  */
 package io.pravega.test.integration.demo;
 
+import io.pravega.client.stream.EventWriterConfig;
+import io.pravega.client.stream.ScalingPolicy;
+import io.pravega.client.stream.StreamConfiguration;
+import io.pravega.client.stream.Transaction;
+import io.pravega.client.stream.TransactionalEventStreamWriter;
+import io.pravega.client.stream.impl.Controller;
+import io.pravega.client.stream.impl.UTF8StringSerializer;
+import io.pravega.client.stream.mock.MockClientFactory;
 import io.pravega.controller.util.Config;
 import io.pravega.segmentstore.contracts.StreamSegmentStore;
 import io.pravega.segmentstore.server.host.handler.PravegaConnectionListener;
 import io.pravega.segmentstore.server.store.ServiceBuilder;
 import io.pravega.segmentstore.server.store.ServiceBuilderConfig;
-import io.pravega.client.stream.EventStreamWriter;
-import io.pravega.client.stream.EventWriterConfig;
-import io.pravega.client.stream.PingFailedException;
-import io.pravega.client.stream.ScalingPolicy;
-import io.pravega.client.stream.StreamConfiguration;
-import io.pravega.client.stream.Transaction;
-import io.pravega.client.stream.impl.Controller;
-import io.pravega.client.stream.impl.JavaSerializer;
-import io.pravega.client.stream.mock.MockClientFactory;
-import java.util.concurrent.CompletableFuture;
-
 import io.pravega.test.common.TestingServerStarter;
+import java.util.concurrent.CompletableFuture;
 import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.curator.test.TestingServer;
@@ -38,7 +36,6 @@ import static org.junit.Assert.assertTrue;
 public class EndToEndTransactionTest {
 
     final static long MAX_LEASE_VALUE = 30000;
-    final static long MAX_SCALE_GRACE_PERIOD = 60000;
 
     @Test
     public static void main(String[] args) throws Exception {
@@ -50,7 +47,7 @@ public class EndToEndTransactionTest {
         StreamSegmentStore store = serviceBuilder.createStreamSegmentService();
         int port = Config.SERVICE_PORT;
         @Cleanup
-        PravegaConnectionListener server = new PravegaConnectionListener(false, port, store);
+        PravegaConnectionListener server = new PravegaConnectionListener(false, port, store, serviceBuilder.createTableStoreService());
         server.startListening();
 
         Thread.sleep(1000);
@@ -71,31 +68,28 @@ public class EndToEndTransactionTest {
         ScalingPolicy policy = ScalingPolicy.fixed(5);
         StreamConfiguration streamConfig =
                 StreamConfiguration.builder()
-                        .scope(testScope)
-                        .streamName(testStream)
                         .scalingPolicy(policy)
                         .build();
 
-        if (!controller.createStream(streamConfig).get()) {
+        if (!controller.createStream(testScope, testStream, streamConfig).get()) {
             log.error("FAILURE: Error creating test stream");
             return;
         }
 
-        final long lease = 4000;
-        final long maxExecutionTime = 10000;
-        final long scaleGracePeriod = 30000;
+        final long txnTimeout = 4000;
 
         @Cleanup
         MockClientFactory clientFactory = new MockClientFactory(testScope, controller);
 
         @Cleanup
-        EventStreamWriter<String> producer = clientFactory.createEventWriter(
+        TransactionalEventStreamWriter<String> producer = clientFactory.createTransactionalEventWriter(
+                "writer",
                 testStream,
-                new JavaSerializer<>(),
-                EventWriterConfig.builder().build());
+                new UTF8StringSerializer(),
+                EventWriterConfig.builder().transactionTimeoutTime(txnTimeout).build());
 
         // region Successful commit tests
-        Transaction<String> transaction = producer.beginTxn(5000, 30000, 30000);
+        Transaction<String> transaction = producer.beginTxn();
 
         for (int i = 0; i < 1; i++) {
             String event = "\n Transactional Publish \n";
@@ -130,7 +124,7 @@ public class EndToEndTransactionTest {
 
         // region Successful abort tests
 
-        Transaction<String> transaction2 = producer.beginTxn(5000, 30000, 30000);
+        Transaction<String> transaction2 = producer.beginTxn();
         for (int i = 0; i < 1; i++) {
             String event = "\n Transactional Publish \n";
             log.info("Producing event: " + event);
@@ -163,113 +157,13 @@ public class EndToEndTransactionTest {
         // endregion
 
         // region Successful timeout tests
-        Transaction<String> tx1 = producer.beginTxn(lease, maxExecutionTime, scaleGracePeriod);
+        Transaction<String> tx1 = producer.beginTxn();
 
-        Thread.sleep((long) (1.3 * lease));
+        Thread.sleep((long) (1.3 * txnTimeout));
 
         Transaction.Status txStatus = tx1.checkStatus();
         Assert.assertTrue(Transaction.Status.ABORTING == txStatus || Transaction.Status.ABORTED == txStatus);
         log.info("SUCCESS: successfully aborted transaction after timeout. Transaction status=" + txStatus);
-
-        // endregion
-
-        // region Successful ping tests
-
-        Transaction<String> tx2 = producer.beginTxn(lease, maxExecutionTime, scaleGracePeriod);
-
-        Thread.sleep((long) (0.75 * lease));
-
-        Assert.assertEquals(Transaction.Status.OPEN, tx2.checkStatus());
-
-        try {
-            tx2.ping(lease);
-            Assert.assertTrue(true);
-        } catch (PingFailedException pfe) {
-            Assert.assertTrue(false);
-        }
-        log.info("SUCCESS: successfully pinged transaction.");
-
-        Thread.sleep((long) (0.5 * lease));
-
-        Assert.assertEquals(Transaction.Status.OPEN, tx2.checkStatus());
-
-        Thread.sleep((long) (0.8 * lease));
-
-        txStatus = tx2.checkStatus();
-        Assert.assertTrue(Transaction.Status.ABORTING == txStatus || Transaction.Status.ABORTED == txStatus);
-        log.info("SUCCESS: successfully aborted transaction after pinging. Transaction status=" + txStatus);
-
-        // endregion
-
-        // region Ping failure due to MaxExecutionTime exceeded
-
-        Transaction<String> tx3 = producer.beginTxn(lease, maxExecutionTime, scaleGracePeriod);
-
-        Thread.sleep((long) (0.75 * lease));
-
-        Assert.assertEquals(Transaction.Status.OPEN, tx3.checkStatus());
-
-        try {
-            //Assert.assertEquals(PingStatus.OK, pingStatus);
-            tx3.ping(lease);
-            Assert.assertTrue(true);
-        } catch (PingFailedException pfe) {
-            Assert.assertTrue(false);
-        }
-
-        Thread.sleep((long) (0.75 * lease));
-
-        Assert.assertEquals(Transaction.Status.OPEN, tx3.checkStatus());
-
-        try {
-            // PingFailedException is expected to be thrown.
-            tx3.ping(lease + 1);
-            Assert.assertTrue(false);
-        } catch (PingFailedException pfe) {
-            Assert.assertTrue(true);
-            log.info("SUCCESS: successfully received error after max expiry time");
-        }
-
-        Thread.sleep((long) (0.5 * lease));
-
-        txStatus = tx3.checkStatus();
-        Assert.assertTrue(Transaction.Status.ABORTING == txStatus || Transaction.Status.ABORTED == txStatus);
-        log.info("SUCCESS: successfully aborted transaction after 1 successful ping and 1 unsuccessful" +
-                "ping. Transaction status=" + txStatus);
-
-        // endregion
-
-        // region Ping failure due to very high lease value
-
-        Transaction<String> tx4 = producer.beginTxn(lease, maxExecutionTime, scaleGracePeriod);
-
-        try {
-            tx4.ping(scaleGracePeriod + 1);
-            Assert.assertTrue(false);
-        } catch (PingFailedException pfe) {
-            Assert.assertTrue(true);
-        }
-
-        try {
-            tx4.ping(maxExecutionTime + 1);
-            Assert.assertTrue(false);
-        } catch (PingFailedException pfe) {
-            Assert.assertTrue(true);
-        }
-
-        try {
-            tx4.ping(MAX_LEASE_VALUE + 1);
-            Assert.assertTrue(false);
-        } catch (PingFailedException pfe) {
-            Assert.assertTrue(true);
-        }
-
-        try {
-            tx4.ping(MAX_SCALE_GRACE_PERIOD + 1);
-            Assert.assertTrue(false);
-        } catch (PingFailedException pfe) {
-            Assert.assertTrue(true);
-        }
 
         // endregion
 

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -11,7 +11,7 @@ package io.pravega.controller.store.stream;
 
 import lombok.Getter;
 
-class OperationContextImpl implements OperationContext {
+class OperationContextImpl<T> implements OperationContext {
 
     @Getter
     private final Stream stream;

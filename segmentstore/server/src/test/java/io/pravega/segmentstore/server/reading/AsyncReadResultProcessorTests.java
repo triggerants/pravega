@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,8 +9,9 @@
  */
 package io.pravega.segmentstore.server.reading;
 
-import io.pravega.common.ExceptionHelpers;
-import io.pravega.common.concurrent.FutureHelpers;
+import com.google.common.collect.Iterators;
+import io.pravega.common.Exceptions;
+import io.pravega.common.concurrent.Futures;
 import io.pravega.common.io.StreamHelpers;
 import io.pravega.segmentstore.contracts.ReadResultEntry;
 import io.pravega.segmentstore.contracts.ReadResultEntryContents;
@@ -18,15 +19,11 @@ import io.pravega.segmentstore.contracts.ReadResultEntryType;
 import io.pravega.test.common.AssertExtensions;
 import io.pravega.test.common.IntentionalException;
 import io.pravega.test.common.ThreadPooledTestSuite;
-import lombok.Cleanup;
-import org.junit.Assert;
-import org.junit.Test;
-
 import java.io.ByteArrayInputStream;
+import java.io.SequenceInputStream;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Semaphore;
@@ -34,13 +31,21 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
+import lombok.Cleanup;
+import lombok.val;
+import org.junit.Assert;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.Timeout;
 
 /**
  * Unit tests for AsyncReadResultProcessor.
  */
 public class AsyncReadResultProcessorTests extends ThreadPooledTestSuite {
     private static final int ENTRY_COUNT = 10000;
-    private static final Duration TIMEOUT = Duration.ofSeconds(5);
+    private static final Duration TIMEOUT = Duration.ofSeconds(10);
+    @Rule
+    public Timeout globalTimeout = Timeout.seconds(TIMEOUT.getSeconds());
 
     @Override
     protected int getThreadPoolSize() {
@@ -128,7 +133,7 @@ public class AsyncReadResultProcessorTests extends ThreadPooledTestSuite {
      * Tests the AsyncReadResultProcessor when it encounters read failures.
      */
     @Test
-    public void testReadFailures() throws Exception {
+    public void testReadFailures() {
         // Pre-generate some entries.
         final int totalLength = 1000;
         final Semaphore barrier = new Semaphore(0);
@@ -154,7 +159,7 @@ public class AsyncReadResultProcessorTests extends ThreadPooledTestSuite {
             AssertExtensions.assertThrows(
                     "Processor did not complete with the expected failure.",
                     () -> testReadResultHandler.completed.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS),
-                    ex -> ExceptionHelpers.getRealException(ex) instanceof IntentionalException);
+                    ex -> Exceptions.unwrap(ex) instanceof IntentionalException);
 
             Assert.assertEquals("Unexpected number of reads processed.", 0, testReadResultHandler.readCount.get());
             Assert.assertNotNull("No read failure encountered.", testReadResultHandler.error.get());
@@ -162,6 +167,41 @@ public class AsyncReadResultProcessorTests extends ThreadPooledTestSuite {
         }
 
         Assert.assertTrue("ReadResult was not closed when the AsyncReadResultProcessor was closed.", rr.isClosed());
+    }
+
+    /**
+     * Tests the {@link AsyncReadResultProcessor#processAll} method.
+     */
+    @Test
+    public void testProcessAll() throws Exception {
+        // Pre-generate some entries.
+        ArrayList<byte[]> entries = new ArrayList<>();
+        int totalLength = generateEntries(entries);
+
+        // Setup an entry provider supplier.
+        AtomicInteger currentIndex = new AtomicInteger();
+        StreamSegmentReadResult.NextEntrySupplier supplier = (offset, length) -> {
+            int idx = currentIndex.getAndIncrement();
+            if (idx == entries.size() - 1) {
+                // Future read result.
+                Supplier<ReadResultEntryContents> entryContentsSupplier =
+                        () -> new ReadResultEntryContents(new ByteArrayInputStream(entries.get(idx)), entries.get(idx).length);
+                return new TestFutureReadResultEntry(offset, length, entryContentsSupplier, executorService());
+            } else if (idx >= entries.size()) {
+                return null;
+            }
+
+            // Normal read.
+            return new CacheReadResultEntry(offset, entries.get(idx), 0, entries.get(idx).length);
+        };
+
+        // Fetch all the data and compare with expected.
+        @Cleanup
+        StreamSegmentReadResult rr = new StreamSegmentReadResult(0, totalLength, supplier, "");
+        val result = AsyncReadResultProcessor.processAll(rr, executorService(), TIMEOUT);
+        val actualData = result.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        val expectedData = new SequenceInputStream(Iterators.asEnumeration(entries.stream().map(ByteArrayInputStream::new).iterator()));
+        AssertExtensions.assertStreamEquals("Unexpected data read back.", expectedData, actualData, totalLength);
     }
 
     private int generateEntries(ArrayList<byte[]> entries) {
@@ -195,7 +235,7 @@ public class AsyncReadResultProcessorTests extends ThreadPooledTestSuite {
         @Override
         public boolean processEntry(ReadResultEntry e) {
             try {
-                Assert.assertTrue("Received Entry that is not ready to serve data yet.", FutureHelpers.isSuccessful(e.getContent()));
+                Assert.assertTrue("Received Entry that is not ready to serve data yet.", Futures.isSuccessful(e.getContent()));
                 ReadResultEntryContents c = e.getContent().join();
                 byte[] data = new byte[c.getLength()];
                 StreamHelpers.readAll(c.getData(), data, 0, data.length);
@@ -244,13 +284,6 @@ public class AsyncReadResultProcessorTests extends ThreadPooledTestSuite {
         @Override
         public void complete(ReadResultEntryContents contents) {
             super.complete(contents);
-        }
-
-        /**
-         * Cancels this pending read result entry.
-         */
-        public void cancel() {
-            fail(new CancellationException());
         }
 
         @Override

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,80 +9,88 @@
  */
 package io.pravega.client.segment.impl;
 
-import io.pravega.common.concurrent.FutureHelpers;
-import io.pravega.shared.protocol.netty.InvalidMessageException;
-import io.pravega.common.util.CircularBuffer;
 import com.google.common.base.Preconditions;
-
-import java.nio.ByteBuffer;
-
-import javax.annotation.concurrent.GuardedBy;
-
-import io.pravega.shared.protocol.netty.WireCommandType;
+import io.pravega.common.Exceptions;
+import io.pravega.common.concurrent.Futures;
+import io.pravega.common.util.CircularBuffer;
 import io.pravega.shared.protocol.netty.WireCommands;
+import io.pravega.shared.protocol.netty.WireCommands.SegmentRead;
+import java.nio.ByteBuffer;
+import java.util.concurrent.CompletableFuture;
+import javax.annotation.concurrent.GuardedBy;
 import lombok.Synchronized;
 import lombok.ToString;
 import lombok.extern.slf4j.Slf4j;
 
+import static com.google.common.base.Preconditions.checkState;
+import static io.pravega.client.segment.impl.EndOfSegmentException.ErrorType.END_OFFSET_REACHED;
+
 /**
- * Manages buffering and provides a synchronus to {@link AsyncSegmentInputStream}
+ * Manages buffering and provides a synchronous to {@link AsyncSegmentInputStream}
  * 
  * @see SegmentInputStream
  */
 @Slf4j
 @ToString
 class SegmentInputStreamImpl implements SegmentInputStream {
-    private static final int DEFAULT_READ_LENGTH = 64 * 1024;
-    static final int DEFAULT_BUFFER_SIZE = 2 * SegmentInputStreamImpl.DEFAULT_READ_LENGTH;
+    static final int MIN_BUFFER_SIZE = 1024;
+    static final int DEFAULT_BUFFER_SIZE = 1024 * 1024;
+    static final int MAX_BUFFER_SIZE = 10 * 1024 * 1024;
+    private static final int DEFAULT_READ_LENGTH = 256 * 1024;
+    private static final long UNBOUNDED_END_OFFSET = Long.MAX_VALUE;
 
     private final AsyncSegmentInputStream asyncInput;
-    private final int readLength;
+    private final int minReadLength;
     @GuardedBy("$lock")
     private final CircularBuffer buffer;
     @GuardedBy("$lock")
-    private final ByteBuffer headerReadingBuffer = ByteBuffer.allocate(WireCommands.TYPE_PLUS_LENGTH_SIZE);
-    @GuardedBy("$lock")
     private long offset;
+    @GuardedBy("$lock")
+    private final long endOffset;
     @GuardedBy("$lock")
     private boolean receivedEndOfSegment = false;
     @GuardedBy("$lock")
-    private AsyncSegmentInputStream.ReadFuture outstandingRequest = null;
+    private boolean receivedTruncated = false;
+    @GuardedBy("$lock")
+    private CompletableFuture<SegmentRead> outstandingRequest = null;
 
-    SegmentInputStreamImpl(AsyncSegmentInputStream asyncInput, long offset) {
-        this(asyncInput, offset, DEFAULT_BUFFER_SIZE);
+    SegmentInputStreamImpl(AsyncSegmentInputStream asyncInput, long startOffset) {
+        this(asyncInput, startOffset, UNBOUNDED_END_OFFSET, DEFAULT_BUFFER_SIZE);
     }
 
-    SegmentInputStreamImpl(AsyncSegmentInputStream asyncInput, long offset, int bufferSize) {
-        Preconditions.checkArgument(offset >= 0);
+    SegmentInputStreamImpl(AsyncSegmentInputStream asyncInput, long startOffset, long endOffset, int bufferSize) {
+        Preconditions.checkArgument(startOffset >= 0);
         Preconditions.checkNotNull(asyncInput);
+        Preconditions.checkNotNull(endOffset, "endOffset");
+        Preconditions.checkArgument(endOffset >= startOffset, "Invalid end offset.");
         this.asyncInput = asyncInput;
-        this.offset = offset;
-        /*
-         * The logic for determining the read length and buffer size are as follows.
-         * If we are reading a single event, then we set the read length to be the size
-         * of the event plus the header.
-         *
-         * If this input stream is going to read many events of different sizes, then
-         * we set the read length to be equal to the max write size and the buffer
-         * size to be twice that. We do it so that we can have at least two events
-         * buffered for next event reads.
-         */
-        this.readLength = Math.min(DEFAULT_READ_LENGTH, bufferSize);
-        this.buffer = new CircularBuffer(Math.max(bufferSize, readLength + 1));
-
+        this.offset = startOffset;
+        this.endOffset = endOffset;
+        // Reads should not be so large they cannot fit into the buffer.
+        this.minReadLength = Math.min(DEFAULT_READ_LENGTH, bufferSize);
+        this.buffer = new CircularBuffer(bufferSize);
         issueRequestIfNeeded();
     }
 
     @Override
     @Synchronized
-    public void setOffset(long offset) {
+    public void setOffset(long offset, boolean resendRequest) {
         log.trace("SetOffset {}", offset);
         Preconditions.checkArgument(offset >= 0);
-        if (offset != this.offset) {
+        Exceptions.checkNotClosed(asyncInput.isClosed(), this);
+        if (offset > this.offset) {
+            receivedTruncated = false;
+        }
+        if (offset != this.offset || resendRequest) {
+            if (outstandingRequest != null) {
+                log.debug("Cancelling the read request for segment {} at offset {}. The new read offset is {}", asyncInput.getSegmentId(), this.offset, offset);
+                outstandingRequest.cancel(true);
+                log.debug("Completed cancelling the read request for segment {}", asyncInput.getSegmentId());
+                outstandingRequest = null;
+            }
             this.offset = offset;
             buffer.clear();
             receivedEndOfSegment = false;
-            outstandingRequest = null;        
         }
     }
 
@@ -93,61 +101,55 @@ class SegmentInputStreamImpl implements SegmentInputStream {
     }
 
     /**
-     * @see SegmentInputStream#read()
+     * @see SegmentInputStream#read(ByteBuffer, long)
      */
     @Override
     @Synchronized
-    public ByteBuffer read(long timeout) throws EndOfSegmentException {
-        log.trace("Read called at offset {}", offset);
-        fillBuffer();
-        while (buffer.dataAvailable() < WireCommands.TYPE_PLUS_LENGTH_SIZE) {
-            if (buffer.dataAvailable() == 0 && receivedEndOfSegment) {
+    public int read(ByteBuffer toFill, long timeout) throws EndOfSegmentException, SegmentTruncatedException {
+        Exceptions.checkNotClosed(asyncInput.isClosed(), this);
+        if (this.offset >= this.endOffset) {
+            log.debug("All events up to the configured end offset:{} have been read", endOffset);
+            throw new EndOfSegmentException(END_OFFSET_REACHED);
+        }
+        if (outstandingRequest == null) {
+            fillBuffer();
+        }
+        if (receivedTruncated) {
+            throw new SegmentTruncatedException();
+        }
+        while (buffer.dataAvailable() == 0) {
+            if (receivedEndOfSegment) {
                 throw new EndOfSegmentException();
             }
-            if (outstandingRequest.await(timeout)) {
-                handleRequest();
-            } else {
-                return null;
+            Futures.await(outstandingRequest, timeout);
+            if (!outstandingRequest.isDone()) {
+                return 0;
             }
+            handleRequest();
         }
-        long originalOffset = offset;
-        boolean success = false;
-        try {
-            headerReadingBuffer.clear();
-            offset += buffer.read(headerReadingBuffer);
-            headerReadingBuffer.flip();
-            int type = headerReadingBuffer.getInt();
-            int length = headerReadingBuffer.getInt();
-            if (type != WireCommandType.EVENT.getCode()) {
-                throw new InvalidMessageException("Event was of wrong type: " + type);
-            }
-            if (length < 0 || length > WireCommands.MAX_WIRECOMMAND_SIZE) {
-                throw new InvalidMessageException("Event of invalid length: " + length);
-            }
-            ByteBuffer result = ByteBuffer.allocate(length);
-            offset += buffer.read(result);
-            while (result.hasRemaining()) {
-                handleRequest();
-                offset += buffer.read(result);
-            }
-            success = true;
-            result.flip();
-            return result;
-        } finally {
-            if (!success) {
-                offset = originalOffset;
-                buffer.clear();
-            }
-        }
+        
+        int read = buffer.read(toFill);
+        offset += read;
+        return read;
     }
-
 
     private boolean dataWaitingToGoInBuffer() {
-        return outstandingRequest != null && outstandingRequest.isSuccess() && buffer.capacityAvailable() > 0;
+        return outstandingRequest != null && Futures.isSuccessful(outstandingRequest) && buffer.capacityAvailable() > 0;
     }
 
-    private void handleRequest() {
-        WireCommands.SegmentRead segmentRead = asyncInput.getResult(outstandingRequest);
+    private void handleRequest() throws SegmentTruncatedException {
+        SegmentRead segmentRead;
+        try {
+            segmentRead = outstandingRequest.join();
+        } catch (Exception e) {
+            outstandingRequest = null;
+            if (Exceptions.unwrap(e) instanceof SegmentTruncatedException) {
+                receivedTruncated = true;
+                throw new SegmentTruncatedException(e);
+            }
+            throw e;
+        }
+        verifyIsAtCorrectOffset(segmentRead);
         if (segmentRead.getData().hasRemaining()) {
             buffer.fill(segmentRead.getData());
         }
@@ -160,44 +162,84 @@ class SegmentInputStreamImpl implements SegmentInputStream {
         }
     }
 
+    private void verifyIsAtCorrectOffset(WireCommands.SegmentRead segmentRead) {
+        long offsetRead = segmentRead.getOffset() + segmentRead.getData().position();
+        long expectedOffset = offset + buffer.dataAvailable();
+        checkState(offsetRead == expectedOffset, "ReadSegment returned data for the wrong offset %s vs %s", offsetRead,
+                   expectedOffset);
+    }
+
     /**
-     * @return If there is enough room for another request, and we aren't already waiting on one
+     * Issues a request
+     *  - if there is enough room for another request, and we aren't already waiting on one and
+     *  - if we have not read up to the configured endOffset.
      */
     private void issueRequestIfNeeded() {
-        if (!receivedEndOfSegment && outstandingRequest == null && buffer.capacityAvailable() > readLength) {
-            outstandingRequest = asyncInput.read(offset + buffer.dataAvailable(), readLength);
+        //compute read length based on current offset up to which the events are read.
+        int updatedReadLength = computeReadLength(offset + buffer.dataAvailable());
+        if (!receivedEndOfSegment && !receivedTruncated && updatedReadLength > 0 && outstandingRequest == null) {
+            log.trace("Issuing read request for segment {} of {} bytes", getSegmentId(), updatedReadLength);
+            outstandingRequest = asyncInput.read(offset + buffer.dataAvailable(), updatedReadLength);
         }
     }
 
-    @Override
-    public long fetchCurrentStreamLength() {
-        log.trace("Fetching current stream length");
-        return FutureHelpers.getAndHandleExceptions(asyncInput.getSegmentInfo(), RuntimeException::new).getSegmentLength();
+    /**
+     * Compute the read length based on the current fetch offset and the configured end offset.
+     */
+    private int computeReadLength(long currentFetchOffset) {
+        Preconditions.checkState(endOffset >= currentFetchOffset,
+                "Current offset up to to which events are fetched should be less than the configured end offset");
+        int currentReadLength = Math.max(minReadLength, buffer.capacityAvailable());
+        if (UNBOUNDED_END_OFFSET == endOffset) { //endOffset is UNBOUNDED_END_OFFSET if the endOffset is not set.
+            return currentReadLength;
+        }
+        long numberOfBytesRemaining = endOffset - currentFetchOffset;
+        return Math.toIntExact(Math.min(currentReadLength, numberOfBytesRemaining));
     }
 
     @Override
     @Synchronized
     public void close() {
         log.trace("Closing {}", this);
+        if (outstandingRequest != null) {
+            log.debug("Cancel outstanding read request for segment {}", asyncInput.getSegmentId());
+            outstandingRequest.cancel(true);
+            log.debug("Completed cancelling outstanding read request for segment {}", asyncInput.getSegmentId());
+        }
         asyncInput.close();
     }
 
     @Override
     @Synchronized
-    public void fillBuffer() {
+    public CompletableFuture<?> fillBuffer() {
         log.trace("Filling buffer {}", this);
-        issueRequestIfNeeded();
-        while (dataWaitingToGoInBuffer()) {
-            handleRequest();
+        Exceptions.checkNotClosed(asyncInput.isClosed(), this);
+        try {      
+            issueRequestIfNeeded();
+            while (dataWaitingToGoInBuffer()) {
+                handleRequest();
+            }
+        } catch (SegmentTruncatedException e) {
+            log.warn("Encountered exception filling buffer", e);
+            return CompletableFuture.completedFuture(null);
         }
+        return outstandingRequest == null ? CompletableFuture.completedFuture(null) : outstandingRequest;
     }
     
     @Override
     @Synchronized
-    public boolean canReadWithoutBlocking() {
-        boolean result = buffer.dataAvailable() > 0 || (outstandingRequest != null && outstandingRequest.isSuccess()
-                && asyncInput.getResult(outstandingRequest).getData().hasRemaining());
-        log.trace("canReadWithoutBlocking {}", result);
+    public int bytesInBuffer() {
+        int result = buffer.dataAvailable();
+        boolean atEnd = receivedEndOfSegment || receivedTruncated || (outstandingRequest != null && outstandingRequest.isCompletedExceptionally());
+        if (outstandingRequest != null && Futures.isSuccessful(outstandingRequest)) {
+            SegmentRead request = outstandingRequest.join();
+            result += request.getData().remaining();
+            atEnd |= request.isEndOfSegment();
+        }
+        if (result <= 0 && atEnd) {
+           result = -1;
+        }
+        log.trace("bytesInBuffer {} on segment {} status is {}", result, getSegmentId(), this);        
         return result;
     }
 

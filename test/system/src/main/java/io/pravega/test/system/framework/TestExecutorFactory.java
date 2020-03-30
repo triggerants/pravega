@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,26 +9,47 @@
  */
 package io.pravega.test.system.framework;
 
-import org.apache.commons.lang.NotImplementedException;
+import io.pravega.test.system.framework.services.kubernetes.K8SequentialExecutor;
+import lombok.Getter;
+import org.apache.commons.lang3.NotImplementedException;
+
+import static io.pravega.test.system.framework.Utils.getConfig;
 
 public class TestExecutorFactory {
-    private static final TestExecutor MARATHON_SEQUENTIAL_EXECUTOR = new RemoteSequential();
+    @Getter(lazy = true)
+    private final TestExecutor marathonSequentialExecutor = new RemoteSequential();
+
+    @Getter(lazy = true)
+    private final TestExecutor dockerExecutor = new DockerBasedTestExecutor();
+
+    @Getter(lazy = true)
+    private final TestExecutor k8sExecutor = new K8SequentialExecutor();
 
     public enum TestExecutorType {
         LOCAL,
+        DOCKER,
+        KUBERNETES,
         REMOTE_SEQUENTIAL,
-        REMOTE_DISTRIBUTED //TODO: Yet to be implemented.
+        REMOTE_DISTRIBUTED //TODO: https://github.com/pravega/pravega/issues/2074.
     }
 
-    public static TestExecutor getTestExecutor(TestExecutorType type) {
+    TestExecutor getTestExecutor(TestExecutorType type) {
         switch (type) {
+            case DOCKER:
+                return getDockerExecutor();
             case REMOTE_SEQUENTIAL:
-                return MARATHON_SEQUENTIAL_EXECUTOR;
+                return getMarathonSequentialExecutor();
+            case KUBERNETES:
+                 return getK8sExecutor();
             case REMOTE_DISTRIBUTED:
                 throw new NotImplementedException("Distributed execution not implemented");
             case LOCAL:
             default:
                 throw new IllegalArgumentException("Invalid Executor specified: " + type);
         }
+    }
+
+    static TestExecutorType getTestExecutionType() {
+        return TestExecutorType.valueOf(getConfig("execType", "LOCAL"));
     }
 }

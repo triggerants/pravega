@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,57 +10,56 @@
 package io.pravega.segmentstore.server;
 
 import io.pravega.segmentstore.contracts.SegmentProperties;
-import io.pravega.segmentstore.contracts.StreamSegmentInformation;
-import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+import java.util.function.BiPredicate;
 
 /**
  * Defines an immutable StreamSegment Metadata.
  */
 public interface SegmentMetadata extends SegmentProperties {
     /**
-     * Defines an attribute value that denotes a missing value.
-     */
-    Long NULL_ATTRIBUTE_VALUE = Long.MIN_VALUE; //This is the same as WireCommands.NULL_ATTRIBUTE_VALUE
-
-    /**
      * Gets a value indicating the id of this StreamSegment.
+     * @return The StreamSegment Id.
      */
     long getId();
 
     /**
-     * Gets a value indicating the id of this StreamSegment's parent.
-     */
-    long getParentId();
-
-    /**
      * Gets a value indicating the id of the Container this StreamSegment belongs to.
+     * @return The Container Id.
      */
     int getContainerId();
 
     /**
      * Gets a value indicating whether this StreamSegment has been merged into another.
+     * @return true if StreamSegment is merged, false otherwise.
      */
     boolean isMerged();
 
     /**
      * Gets a value indicating whether this StreamSegment has been sealed in Storage.
-     * This is different from isSealed(), which returns true if the StreamSegment has been sealed in DurableLog or in Storage.
+     * This is different from isSealed(), which returns true if the StreamSegment has been sealed in the Metadata or in Storage.
+     * @return true if this StreamSegment has been sealed in Storage, false otherwise.
      */
     boolean isSealedInStorage();
 
     /**
+     * Gets a value indicating whether this StreamSegment has been deleted in Storage.
+     * This is different from isDeleted(), which returns true if the StreamSegment has been deleted in the Metadata or in Storage.
+     * @return true if this StreamSegment has been deleted in Storage, false otherwise.
+     */
+    boolean isDeletedInStorage();
+
+    /**
      * Gets a value indicating the length of this StreamSegment for the part that exists in Storage Only.
+     * @return The length of the StreamSegment.
      */
     long getStorageLength();
 
     /**
-     * Gets a value indicating the length of this entire StreamSegment (the part in Storage + the part in DurableLog).
-     */
-    long getDurableLogLength();
-
-    /**
      * Gets a value representing the when the Segment was last used. The meaning of this value is implementation specific,
      * however higher values should indicate it was used more recently.
+     * @return The value representing when the Segment last used.
      */
     long getLastUsed();
 
@@ -77,9 +76,48 @@ public interface SegmentMetadata extends SegmentProperties {
      * Creates a new SegmentProperties instance with current information from this SegmentMetadata object.
      *
      * @return The new SegmentProperties instance. This object is completely detached from the SegmentMetadata from which
-     * it was created (changes to the base object will not be reflected in the result).
+     * it was created (changes to the base object will not be reflected in the result). The returned object will have a copy
+     * of this instance's Attributes which would make it safe for iterating over without holding any locks.
      */
-    default SegmentProperties getSnapshot() {
-        return new StreamSegmentInformation(this, new HashMap<>(getAttributes()));
-    }
+    SegmentProperties getSnapshot();
+
+    /**
+     * Gets a value indicating whether this {@link SegmentMetadata} instance is pinned to memory. If pinned, this metadata
+     * will never be evicted by the owning metadata (even if there is eviction pressure and this Segment meets all other
+     * eviction criteria).
+     *
+     * Notes:
+     * - This will still be cleared out of the metadata if {@link UpdateableContainerMetadata#reset()} is invoked.
+     * - This has no bearing on the eviction of the Segment's Extended Attributes.
+     *
+     * @return True if pinned, false otherwise.
+     */
+    boolean isPinned();
+
+    /**
+     * Gets a read-only Map of AttributeId-Values for this Segment. The returned object is a View combining both Core
+     * and Extended attributes and provides direct read-only access to all this Segment's Attributes.
+     *
+     * Notes on concurrency:
+     * - All retrieval methods are thread-safe and can be invoked from any context.
+     * - Iterating over this Map's elements ({@link Map#keySet()}, {@link Map#values()}, {@link Map#entrySet()}) is not
+     * thread safe and should only be done in an (external) synchronized context (while holding the same lock that is
+     * used to update this {@link SegmentMetadata} instance).
+     * - Consider using {@link #getSnapshot()} if you need a thread-safe way of iterating over the current set of Attributes.
+     * - Consider using {@link #getAttributes(BiPredicate)} if you need to get a subset of the attributes and can provide
+     * a filter.
+     *
+     * @return The map.
+     */
+    @Override
+    Map<UUID, Long> getAttributes();
+
+    /**
+     * Gets new Map containing all the Attributes for this Segment that match the given filter.
+     *
+     * @param filter The Key-Value filter that will be used.
+     * @return A new Map containing the result. This is a new object, detached from this {@link SegmentMetadata} instance
+     * and can be safely accessed and iterated over from any thread.
+     */
+    Map<UUID, Long> getAttributes(BiPredicate<UUID, Long> filter);
 }

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,13 +9,17 @@
  */
 package io.pravega.segmentstore.server.store;
 
-import io.pravega.common.util.ConfigBuilder;
 import com.google.common.base.Preconditions;
+import io.pravega.common.util.ConfigBuilder;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.IOException;
 import java.util.Properties;
+import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
+import lombok.val;
 
 /**
  * Configuration for ServiceBuilder.
@@ -24,6 +28,7 @@ import lombok.extern.slf4j.Slf4j;
 public class ServiceBuilderConfig {
     //region Members
 
+    public static final String CONFIG_FILE_PROPERTY_NAME = "pravega.configurationFile";
     private final Properties properties;
 
     //endregion
@@ -56,11 +61,33 @@ public class ServiceBuilderConfig {
      *
      * @param constructor A Supplier for a ConfigBuilder for the given Configuration.
      * @param <T>         The type of the Configuration to instantiate.
+     * @return The new instance of a Configuration for this builder.
      */
     public <T> T getConfig(Supplier<? extends ConfigBuilder<? extends T>> constructor) {
         return constructor.get()
                           .rebase(this.properties)
                           .build();
+    }
+
+    /**
+     * Stores the contents of the ServiceBuilderConfig into the given File.
+     *
+     * @param file The file to store the contents in.
+     * @throws IOException If an exception occurred.
+     */
+    public void store(File file) throws IOException {
+        try (val s = new FileOutputStream(file, false)) {
+            this.properties.store(s, "");
+        }
+    }
+
+    /**
+     * Executes the given BiConsumer on all non-default properties in this configuration.
+     *
+     * @param consumer The BiConsumer to execute.
+     */
+    public void forEach(BiConsumer<? super Object, ? super Object> consumer) {
+        this.properties.forEach(consumer);
     }
 
     //region Default Configuration
@@ -69,6 +96,7 @@ public class ServiceBuilderConfig {
      * Gets a default set of configuration values, in absence of any real configuration.
      * These configuration values are the default ones from all component configurations, except that it will
      * create only one container to host segments.
+     * @return The default set of configuration values.
      */
     public static ServiceBuilderConfig getDefaultConfig() {
         // All component configs should have defaults built-in, so no need to override them here.
@@ -83,12 +111,22 @@ public class ServiceBuilderConfig {
 
     /**
      * Represents a Builder for the ServiceBuilderConfig.
+     * Returns the new instance of a Configuration.
      */
     public static class Builder {
         private final Properties properties;
 
         private Builder() {
             this.properties = new Properties();
+        }
+
+        /**
+         * Creates a new instance of this class containing a copy of the existing configuration.
+         *
+         * @return A new instance of this class.
+         */
+        public Builder makeCopy() {
+            return new Builder().include(this.properties);
         }
 
         /**

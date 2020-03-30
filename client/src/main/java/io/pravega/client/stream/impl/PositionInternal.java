@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -11,21 +11,25 @@ package io.pravega.client.stream.impl;
 
 import io.pravega.client.segment.impl.Segment;
 import io.pravega.client.stream.Position;
+import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.Set;
 
 /**
- * A position has two components
- * 1. ownedSegments -- segments that can be read currently. Each ownedSegment also has an offset indicating the
- * point until which events have been read from that segment. Completely read segments have offset of -1.
- * 2. futureOwnedSegments -- segments that can be read after one of the currently read segment is completely read. Each
- * segment in this set has exactly one previous segment that belongs to the set ownedSegments.
+ * A position has ownedSegments -- segments that can be read currently (or have been completed and
+ * not yet replaced).
+ * 
+ * A Position obtained at any given point will return a segment for all of the keyspace owned by
+ * the reader.
+ * 
+ * Each ownedSegment also has an offset indicating the point until which events have been read from
+ * that segment. Completely read segments have offset of -1.
  * <p>
- * Well-formed position object. A position is called well-formed iff the following hold.
- * 1. for each segment s in futureOwnedSegment, s.previous belongs to ownedSegments and s.previous.offset != -1
- * 2. for each segment s in ownedSegment, s.previous does not belongs to ownedSegments
+ * We say that a position object P is well-formed to denote that every segment `s` in `P`
+ * is not a predecessor of any segment in ownedSegments.
  */
 public abstract class PositionInternal implements Position {
+
     /**
      * Gets the set of segments currently being read, i.e., ownedSegments set.
      */
@@ -37,6 +41,13 @@ public abstract class PositionInternal implements Position {
      * @return the read offset for each segment in the ownedSegments set
      */
     abstract Map<Segment, Long> getOwnedSegmentsWithOffsets();
+    
+    /**
+     * Completely read segments have offset of -1.
+     *
+     * @return the read offset for each segmentWithRange in the ownedSegments set
+     */
+    abstract Map<SegmentWithRange, Long> getOwnedSegmentRangesWithOffsets();
 
     /**
      * Gets the set of completely read segments.
@@ -49,5 +60,15 @@ public abstract class PositionInternal implements Position {
      * @param segmentId input segment
      */
     abstract Long getOffsetForOwnedSegment(Segment segmentId);
+    
+    /**
+     * Deserializes the position from its serialized from obtained from calling {@link #toBytes()}.
+     * 
+     * @param position A serialized position.
+     * @return The position object.
+     */
+    public static Position fromBytes(ByteBuffer position) {
+        return PositionImpl.fromBytes(position);
+    }
 
 }

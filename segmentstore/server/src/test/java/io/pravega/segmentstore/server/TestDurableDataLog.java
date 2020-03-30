@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,11 +10,14 @@
 package io.pravega.segmentstore.server;
 
 import com.google.common.base.Preconditions;
-import io.pravega.common.util.ArrayView;
 import io.pravega.common.util.CloseableIterator;
+import io.pravega.common.util.CompositeArrayView;
 import io.pravega.segmentstore.storage.DurableDataLog;
 import io.pravega.segmentstore.storage.DurableDataLogException;
 import io.pravega.segmentstore.storage.LogAddress;
+import io.pravega.segmentstore.storage.QueueStats;
+import io.pravega.segmentstore.storage.ThrottleSourceListener;
+import io.pravega.segmentstore.storage.WriteSettings;
 import io.pravega.segmentstore.storage.mocks.InMemoryDurableDataLogFactory;
 import io.pravega.test.common.ErrorInjector;
 import java.time.Duration;
@@ -69,10 +72,20 @@ public class TestDurableDataLog implements DurableDataLog {
     }
 
     @Override
-    public CompletableFuture<LogAddress> append(ArrayView data, Duration timeout) {
+    public void enable() throws DurableDataLogException {
+        this.wrappedLog.enable();
+    }
+
+    @Override
+    public void disable() throws DurableDataLogException {
+        this.wrappedLog.disable();
+    }
+
+    @Override
+    public CompletableFuture<LogAddress> append(CompositeArrayView data, Duration timeout) {
         ErrorInjector.throwSyncExceptionIfNeeded(this.appendSyncErrorInjector);
-        return ErrorInjector.throwAsyncExceptionIfNeeded(this.appendAsyncErrorInjector)
-                            .thenCompose(v -> this.wrappedLog.append(data, timeout));
+        return ErrorInjector.throwAsyncExceptionIfNeeded(this.appendAsyncErrorInjector,
+                () -> this.wrappedLog.append(data, timeout));
     }
 
     @Override
@@ -94,18 +107,23 @@ public class TestDurableDataLog implements DurableDataLog {
     }
 
     @Override
-    public int getMaxAppendLength() {
-        return this.wrappedLog.getMaxAppendLength();
-    }
-
-    @Override
-    public long getLastAppendSequence() {
-        return this.wrappedLog.getLastAppendSequence();
+    public WriteSettings getWriteSettings() {
+        return this.wrappedLog.getWriteSettings();
     }
 
     @Override
     public long getEpoch() {
         return this.wrappedLog.getEpoch();
+    }
+
+    @Override
+    public QueueStats getQueueStatistics() {
+        return this.wrappedLog.getQueueStatistics();
+    }
+
+    @Override
+    public void registerQueueStateChangeListener(ThrottleSourceListener listener) {
+        this.wrappedLog.registerQueueStateChangeListener(listener);
     }
 
     //endregion
@@ -191,7 +209,25 @@ public class TestDurableDataLog implements DurableDataLog {
      * @return The newly created log.
      */
     public static TestDurableDataLog create(int containerId, int maxAppendSize, ScheduledExecutorService executorService) {
+        return create(containerId, maxAppendSize, 0, executorService);
+    }
+
+    /**
+     * Creates a new TestDurableDataLog backed by an InMemoryDurableDataLog.
+     *
+     * @param containerId       The Id of the container.
+     * @param maxAppendSize     The maximum append size for the log.
+     * @param appendDelayMillis The amount of delay, in milliseconds, for each append operation.
+     * @param executorService   An executor to use for async operations.
+     * @return The newly created log.
+     */
+    public static TestDurableDataLog create(int containerId, int maxAppendSize, int appendDelayMillis, ScheduledExecutorService executorService) {
         try (InMemoryDurableDataLogFactory factory = new InMemoryDurableDataLogFactory(maxAppendSize, executorService)) {
+            if (appendDelayMillis > 0) {
+                Duration delay = Duration.ofMillis(appendDelayMillis);
+                factory.setAppendDelayProvider(() -> delay);
+            }
+
             DurableDataLog log = factory.createDurableDataLog(containerId);
             return create(log);
         }

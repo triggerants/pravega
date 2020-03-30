@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,9 +9,7 @@
  */
 package io.pravega.controller.server;
 
-import io.pravega.shared.metrics.MetricsProvider;
-import io.pravega.controller.fault.ControllerClusterListenerConfig;
-import io.pravega.controller.fault.impl.ControllerClusterListenerConfigImpl;
+import com.google.common.annotations.VisibleForTesting;
 import io.pravega.controller.server.eventProcessor.ControllerEventProcessorConfig;
 import io.pravega.controller.server.eventProcessor.impl.ControllerEventProcessorConfigImpl;
 import io.pravega.controller.server.impl.ControllerServiceConfigImpl;
@@ -26,10 +24,15 @@ import io.pravega.controller.store.host.HostMonitorConfig;
 import io.pravega.controller.store.host.impl.HostMonitorConfigImpl;
 import io.pravega.controller.timeout.TimeoutServiceConfig;
 import io.pravega.controller.util.Config;
-import lombok.extern.slf4j.Slf4j;
+import io.pravega.shared.metrics.MetricsProvider;
+import io.pravega.shared.metrics.StatsProvider;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
 import java.util.Optional;
-import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
+
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * Entry point of controller server.
@@ -39,65 +42,114 @@ public class Main {
 
     public static void main(String[] args) {
 
-        //0. Initialize metrics provider
-        MetricsProvider.initialize(Config.getMetricsConfig());
+        StatsProvider statsProvider = null;
+        try {
+            //0. Initialize metrics provider
+            MetricsProvider.initialize(Config.METRICS_CONFIG);
+            statsProvider = MetricsProvider.getMetricsProvider();
+            statsProvider.start();
 
-        ZKClientConfig zkClientConfig = ZKClientConfigImpl.builder()
-                .connectionString(Config.ZK_URL)
-                .namespace("pravega/" + Config.CLUSTER_NAME)
-                .initialSleepInterval(Config.ZK_RETRY_SLEEP_MS)
-                .maxRetries(Config.ZK_MAX_RETRIES)
-                .build();
+            ZKClientConfig zkClientConfig = ZKClientConfigImpl.builder()
+                    .connectionString(Config.ZK_URL)
+                    .secureConnectionToZooKeeper(Config.SECURE_ZK)
+                    .trustStorePath(Config.ZK_TRUSTSTORE_FILE_PATH)
+                    .trustStorePasswordPath(Config.ZK_TRUSTSTORE_PASSWORD_FILE_PATH)
+                    .namespace("pravega/" + Config.CLUSTER_NAME)
+                    .initialSleepInterval(Config.ZK_RETRY_SLEEP_MS)
+                    .maxRetries(Config.ZK_MAX_RETRIES)
+                    .sessionTimeoutMs(Config.ZK_SESSION_TIMEOUT_MS)
+                    .build();
 
-        StoreClientConfig storeClientConfig = StoreClientConfigImpl.withZKClient(zkClientConfig);
+            StoreClientConfig storeClientConfig;
+            if (Config.USE_PRAVEGA_TABLES) {
+                storeClientConfig = StoreClientConfigImpl.withPravegaTablesClient(zkClientConfig);
+            } else {
+                storeClientConfig = StoreClientConfigImpl.withZKClient(zkClientConfig);
+            }
 
-        HostMonitorConfig hostMonitorConfig = HostMonitorConfigImpl.builder()
-                .hostMonitorEnabled(Config.HOST_MONITOR_ENABLED)
-                .hostMonitorMinRebalanceInterval(Config.CLUSTER_MIN_REBALANCE_INTERVAL)
-                .containerCount(Config.HOST_STORE_CONTAINER_COUNT)
-                .hostContainerMap(HostMonitorConfigImpl.getHostContainerMap(Config.SERVICE_HOST,
-                        Config.SERVICE_PORT, Config.HOST_STORE_CONTAINER_COUNT))
-                .build();
+            HostMonitorConfig hostMonitorConfig = HostMonitorConfigImpl.builder()
+                    .hostMonitorEnabled(Config.HOST_MONITOR_ENABLED)
+                    .hostMonitorMinRebalanceInterval(Config.CLUSTER_MIN_REBALANCE_INTERVAL)
+                    .containerCount(Config.HOST_STORE_CONTAINER_COUNT)
+                    .hostContainerMap(HostMonitorConfigImpl.getHostContainerMap(Config.SERVICE_HOST,
+                            Config.SERVICE_PORT, Config.HOST_STORE_CONTAINER_COUNT))
+                    .build();
 
-        ControllerClusterListenerConfig controllerClusterListenerConfig = ControllerClusterListenerConfigImpl.builder()
-                .minThreads(1)
-                .maxThreads(10)
-                .idleTime(10)
-                .idleTimeUnit(TimeUnit.SECONDS)
-                .maxQueueSize(512)
-                .build();
+            TimeoutServiceConfig timeoutServiceConfig = TimeoutServiceConfig.builder()
+                    .maxLeaseValue(Config.MAX_LEASE_VALUE)
+                    .build();
 
-        TimeoutServiceConfig timeoutServiceConfig = TimeoutServiceConfig.builder()
-                .maxLeaseValue(Config.MAX_LEASE_VALUE)
-                .maxScaleGracePeriod(Config.MAX_SCALE_GRACE_PERIOD)
-                .build();
+            ControllerEventProcessorConfig eventProcessorConfig = ControllerEventProcessorConfigImpl.withDefault();
 
-        ControllerEventProcessorConfig eventProcessorConfig = ControllerEventProcessorConfigImpl.withDefault();
+            GRPCServerConfig grpcServerConfig = Config.GRPC_SERVER_CONFIG;
 
-        GRPCServerConfig grpcServerConfig = Config.getGRPCServerConfig();
+            RESTServerConfig restServerConfig = RESTServerConfigImpl.builder()
+                    .host(Config.REST_SERVER_IP)
+                    .port(Config.REST_SERVER_PORT)
+                    .tlsEnabled(Config.TLS_ENABLED)
+                    .keyFilePath(Config.REST_KEYSTORE_FILE_PATH)
+                    .keyFilePasswordPath(Config.REST_KEYSTORE_PASSWORD_FILE_PATH)
+                    .build();
 
-        RESTServerConfig restServerConfig = RESTServerConfigImpl.builder()
-                .host(Config.REST_SERVER_IP)
-                .port(Config.REST_SERVER_PORT)
-                .build();
+            ControllerServiceConfig serviceConfig = ControllerServiceConfigImpl.builder()
+                    .threadPoolSize(Config.ASYNC_TASK_POOL_SIZE)
+                    .storeClientConfig(storeClientConfig)
+                    .hostMonitorConfig(hostMonitorConfig)
+                    .controllerClusterListenerEnabled(true)
+                    .timeoutServiceConfig(timeoutServiceConfig)
+                    .eventProcessorConfig(Optional.of(eventProcessorConfig))
+                    .grpcServerConfig(Optional.of(grpcServerConfig))
+                    .restServerConfig(Optional.of(restServerConfig))
+                    .tlsEnabledForSegmentStore(Config.TLS_ENABLED_FOR_SEGMENT_STORE)
+                    .build();
 
-        ControllerServiceConfig serviceConfig = ControllerServiceConfigImpl.builder()
-                .serviceThreadPoolSize(Config.ASYNC_TASK_POOL_SIZE)
-                .taskThreadPoolSize(Config.ASYNC_TASK_POOL_SIZE)
-                .storeThreadPoolSize(Config.ASYNC_TASK_POOL_SIZE)
-                .eventProcThreadPoolSize(Config.ASYNC_TASK_POOL_SIZE / 2)
-                .requestHandlerThreadPoolSize(Config.ASYNC_TASK_POOL_SIZE / 2)
-                .storeClientConfig(storeClientConfig)
-                .hostMonitorConfig(hostMonitorConfig)
-                .controllerClusterListenerConfig(Optional.of(controllerClusterListenerConfig))
-                .timeoutServiceConfig(timeoutServiceConfig)
-                .eventProcessorConfig(Optional.of(eventProcessorConfig))
-                .grpcServerConfig(Optional.of(grpcServerConfig))
-                .restServerConfig(Optional.of(restServerConfig))
-                .build();
+            setUncaughtExceptionHandler(Main::logUncaughtException);
 
-        ControllerServiceMain controllerServiceMain = new ControllerServiceMain(serviceConfig);
-        controllerServiceMain.startAsync();
-        controllerServiceMain.awaitTerminated();
+            ControllerServiceMain controllerServiceMain = new ControllerServiceMain(serviceConfig);
+            controllerServiceMain.startAsync();
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                onShutdown(controllerServiceMain);
+            }));
+            
+            controllerServiceMain.awaitTerminated();
+
+            log.info("Controller service exited");
+            System.exit(0);
+        } catch (Throwable e) {
+            log.error("Controller service failed", e);
+            System.exit(-1);
+        } finally {
+            if (statsProvider != null) {
+                statsProvider.close();
+            }
+        }
+    }
+
+    @VisibleForTesting
+    static void setUncaughtExceptionHandler(BiConsumer<Thread, Throwable> exceptionConsumer) {
+        Thread.setDefaultUncaughtExceptionHandler(exceptionConsumer::accept);
+    }
+
+    static void logUncaughtException(Thread t, Throwable e) {
+        log.error("Thread {} with stackTrace {} failed with uncaught exception", t.getName(), t.getStackTrace(), e);
+    }
+
+    @VisibleForTesting
+    static void onShutdown(ControllerServiceMain controllerServiceMain) {
+        MemoryMXBean memoryMXBean = ManagementFactory.getMemoryMXBean();
+        memoryMXBean.setVerbose(true);
+        log.info("Shutdown hook memory usage dump: Heap memory usage: {}, non heap memory usage {}", memoryMXBean.getHeapMemoryUsage(),
+                memoryMXBean.getNonHeapMemoryUsage());
+
+        log.info("Controller service shutting down");
+        try {
+            controllerServiceMain.stopAsync();
+            controllerServiceMain.awaitTerminated();
+        } finally {
+            if (Config.DUMP_STACK_ON_SHUTDOWN) {
+                Thread.getAllStackTraces().forEach((key, value) ->
+                        log.info("Shutdown Hook Thread dump: Thread {} stackTrace: {} ", key.getName(), value));
+            }
+        }
     }
 }

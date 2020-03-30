@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,9 +9,7 @@
  */
 package io.pravega.segmentstore.server.logs.operations;
 
-import io.pravega.segmentstore.server.logs.SerializationException;
-
-import java.io.DataInputStream;
+import io.pravega.segmentstore.server.SegmentOperation;
 
 /**
  * Log Operation that deals with Storage Operations. This is generally the direct result of an external operation.
@@ -35,8 +33,10 @@ public abstract class StorageOperation extends Operation implements SegmentOpera
         setStreamSegmentId(streamSegmentId);
     }
 
-    protected StorageOperation(OperationHeader header, DataInputStream source) throws SerializationException {
-        super(header, source);
+    /**
+     * Deserialization constructor.
+     */
+    protected StorageOperation() {
     }
 
     //endregion
@@ -50,16 +50,20 @@ public abstract class StorageOperation extends Operation implements SegmentOpera
 
     /**
      * Gets a value indicating the Offset within the StreamSegment where this operation applies.
+     * @return The offset within the Streamsegment.
      */
     public abstract long getStreamSegmentOffset();
 
     /**
      * Gets a value indicating the Length of this StorageOperation.
+     * @return The value indicating the length of this StorageOperation.
      */
     public abstract long getLength();
 
     /**
-     * Gets a value indicating the Offset within the StreamSegment of the last byte that this operation applies (i.e., ending offset).
+     * Gets a value indicating the Offset within the StreamSegment following the last byte that this operation applies 
+     * (i.e., the next write's offset).
+     * @return The Offset within the StreamSegment following the last byte that this operation applies.
      */
     public long getLastStreamSegmentOffset() {
         return getStreamSegmentOffset() + getLength();

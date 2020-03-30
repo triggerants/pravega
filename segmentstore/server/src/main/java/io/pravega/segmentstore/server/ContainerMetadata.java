@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -8,6 +8,8 @@
  *     http://www.apache.org/licenses/LICENSE-2.0
  */
 package io.pravega.segmentstore.server;
+
+import java.util.Collection;
 
 /**
  * Defines an immutable Stream Segment Container Metadata.
@@ -25,6 +27,7 @@ public interface ContainerMetadata {
 
     /**
      * Gets a value indicating the Id of the StreamSegmentContainer this Metadata refers to.
+     * @return The Id of the StreamSegmentContainer.
      */
     int getContainerId();
 
@@ -45,11 +48,13 @@ public interface ContainerMetadata {
 
     /**
      * Gets a value indicating whether we are currently in Recovery Mode.
+     * @return true if currently in Recovery Mode, false otherwise.
      */
     boolean isRecoveryMode();
 
     /**
      * Gets a value indicating the current Operation Sequence Number.
+     * @return The Current Operation Sequence Number.
      */
     long getOperationSequenceNumber();
 
@@ -70,4 +75,24 @@ public interface ContainerMetadata {
      * @return The mapped StreamSegmentMetadata, or null if none is.
      */
     SegmentMetadata getStreamSegmentMetadata(long streamSegmentId);
+
+    /**
+     * Gets a collection containing all StreamSegmentIds currently mapped.
+     * @return The collection containing all StreamSegmentIds currently mapped.
+     */
+    Collection<Long> getAllStreamSegmentIds();
+
+    /**
+     * Gets a value indicating the maximum number of segments that can be registered in this metadata at any given time.
+     *
+     * @return The maximum number of segments.
+     */
+    int getMaximumActiveSegmentCount();
+
+    /**
+     * Gets a value indicating the current number of registered segments.
+     *
+     * @return The count.
+     */
+    int getActiveSegmentCount();
 }

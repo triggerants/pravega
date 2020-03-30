@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,20 +10,22 @@
 package io.pravega.controller.eventProcessor.impl;
 
 import com.google.common.base.Preconditions;
-import io.pravega.client.ClientFactory;
+import io.pravega.client.EventStreamClientFactory;
 import io.pravega.client.admin.ReaderGroupManager;
-import io.pravega.controller.store.checkpoint.CheckpointStore;
-import io.pravega.controller.store.checkpoint.CheckpointStoreException;
+import io.pravega.controller.eventProcessor.EventProcessorConfig;
 import io.pravega.controller.eventProcessor.EventProcessorGroup;
 import io.pravega.controller.eventProcessor.EventProcessorSystem;
-import io.pravega.controller.eventProcessor.EventProcessorConfig;
+import io.pravega.controller.store.checkpoint.CheckpointStore;
+import io.pravega.controller.store.checkpoint.CheckpointStoreException;
 import io.pravega.shared.controller.event.ControllerEvent;
 import lombok.extern.slf4j.Slf4j;
+
+import java.util.concurrent.ScheduledExecutorService;
 
 @Slf4j
 public class EventProcessorSystemImpl implements EventProcessorSystem {
 
-    final ClientFactory clientFactory;
+    final EventStreamClientFactory clientFactory;
     final ReaderGroupManager readerGroupManager;
 
     private final String name;
@@ -31,7 +33,7 @@ public class EventProcessorSystemImpl implements EventProcessorSystem {
 
     private final String scope;
 
-    public EventProcessorSystemImpl(String name, String process, String scope, ClientFactory clientFactory, ReaderGroupManager readerGroupManager) {
+    public EventProcessorSystemImpl(String name, String process, String scope, EventStreamClientFactory clientFactory, ReaderGroupManager readerGroupManager) {
         this.name = name;
         this.process = process;
 
@@ -55,16 +57,17 @@ public class EventProcessorSystemImpl implements EventProcessorSystem {
         return this.process;
     }
 
+    @Override
     public <T extends ControllerEvent> EventProcessorGroup<T> createEventProcessorGroup(
             final EventProcessorConfig<T> eventProcessorConfig,
-            final CheckpointStore checkpointStore) throws CheckpointStoreException {
+            final CheckpointStore checkpointStore, final ScheduledExecutorService rebalanceExecutor) throws CheckpointStoreException {
         Preconditions.checkNotNull(eventProcessorConfig, "eventProcessorConfig");
         Preconditions.checkNotNull(checkpointStore, "checkpointStore");
 
         EventProcessorGroupImpl<T> actorGroup;
 
         // Create event processor group.
-        actorGroup = new EventProcessorGroupImpl<>(this, eventProcessorConfig, checkpointStore);
+        actorGroup = new EventProcessorGroupImpl<>(this, eventProcessorConfig, checkpointStore, rebalanceExecutor);
 
         // Initialize it.
         actorGroup.initialize();

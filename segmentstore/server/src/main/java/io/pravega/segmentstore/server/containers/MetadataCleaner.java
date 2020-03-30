@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,11 +12,9 @@ package io.pravega.segmentstore.server.containers;
 import io.pravega.common.LoggerHelpers;
 import io.pravega.common.concurrent.AbstractThreadPoolService;
 import io.pravega.common.concurrent.CancellationToken;
-import io.pravega.common.concurrent.FutureHelpers;
-import io.pravega.common.util.AsyncMap;
+import io.pravega.common.concurrent.Futures;
 import io.pravega.segmentstore.server.EvictableMetadata;
 import io.pravega.segmentstore.server.SegmentMetadata;
-import com.google.common.base.Preconditions;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.concurrent.CompletableFuture;
@@ -27,6 +25,7 @@ import java.util.stream.Collectors;
 import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.ThreadSafe;
 
+import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 import lombok.val;
 
@@ -40,7 +39,7 @@ class MetadataCleaner extends AbstractThreadPoolService {
 
     private final ContainerConfig config;
     private final EvictableMetadata metadata;
-    private final AsyncMap<String, SegmentState> stateStore;
+    private final MetadataStore metadataStore;
     private final Consumer<Collection<SegmentMetadata>> cleanupCallback;
     private final AtomicLong lastIterationSequenceNumber;
     private final CancellationToken stopToken;
@@ -57,22 +56,20 @@ class MetadataCleaner extends AbstractThreadPoolService {
      *
      * @param config          Container Configuration to use.
      * @param metadata        An EvictableMetadata to operate on.
-     * @param stateStore      SegmentStateStore to serialize SegmentState in.
+     * @param metadataStore   SegmentStateStore to serialize SegmentState in.
      * @param cleanupCallback A callback to invoke every time cleanup happened.
      * @param traceObjectId   An identifier to use for logging purposes. This will be included at the beginning of all
      *                        log calls initiated by this Service.
      * @param executor        The Executor to use for async callbacks and operations.
      */
-    MetadataCleaner(ContainerConfig config, EvictableMetadata metadata, AsyncMap<String, SegmentState> stateStore,
-                    Consumer<Collection<SegmentMetadata>> cleanupCallback, ScheduledExecutorService executor, String traceObjectId) {
+    MetadataCleaner(@NonNull ContainerConfig config, @NonNull EvictableMetadata metadata, @NonNull MetadataStore metadataStore,
+                    @NonNull Consumer<Collection<SegmentMetadata>> cleanupCallback, @NonNull ScheduledExecutorService executor,
+                    String traceObjectId) {
         super(traceObjectId, executor);
-        Preconditions.checkNotNull(metadata, "metadata");
-        Preconditions.checkNotNull(stateStore, "stateStore");
-        Preconditions.checkNotNull(cleanupCallback, "cleanupCallback");
 
         this.config = config;
         this.metadata = metadata;
-        this.stateStore = stateStore;
+        this.metadataStore = metadataStore;
         this.cleanupCallback = cleanupCallback;
         this.lastIterationSequenceNumber = new AtomicLong(metadata.getOperationSequenceNumber());
         this.stopToken = new CancellationToken();
@@ -89,7 +86,7 @@ class MetadataCleaner extends AbstractThreadPoolService {
 
     @Override
     protected CompletableFuture<Void> doRun() {
-        return FutureHelpers.loop(
+        return Futures.loop(
                 () -> !this.stopToken.isCancellationRequested(),
                 () -> delay().thenCompose(v -> runOnce()),
                 this.executor);
@@ -130,7 +127,7 @@ class MetadataCleaner extends AbstractThreadPoolService {
             }
         }
 
-        FutureHelpers.completeAfter(this::runOnceInternal, result);
+        Futures.completeAfter(this::runOnceInternal, result);
         return result;
     }
 
@@ -144,21 +141,22 @@ class MetadataCleaner extends AbstractThreadPoolService {
         // Serialize only those segments that are still alive (not deleted or merged - those will get removed anyway).
         val cleanupTasks = cleanupCandidates
                 .stream()
-                .filter(sm -> !sm.isDeleted() || !sm.isMerged())
-                .map(sm -> this.stateStore.put(sm.getName(), new SegmentState(sm.getId(), sm), this.config.getSegmentMetadataExpiration()))
+                .filter(sm -> !sm.isDeleted() && !sm.isMerged())
+                .map(sm -> this.metadataStore.updateSegmentInfo(sm, this.config.getSegmentMetadataExpiration()))
                 .collect(Collectors.toList());
 
-        return FutureHelpers
+        return Futures
                 .allOf(cleanupTasks)
                 .thenRunAsync(() -> {
                     Collection<SegmentMetadata> evictedSegments = this.metadata.cleanup(cleanupCandidates, lastSeqNo);
                     this.cleanupCallback.accept(evictedSegments);
-                    LoggerHelpers.traceLeave(log, this.traceObjectId, "metadataCleanup", traceId, evictedSegments.size());
+                    int evictedAttributes = this.metadata.cleanupExtendedAttributes(0, lastSeqNo);
+                    LoggerHelpers.traceLeave(log, this.traceObjectId, "metadataCleanup", traceId, evictedSegments.size(), evictedAttributes);
                 }, this.executor);
     }
 
     private CompletableFuture<Void> delay() {
-        val result = FutureHelpers.delayedFuture(this.config.getSegmentMetadataExpiration(), this.executor);
+        val result = Futures.delayedFuture(this.config.getSegmentMetadataExpiration(), this.executor);
         this.stopToken.register(result);
         return result;
     }

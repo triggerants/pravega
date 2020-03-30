@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -11,8 +11,6 @@ package io.pravega.test.integration.demo;
 
 import io.pravega.shared.NameUtils;
 import io.pravega.controller.eventProcessor.CheckpointConfig;
-import io.pravega.controller.fault.ControllerClusterListenerConfig;
-import io.pravega.controller.fault.impl.ControllerClusterListenerConfigImpl;
 import io.pravega.controller.server.ControllerServiceConfig;
 import io.pravega.controller.server.ControllerServiceMain;
 import io.pravega.controller.server.ControllerService;
@@ -33,11 +31,12 @@ import io.pravega.controller.timeout.TimeoutServiceConfig;
 import io.pravega.controller.util.Config;
 import io.pravega.client.stream.ScalingPolicy;
 import io.pravega.client.stream.impl.Controller;
-import lombok.extern.slf4j.Slf4j;
 
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+
+import lombok.extern.slf4j.Slf4j;
 
 
 @Slf4j
@@ -68,12 +67,36 @@ public class ControllerWrapper implements AutoCloseable {
                              final int controllerPort, final String serviceHost, final int servicePort,
                              final int containerCount, int restPort) {
 
+        this(connectionString, disableEventProcessor, disableControllerCluster, controllerPort,
+                serviceHost, servicePort, containerCount, restPort,
+                false, null, null);
+    }
+
+    public ControllerWrapper(final String connectionString, final boolean disableEventProcessor,
+                             final boolean disableControllerCluster,
+                             final int controllerPort, final String serviceHost, final int servicePort,
+                             final int containerCount, int restPort,
+                             boolean enableAuth, String passwordAuthHandlerInputFilePath, String tokenSigningKey) {
+
+        this(connectionString, disableEventProcessor, disableControllerCluster, controllerPort,
+                serviceHost, servicePort, containerCount, restPort,
+                enableAuth, passwordAuthHandlerInputFilePath, tokenSigningKey, 600);
+    }
+
+    public ControllerWrapper(final String connectionString, final boolean disableEventProcessor,
+                             final boolean disableControllerCluster,
+                             final int controllerPort, final String serviceHost, final int servicePort,
+                             final int containerCount, int restPort,
+                             boolean enableAuth, String passwordAuthHandlerInputFilePath,
+                             String tokenSigningKey, int accessTokenTtlInSeconds) {
+
         ZKClientConfig zkClientConfig = ZKClientConfigImpl.builder().connectionString(connectionString)
                 .initialSleepInterval(500)
                 .maxRetries(10)
+                .sessionTimeoutMs(10 * 1000)
                 .namespace("pravega/" + UUID.randomUUID())
                 .build();
-        StoreClientConfig storeClientConfig = StoreClientConfigImpl.withZKClient(zkClientConfig);
+        StoreClientConfig storeClientConfig = StoreClientConfigImpl.withPravegaTablesClient(zkClientConfig);
 
         HostMonitorConfig hostMonitorConfig = HostMonitorConfigImpl.builder()
                 .hostMonitorEnabled(false)
@@ -82,22 +105,8 @@ public class ControllerWrapper implements AutoCloseable {
                 .hostContainerMap(HostMonitorConfigImpl.getHostContainerMap(serviceHost, servicePort, containerCount))
                 .build();
 
-        Optional<ControllerClusterListenerConfig> controllerClusterListenerConfig;
-        if (!disableControllerCluster) {
-            controllerClusterListenerConfig = Optional.of(ControllerClusterListenerConfigImpl.builder()
-                    .minThreads(2)
-                    .maxThreads(10)
-                    .idleTime(10)
-                    .idleTimeUnit(TimeUnit.SECONDS)
-                    .maxQueueSize(512)
-                    .build());
-        } else {
-            controllerClusterListenerConfig = Optional.empty();
-        }
-
         TimeoutServiceConfig timeoutServiceConfig = TimeoutServiceConfig.builder()
                 .maxLeaseValue(Config.MAX_LEASE_VALUE)
-                .maxScaleGracePeriod(Config.MAX_SCALE_GRACE_PERIOD)
                 .build();
 
         Optional<ControllerEventProcessorConfig> eventProcessorConfig;
@@ -120,21 +129,26 @@ public class ControllerWrapper implements AutoCloseable {
             eventProcessorConfig = Optional.empty();
         }
 
-        GRPCServerConfig grpcServerConfig = GRPCServerConfigImpl.builder().port(controllerPort)
-                .publishedRPCHost("localhost").publishedRPCPort(controllerPort).build();
+        GRPCServerConfig grpcServerConfig = GRPCServerConfigImpl.builder()
+                .port(controllerPort)
+                .publishedRPCHost("localhost")
+                .publishedRPCPort(controllerPort)
+                .replyWithStackTraceOnError(false)
+                .requestTracingEnabled(true)
+                .authorizationEnabled(enableAuth)
+                .tokenSigningKey(tokenSigningKey)
+                .accessTokenTTLInSeconds(accessTokenTtlInSeconds)
+                .userPasswordFile(passwordAuthHandlerInputFilePath)
+                .build();
 
         Optional<RESTServerConfig> restServerConfig = restPort > 0 ?
                 Optional.of(RESTServerConfigImpl.builder().host("localhost").port(restPort).build()) :
                 Optional.<RESTServerConfig>empty();
 
         ControllerServiceConfig serviceConfig = ControllerServiceConfigImpl.builder()
-                .serviceThreadPoolSize(3)
-                .taskThreadPoolSize(3)
-                .storeThreadPoolSize(3)
-                .eventProcThreadPoolSize(3)
-                .requestHandlerThreadPoolSize(3)
+                .threadPoolSize(15)
                 .storeClientConfig(storeClientConfig)
-                .controllerClusterListenerConfig(controllerClusterListenerConfig)
+                .controllerClusterListenerEnabled(!disableControllerCluster)
                 .hostMonitorConfig(hostMonitorConfig)
                 .timeoutServiceConfig(timeoutServiceConfig)
                 .eventProcessorConfig(eventProcessorConfig)
@@ -145,6 +159,7 @@ public class ControllerWrapper implements AutoCloseable {
         controllerServiceMain = new ControllerServiceMain(serviceConfig);
         controllerServiceMain.startAsync();
     }
+
 
     public boolean awaitTasksModuleInitialization(long timeout, TimeUnit timeUnit) throws InterruptedException {
         return this.controllerServiceMain.awaitServiceStarting().awaitTasksModuleInitialization(timeout, timeUnit);

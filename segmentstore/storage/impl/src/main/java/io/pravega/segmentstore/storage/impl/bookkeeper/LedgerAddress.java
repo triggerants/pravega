@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@ class LedgerAddress extends LogAddress implements Comparable<LedgerAddress> {
     /**
      * Creates a new instance of the LedgerAddress class.
      *
-     * @param metadata The LedgerMetdata for the ledger.
+     * @param metadata The LedgerMetadata for the ledger.
      * @param entryId  The Entry Id inside the Ledger that this Address corresponds to.
      */
     LedgerAddress(LedgerMetadata metadata, long entryId) {

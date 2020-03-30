@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,4 +26,22 @@ public interface RESTServerConfig {
      * @return The port on which controller gRPC listens.
      */
     int getPort();
+
+    /**
+     * Flag which denotes whether TLS is enabled.
+     * @return Flag which denotes whether TLS is enabled.
+     */
+    boolean isTlsEnabled();
+
+    /**
+     * Path to a file which contains the key file for the TLS connection.
+     * @return File which contains the key file for the TLS connection.
+     */
+    String getKeyFilePath();
+
+    /**
+     * File which contains the password for the key file for the TLS connection.
+     * @return File which contains the password for the key file for the TLS connection.
+     */
+    String getKeyFilePasswordPath();
 }

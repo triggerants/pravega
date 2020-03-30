@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,5 +17,9 @@ import java.io.IOException;
 public class SegmentSealedException extends IOException {
 
     private static final long serialVersionUID = 1L;
+
+    public SegmentSealedException(String segment) {
+        super("SegmentSealed Exception for segment:" + segment);
+    }
 
 }

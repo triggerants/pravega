@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,15 +9,15 @@
  */
 package io.pravega.segmentstore.server.host.stat;
 
+import com.google.common.base.Strings;
 import io.pravega.common.util.ConfigBuilder;
 import io.pravega.common.util.ConfigurationException;
 import io.pravega.common.util.Property;
 import io.pravega.common.util.TypedProperties;
-import lombok.Data;
-import lombok.Getter;
-
 import java.net.URI;
 import java.time.Duration;
+import lombok.Data;
+import lombok.Getter;
 
 @Data
 public class AutoScalerConfig {
@@ -27,8 +27,14 @@ public class AutoScalerConfig {
     public static final Property<Integer> CACHE_CLEANUP_IN_SECONDS = Property.named("cacheCleanUpInSeconds", 5 * 60);
     public static final Property<Integer> CACHE_EXPIRY_IN_SECONDS = Property.named("cacheExpiryInSeconds", 20 * 60);
     public static final Property<String> CONTROLLER_URI = Property.named("controllerUri", "tcp://localhost:9090");
+    public static final Property<Boolean> TLS_ENABLED = Property.named("tlsEnabled", false);
+    public static final Property<String> TLS_CERT_FILE = Property.named("tlsCertFile", "");
+    public static final Property<Boolean> AUTH_ENABLED = Property.named("authEnabled", false);
+    public static final Property<String> TOKEN_SIGNING_KEY = Property.named("tokenSigningKey", "secret");
+    public static final Property<Boolean> VALIDATE_HOSTNAME = Property.named("validateHostName", true);
+    public static final Property<Integer> THREAD_POOL_SIZE = Property.named("threadPoolSize", 10);
 
-    private static final String COMPONENT_CODE = "autoScale";
+    public static final String COMPONENT_CODE = "autoScale";
 
     /**
      * Uri for controller.
@@ -69,6 +75,42 @@ public class AutoScalerConfig {
     @Getter
     private final Duration cacheCleanup;
 
+    /**
+     * Flag to represent the case where interactions with controller are encrypted with TLS.
+     */
+    @Getter
+    private final boolean tlsEnabled;
+
+    /**
+     * The X.509 certificate file used for TLS connection to controller.
+     */
+    @Getter
+    private final String tlsCertFile;
+
+    /**
+     * Flag to represent the case where controller expects authorization details.
+     */
+    @Getter
+    private final boolean authEnabled;
+
+    /**
+     * Signing key for the auth token.
+     */
+    @Getter
+    private final String tokenSigningKey;
+
+    /**
+     * Flag indicating whether to validate the hostname when TLS is enabled.
+     */
+    @Getter
+    private final boolean validateHostName;
+
+    /**
+     * The number of threads for the {@link AutoScaleMonitor}.
+     */
+    @Getter
+    private final int threadPoolSize;
+
     private AutoScalerConfig(TypedProperties properties) throws ConfigurationException {
         this.internalRequestStream = properties.get(REQUEST_STREAM);
         this.cooldownDuration = Duration.ofSeconds(properties.getInt(COOLDOWN_IN_SECONDS));
@@ -76,9 +118,42 @@ public class AutoScalerConfig {
         this.cacheCleanup = Duration.ofSeconds(properties.getInt(CACHE_CLEANUP_IN_SECONDS));
         this.cacheExpiry = Duration.ofSeconds(properties.getInt(CACHE_EXPIRY_IN_SECONDS));
         this.controllerUri = URI.create(properties.get(CONTROLLER_URI));
+        this.tlsEnabled = properties.getBoolean(TLS_ENABLED);
+        this.authEnabled = properties.getBoolean(AUTH_ENABLED);
+        this.tlsCertFile = properties.get(TLS_CERT_FILE);
+        this.tokenSigningKey = properties.get(TOKEN_SIGNING_KEY);
+        this.validateHostName = properties.getBoolean(VALIDATE_HOSTNAME);
+        this.threadPoolSize = properties.getInt(THREAD_POOL_SIZE);
+        if (this.threadPoolSize <= 0) {
+            throw new ConfigurationException(String.format("Property '%s' must be a non-negative integer.", THREAD_POOL_SIZE));
+        }
     }
 
     public static ConfigBuilder<AutoScalerConfig> builder() {
         return new ConfigBuilder<>(COMPONENT_CODE, AutoScalerConfig::new);
+    }
+
+    @Override
+    public String toString() {
+        // Note: We don't use Lombok @ToString to automatically generate an implementation of this method,
+        // in order to avoid returning a string containing sensitive security configuration.
+
+        return new StringBuilder(String.format("%s(", getClass().getSimpleName()))
+                .append(String.format("controllerUri: %s, ", (controllerUri != null) ? controllerUri.toString() : "null"))
+                .append(String.format("internalRequestStream: %s, ", internalRequestStream))
+                .append(String.format("cooldownDuration: %s, ", (cooldownDuration != null) ? cooldownDuration.toString() : "null"))
+                .append(String.format("muteDuration: %s, ", (muteDuration != null) ? muteDuration.toString() : "null"))
+                .append(String.format("cacheExpiry: %s, ", (cacheExpiry != null) ? cacheExpiry.toString() : "null"))
+                .append(String.format("cacheCleanup: %s, ", (cacheCleanup != null) ? cacheCleanup.toString() : "null"))
+                .append(String.format("tlsEnabled: %b, ", tlsEnabled))
+                .append(String.format("tlsCertFile is %s, ",
+                        Strings.isNullOrEmpty(tlsCertFile) ? "unspecified" : "specified"))
+                .append(String.format("authEnabled: %b, ", authEnabled))
+                .append(String.format("tokenSigningKey is %s, ",
+                        Strings.isNullOrEmpty(tokenSigningKey) ? "unspecified" : "specified"))
+                .append(String.format("validateHostName: %b, ", validateHostName))
+                .append(String.format("threadPoolSize: %d", threadPoolSize))
+                .append(")")
+                .toString();
     }
 }

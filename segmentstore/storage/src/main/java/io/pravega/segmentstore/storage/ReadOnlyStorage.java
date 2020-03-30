@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,9 +15,9 @@ import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Defines a Read-Only abstraction for Permanent Storage.
+ * Defines a Read-Only abstraction for Permanent Storage with async operations.
  */
-public interface ReadOnlyStorage {
+public interface ReadOnlyStorage extends AutoCloseable {
     /**
      * Initializes this Storage instance with the given ContainerEpoch.
      *
@@ -81,4 +81,7 @@ public interface ReadOnlyStorage {
      * it will contain the cause of the failure.
      */
     CompletableFuture<Boolean> exists(String streamSegmentName, Duration timeout);
+
+    @Override
+    void close();
 }

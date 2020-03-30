@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,37 +9,55 @@
  */
 package io.pravega.segmentstore.server.store;
 
-import io.pravega.common.concurrent.FutureHelpers;
-import io.pravega.common.concurrent.ServiceShutdownListener;
+import com.google.common.util.concurrent.AbstractService;
+import com.google.common.util.concurrent.Service;
+import io.pravega.common.concurrent.Futures;
+import io.pravega.common.concurrent.Services;
+import io.pravega.common.util.BufferView;
+import io.pravega.common.util.ReusableLatch;
 import io.pravega.segmentstore.contracts.AttributeUpdate;
 import io.pravega.segmentstore.contracts.ContainerNotFoundException;
+import io.pravega.segmentstore.contracts.MergeStreamSegmentResult;
+import io.pravega.segmentstore.server.DirectSegmentAccess;
 import io.pravega.segmentstore.contracts.ReadResult;
 import io.pravega.segmentstore.contracts.SegmentProperties;
 import io.pravega.segmentstore.server.ContainerHandle;
 import io.pravega.segmentstore.server.SegmentContainer;
 import io.pravega.segmentstore.server.SegmentContainerFactory;
+import io.pravega.segmentstore.server.SegmentContainerExtension;
+import io.pravega.segmentstore.server.ServiceListeners;
 import io.pravega.test.common.AssertExtensions;
 import io.pravega.test.common.IntentionalException;
 import io.pravega.test.common.ThreadPooledTestSuite;
-import com.google.common.util.concurrent.AbstractService;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicInteger;
-
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import lombok.Cleanup;
+import lombok.val;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.Timeout;
 
 /**
  * Unit tests for the StreamSegmentContainerRegistry class.
  */
 public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
     private static final Duration TIMEOUT = Duration.ofSeconds(30);
+    @Rule
+    public Timeout globalTimeout = Timeout.seconds(TIMEOUT.getSeconds());
+
+    @Override
+    protected int getThreadPoolSize() {
+        return 3;
+    }
 
     /**
      * Tests the getContainer method for registered and unregistered containers.
@@ -58,7 +76,7 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
             expectedContainerIds.add(containerId);
         }
 
-        List<ContainerHandle> handles = FutureHelpers.allOfWithResults(handleFutures).join();
+        List<ContainerHandle> handles = Futures.allOfWithResults(handleFutures).join();
         HashSet<Integer> actualHandleIds = new HashSet<>();
         for (ContainerHandle handle : handles) {
             actualHandleIds.add(handle.getContainerId());
@@ -87,16 +105,18 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
         StreamSegmentContainerRegistry registry = new StreamSegmentContainerRegistry(factory, executorService());
         ContainerHandle handle = registry.startContainer(containerId, TIMEOUT).join();
 
-        // Register a Listener for the Container.Stop event.
-        AtomicInteger stopListenerCallback = new AtomicInteger();
-        handle.setContainerStoppedListener(stopListenerCallback::set);
+        // Register a Listener for the Container.Stop event. Make this a Future since these callbacks are invoked async
+        // so they may finish executing after stop() finished.
+        CompletableFuture<Integer> stopListenerCallback = new CompletableFuture<>();
+        handle.setContainerStoppedListener(stopListenerCallback::complete);
 
         TestContainer container = (TestContainer) registry.getContainer(handle.getContainerId());
         Assert.assertFalse("Container is closed before being shut down.", container.isClosed());
 
         registry.stopContainer(handle, TIMEOUT).join();
+        Assert.assertEquals("Unexpected value passed to Handle.stopListenerCallback or callback was not invoked.",
+                containerId, (int) stopListenerCallback.join());
         Assert.assertTrue("Container is not closed after being shut down.", container.isClosed());
-        Assert.assertEquals("Unexpected value passed to Handle.stopListenerCallback or callback was not invoked.", containerId, stopListenerCallback.get());
         AssertExtensions.assertThrows(
                 "Container is still registered after being shut down.",
                 () -> registry.getContainer(handle.getContainerId()),
@@ -109,7 +129,12 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
     @Test
     public void testContainerFailureOnStartup() throws Exception {
         final int containerId = 123;
-        TestContainerFactory factory = new TestContainerFactory(new IntentionalException());
+
+        // We insert a ReusableLatch that will allow us to manually delay the TestContainer's shutdown/closing process
+        // so that we have enough time to verify that calling getContainer() on a currently shutting down container will
+        // throw the appropriate exception.
+        ReusableLatch closeReleaseSignal = new ReusableLatch();
+        TestContainerFactory factory = new TestContainerFactory(new IntentionalException(), closeReleaseSignal);
         @Cleanup
         StreamSegmentContainerRegistry registry = new StreamSegmentContainerRegistry(factory, executorService());
 
@@ -119,7 +144,15 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
                 ex -> ex instanceof IntentionalException || (ex instanceof IllegalStateException && ex.getCause() instanceof IntentionalException));
 
         AssertExtensions.assertThrows(
-                "Container is registered even if it failed to start.",
+                "Container is registered even if it failed to start (and is currently shut down).",
+                () -> registry.getContainer(containerId),
+                ex -> ex instanceof ContainerNotFoundException);
+
+        // Unblock container closing, which will, in turn, unblock its de-registration.
+        closeReleaseSignal.release();
+
+        AssertExtensions.assertThrows(
+                "Container is registered even if it failed to start (and has been unregistered).",
                 () -> registry.getContainer(containerId),
                 ex -> ex instanceof ContainerNotFoundException);
     }
@@ -136,38 +169,89 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
 
         ContainerHandle handle = registry.startContainer(containerId, TIMEOUT).join();
 
-        // Register a Listener for the Container.Stop event.
-        AtomicInteger stopListenerCallback = new AtomicInteger();
-        handle.setContainerStoppedListener(stopListenerCallback::set);
+        // Register a Listener for the Container.Stop event. Make this a Future since these callbacks are invoked async
+        // so they may finish executing after stop() finished.
+        CompletableFuture<Integer> stopListenerCallback = new CompletableFuture<>();
+        handle.setContainerStoppedListener(stopListenerCallback::complete);
 
         TestContainer container = (TestContainer) registry.getContainer(handle.getContainerId());
 
         // Fail the container and wait for it to properly terminate.
         container.fail(new IntentionalException());
-        ServiceShutdownListener.awaitShutdown(container, false);
-        Assert.assertEquals("Unexpected value passed to Handle.stopListenerCallback or callback was not invoked.", containerId, stopListenerCallback.get());
+        ServiceListeners.awaitShutdown(container, false);
+        Assert.assertEquals("Unexpected value passed to Handle.stopListenerCallback or callback was not invoked.",
+                containerId, (int) stopListenerCallback.join());
         AssertExtensions.assertThrows(
                 "Container is still registered after failure.",
                 () -> registry.getContainer(containerId),
                 ex -> ex instanceof ContainerNotFoundException);
     }
 
+    /**
+     * Tests a scenario where a container startup is requested immediately after the shutdown of the same container or
+     * while that one is running. This tests both the case when a container auto-shuts down due to failure and when it
+     * is shut down in a controlled manner.
+     */
+    @Test
+    public void testStartAlreadyRunning() throws Exception {
+        final int containerId = 1;
+        TestContainerFactory factory = new TestContainerFactory();
+        @Cleanup
+        StreamSegmentContainerRegistry registry = new StreamSegmentContainerRegistry(factory, executorService());
+
+        registry.startContainer(containerId, TIMEOUT).join();
+        TestContainer container1 = (TestContainer) registry.getContainer(containerId);
+
+        // 1. While running.
+        AssertExtensions.assertThrows("startContainer() did not throw for already registered container.",
+                () -> registry.startContainer(containerId, TIMEOUT),
+                ex -> ex instanceof IllegalArgumentException);
+
+        // 2. After a container fails - while shutting down.
+        container1.stopSignal = new ReusableLatch(); // Manually control when the Container actually shuts down.
+        container1.fail(new IntentionalException());
+        val startContainer2 = registry.startContainer(containerId, TIMEOUT);
+        Assert.assertFalse("startContainer() completed before previous container shut down (with failure).", startContainer2.isDone());
+
+        container1.stopSignal.release();
+        startContainer2.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        TestContainer container2 = (TestContainer) registry.getContainer(containerId);
+
+        Assert.assertEquals("Container1 was not shut down (with failure).", Service.State.FAILED, container1.state());
+        Assert.assertEquals("Container2 was not started properly.", Service.State.RUNNING, container2.state());
+
+        // 3. After a controlled shutdown - while shutting down.
+        container2.stopSignal = new ReusableLatch(); // Manually control when the Container actually shuts down.
+        container2.stopAsync();
+        val startContainer3 = registry.startContainer(containerId, TIMEOUT);
+        Assert.assertFalse("startContainer() completed before previous container shut down (normally).", startContainer3.isDone());
+
+        container2.stopSignal.release();
+        startContainer3.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        TestContainer container3 = (TestContainer) registry.getContainer(containerId);
+
+        Assert.assertEquals("Container2 was not shut down (normally).", Service.State.TERMINATED, container2.state());
+        Assert.assertEquals("Container3 was not started properly.", Service.State.RUNNING, container3.state());
+    }
+
     //region TestContainerFactory
 
-    private static class TestContainerFactory implements SegmentContainerFactory {
+    private class TestContainerFactory implements SegmentContainerFactory {
         private final Exception startException;
+        private final ReusableLatch startReleaseSignal;
 
         TestContainerFactory() {
-            this(null);
+            this(null, null);
         }
 
-        TestContainerFactory(Exception startException) {
+        TestContainerFactory(Exception startException, ReusableLatch startReleaseSignal) {
             this.startException = startException;
+            this.startReleaseSignal = startReleaseSignal;
         }
 
         @Override
         public SegmentContainer createStreamSegmentContainer(int containerId) {
-            return new TestContainer(containerId, this.startException);
+            return new TestContainer(containerId, this.startException, this.startReleaseSignal);
         }
     }
 
@@ -175,15 +259,19 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
 
     //region TestContainer
 
-    private static class TestContainer extends AbstractService implements SegmentContainer {
+    private class TestContainer extends AbstractService implements SegmentContainer {
         private final int id;
         private final Exception startException;
+        private final ReusableLatch closeReleaseSignal;
         private Exception stopException;
-        private boolean closed;
+        private final AtomicBoolean closed;
+        private ReusableLatch stopSignal;
 
-        TestContainer(int id, Exception startException) {
+        TestContainer(int id, Exception startException, ReusableLatch closeReleaseSignal) {
             this.id = id;
             this.startException = startException;
+            this.closeReleaseSignal = closeReleaseSignal;
+            this.closed = new AtomicBoolean();
         }
 
         public void fail(Exception ex) {
@@ -192,7 +280,7 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
         }
 
         public boolean isClosed() {
-            return this.closed;
+            return this.closed.get();
         }
 
         @Override
@@ -201,41 +289,59 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
         }
 
         @Override
+        public boolean isOffline() {
+            return false;
+        }
+
+        @Override
         public void close() {
-            if (!this.closed) {
-                stopAsync();
-                ServiceShutdownListener.awaitShutdown(this, false);
-                this.closed = true;
+            if (!this.closed.getAndSet(true)) {
+                Futures.await(Services.stopAsync(this, executorService()));
+                ReusableLatch signal = this.closeReleaseSignal;
+                if (signal != null) {
+                    // Wait until we are told to complete.
+                    signal.awaitUninterruptibly();
+                }
             }
         }
 
         @Override
         protected void doStart() {
-            if (this.startException != null) {
-                notifyFailed(this.startException);
-            } else {
-                notifyStarted();
-            }
+            executorService().execute(() -> {
+                if (this.startException != null) {
+                    notifyFailed(this.startException);
+                } else {
+                    notifyStarted();
+                }
+            });
         }
 
         @Override
         protected void doStop() {
-            if (state() != State.FAILED && state() != State.TERMINATED && this.stopException != null) {
-                notifyFailed(this.stopException);
-            } else {
-                notifyStopped();
-            }
+            executorService().execute(() -> {
+                ReusableLatch signal = this.stopSignal;
+                if (signal != null) {
+                    // Wait until we are told to stop.
+                    signal.awaitUninterruptibly();
+                }
+
+                if (state() != State.FAILED && state() != State.TERMINATED && this.stopException != null) {
+                    notifyFailed(this.stopException);
+                } else {
+                    notifyStopped();
+                }
+            });
         }
 
         //region Unimplemented methods
 
         @Override
-        public CompletableFuture<Void> append(String streamSegmentName, byte[] data, Collection<AttributeUpdate> attributeUpdates, Duration timeout) {
+        public CompletableFuture<Long> append(String streamSegmentName, BufferView data, Collection<AttributeUpdate> attributeUpdates, Duration timeout) {
             return null;
         }
 
         @Override
-        public CompletableFuture<Void> append(String streamSegmentName, long offset, byte[] data, Collection<AttributeUpdate> attributeUpdates, Duration timeout) {
+        public CompletableFuture<Long> append(String streamSegmentName, long offset, BufferView data, Collection<AttributeUpdate> attributeUpdates, Duration timeout) {
             return null;
         }
 
@@ -245,12 +351,17 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
         }
 
         @Override
+        public CompletableFuture<Map<UUID, Long>> getAttributes(String streamSegmentName, Collection<UUID> attributeIds, boolean cache, Duration timeout) {
+            return null;
+        }
+
+        @Override
         public CompletableFuture<ReadResult> read(String streamSegmentName, long offset, int maxLength, Duration timeout) {
             return null;
         }
 
         @Override
-        public CompletableFuture<SegmentProperties> getStreamSegmentInfo(String streamSegmentName, boolean waitForPendingOps, Duration timeout) {
+        public CompletableFuture<SegmentProperties> getStreamSegmentInfo(String streamSegmentName, Duration timeout) {
             return null;
         }
 
@@ -260,12 +371,7 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
         }
 
         @Override
-        public CompletableFuture<String> createTransaction(String parentStreamSegmentName, UUID transactionId, Collection<AttributeUpdate> attributes, Duration timeout) {
-            return null;
-        }
-
-        @Override
-        public CompletableFuture<Void> mergeTransaction(String transactionName, Duration timeout) {
+        public CompletableFuture<MergeStreamSegmentResult> mergeStreamSegment(String targetStreamSegment, String sourceStreamSegment, Duration timeout) {
             return null;
         }
 
@@ -280,7 +386,22 @@ public class StreamSegmentContainerRegistryTests extends ThreadPooledTestSuite {
         }
 
         @Override
+        public CompletableFuture<Void> truncateStreamSegment(String streamSegmentName, long offset, Duration timeout) {
+            return null;
+        }
+
+        @Override
+        public CompletableFuture<DirectSegmentAccess> forSegment(String streamSegmentName, Duration timeout) {
+            return null;
+        }
+
+        @Override
         public Collection<SegmentProperties> getActiveSegments() {
+            return null;
+        }
+
+        @Override
+        public <T extends SegmentContainerExtension> T getExtension(Class<T> extensionClass) {
             return null;
         }
 

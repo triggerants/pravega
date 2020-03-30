@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,17 +9,28 @@
  */
 package io.pravega.segmentstore.server.writer;
 
-import lombok.val;
-import org.junit.Assert;
-import org.junit.Test;
-
+import io.pravega.common.hash.RandomFactory;
+import io.pravega.segmentstore.server.SegmentOperation;
+import io.pravega.segmentstore.server.WriterFlushResult;
+import io.pravega.segmentstore.server.WriterSegmentProcessor;
+import io.pravega.segmentstore.server.logs.operations.Operation;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Random;
+import java.util.concurrent.CompletableFuture;
+import lombok.val;
+import org.junit.Assert;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.Timeout;
 
 /**
  * Unit tests for the AckCalculator class.
  */
 public class AckCalculatorTests {
+    @Rule
+    public Timeout globalTimeout = Timeout.seconds(10);
+
     /**
      * Tests the getHighestCommittedSequenceNumber method.
      */
@@ -30,7 +41,7 @@ public class AckCalculatorTests {
         final int resetCount = 5;
         WriterState state = new WriterState();
         AckCalculator calc = new AckCalculator(state);
-        Random random = new Random();
+        Random random = RandomFactory.create();
 
         ArrayList<TestProcessor> processors = new ArrayList<>();
         for (int i = 0; i < processorCount; i++) {
@@ -84,7 +95,37 @@ public class AckCalculatorTests {
         Assert.assertEquals("Unexpected result for Set with partial values when LRSN is infinite.", expectedResult, result);
     }
 
-    private static class TestProcessor implements OperationProcessor {
+    /**
+     * Tests the {@link AckCalculator#getLowestUncommittedSequenceNumber} method.
+     */
+    @Test
+    public void testGetLowestUncommittedSequenceNumber() {
+        final int processorCount = 2;
+        WriterState state = new WriterState();
+        AckCalculator calc = new AckCalculator(state);
+
+        ArrayList<TestProcessor> processors = new ArrayList<>();
+        for (int i = 0; i < processorCount; i++) {
+            processors.add(new TestProcessor());
+        }
+
+        // Everything up-to-date.
+        processors.forEach(p -> p.setLowestUncommittedSequenceNumber(Operation.NO_SEQUENCE_NUMBER));
+        long lusn = calc.getLowestUncommittedSequenceNumber(processors);
+        Assert.assertEquals("Unexpected result when all processors up-to-date.", Operation.NO_SEQUENCE_NUMBER, lusn);
+
+        // One processor not up-to-date.
+        processors.get(0).setLowestUncommittedSequenceNumber(10);
+        lusn = calc.getLowestUncommittedSequenceNumber(processors);
+        Assert.assertEquals("Unexpected result when only one processor is up-to-date.", 10, lusn);
+
+        // Neither processor is up-to-date.
+        processors.get(1).setLowestUncommittedSequenceNumber(8);
+        lusn = calc.getLowestUncommittedSequenceNumber(processors);
+        Assert.assertEquals("Unexpected result when neither processor is up-to-date.", 8, lusn);
+    }
+
+    private static class TestProcessor implements WriterSegmentProcessor {
         private long lowestUncommittedSequenceNumber;
 
         void setLowestUncommittedSequenceNumber(long value) {
@@ -94,6 +135,26 @@ public class AckCalculatorTests {
         @Override
         public long getLowestUncommittedSequenceNumber() {
             return this.lowestUncommittedSequenceNumber;
+        }
+
+        @Override
+        public boolean mustFlush() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void add(SegmentOperation operation) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public CompletableFuture<WriterFlushResult> flush(Duration timeout) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void close() {
+            throw new UnsupportedOperationException();
         }
 
         @Override

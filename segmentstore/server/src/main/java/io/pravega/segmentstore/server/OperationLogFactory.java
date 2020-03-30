@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ public interface OperationLogFactory {
      * @param readIndex         A ReadIndex that can be used to store new appends in.
      * @throws NullPointerException     If any of the arguments are null.
      * @throws IllegalArgumentException If the metadata is already in recovery mode.
+     * @return The OperationLog instance.
      */
     OperationLog createDurableLog(UpdateableContainerMetadata containerMetadata, ReadIndex readIndex);
 }

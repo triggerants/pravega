@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,6 +31,9 @@ public class ReadResultEntryContents {
 
     /**
      * Gets a value indicating the length of the Data Stream.
+     *
+     * @return length of the data stream
+     *
      */
     public int getLength() {
         return this.length;
@@ -38,6 +41,9 @@ public class ReadResultEntryContents {
 
     /**
      * Gets an InputStream representing the Data that was retrieved.
+     *
+     * @return Stream representing retrieved data
+     *
      */
     public InputStream getData() {
         return this.data;

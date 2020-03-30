@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2017 Dell Inc., or its subsidiaries. All Rights Reserved.
+ * Copyright (c) Dell Inc., or its subsidiaries. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -9,11 +9,15 @@
  */
 package io.pravega.client.stream.mock;
 
+import com.google.common.base.Preconditions;
+import io.pravega.client.ClientConfig;
 import io.pravega.client.admin.ReaderGroupManager;
+import io.pravega.client.admin.StreamInfo;
 import io.pravega.client.admin.StreamManager;
+import io.pravega.client.admin.impl.ReaderGroupManagerImpl.ReaderGroupStateInitSerializer;
+import io.pravega.client.admin.impl.ReaderGroupManagerImpl.ReaderGroupStateUpdatesSerializer;
 import io.pravega.client.netty.impl.ConnectionFactoryImpl;
-import io.pravega.common.concurrent.FutureHelpers;
-import io.pravega.shared.NameUtils;
+import io.pravega.client.state.StateSynchronizer;
 import io.pravega.client.state.SynchronizerConfig;
 import io.pravega.client.stream.Position;
 import io.pravega.client.stream.ReaderGroup;
@@ -21,19 +25,29 @@ import io.pravega.client.stream.ReaderGroupConfig;
 import io.pravega.client.stream.ScalingPolicy;
 import io.pravega.client.stream.Stream;
 import io.pravega.client.stream.StreamConfiguration;
-import io.pravega.client.stream.impl.JavaSerializer;
+import io.pravega.client.stream.StreamCut;
 import io.pravega.client.stream.impl.PositionImpl;
 import io.pravega.client.stream.impl.ReaderGroupImpl;
+import io.pravega.client.stream.impl.ReaderGroupState;
+import io.pravega.client.stream.impl.SegmentWithRange;
 import io.pravega.client.stream.impl.StreamImpl;
-import java.util.Set;
+import io.pravega.common.concurrent.Futures;
+import io.pravega.common.util.AsyncIterator;
+import io.pravega.shared.NameUtils;
+import java.net.URI;
+import java.util.Iterator;
+import java.util.Map;
 import java.util.stream.Collectors;
-
+import lombok.Cleanup;
 import lombok.Getter;
-import org.apache.commons.lang.NotImplementedException;
+import org.apache.commons.lang3.NotImplementedException;
+
+import static io.pravega.client.stream.impl.ReaderGroupImpl.getEndSegmentsForStreams;
 
 public class MockStreamManager implements StreamManager, ReaderGroupManager {
 
     private final String scope;
+    @Getter
     private final ConnectionFactoryImpl connectionFactory;
     private final MockController controller;
     @Getter
@@ -41,21 +55,50 @@ public class MockStreamManager implements StreamManager, ReaderGroupManager {
 
     public MockStreamManager(String scope, String endpoint, int port) {
         this.scope = scope;
-        this.connectionFactory = new ConnectionFactoryImpl(false);
-        this.controller = new MockController(endpoint, port, connectionFactory);
+        this.connectionFactory = new ConnectionFactoryImpl(ClientConfig.builder().controllerURI(URI.create("tcp://localhost")).build());
+        this.controller = new MockController(endpoint, port, connectionFactory, true);
         this.clientFactory = new MockClientFactory(scope, controller);
     }
 
     @Override
     public boolean createScope(String scopeName) {
-        return FutureHelpers.getAndHandleExceptions(controller.createScope(scope),
+        return Futures.getAndHandleExceptions(controller.createScope(scope),
                 RuntimeException::new);
     }
 
     @Override
+    public Iterator<Stream> listStreams(String scopeName) {
+        AsyncIterator<Stream> asyncIterator = controller.listStreams(scopeName);
+        return new Iterator<Stream>() {
+            private Stream next;
+
+            private void load() {
+                next = asyncIterator.getNext().join();
+            }
+            
+            @Override
+            public boolean hasNext() {
+                load();
+                return next != null;
+            }
+
+            @Override
+            public Stream next() {
+                load();
+                return next;
+            }
+        };
+    }
+
+    @Override
     public boolean deleteScope(String scopeName) {
-        return FutureHelpers.getAndHandleExceptions(controller.deleteScope(scope),
+        return Futures.getAndHandleExceptions(controller.deleteScope(scope),
                 RuntimeException::new);
+    }
+
+    @Override
+    public StreamInfo getStreamInfo(String scopeName, String streamName) {
+        throw new NotImplementedException("getStreamInfo");
     }
 
     @Override
@@ -63,51 +106,40 @@ public class MockStreamManager implements StreamManager, ReaderGroupManager {
         NameUtils.validateUserStreamName(streamName);
         if (config == null) {
             config = StreamConfiguration.builder()
-                                        .scope(scopeName)
-                                        .streamName(streamName)
                                         .scalingPolicy(ScalingPolicy.fixed(1))
                                         .build();
         }
-
-        return FutureHelpers.getAndHandleExceptions(controller.createStream(StreamConfiguration.builder()
-                                                                                               .scope(scopeName)
-                                                                                               .streamName(streamName)
-                                                                                               .scalingPolicy(config.getScalingPolicy())
-                                                                                               .build()),
-                RuntimeException::new);
+        return Futures.getAndHandleExceptions(controller.createStream(scopeName, streamName, config), RuntimeException::new);
     }
 
     @Override
-    public boolean alterStream(String scopeName, String streamName, StreamConfiguration config) {
+    public boolean updateStream(String scopeName, String streamName, StreamConfiguration config) {
         if (config == null) {
             config = StreamConfiguration.builder()
-                                        .scope(scopeName)
-                                        .streamName(streamName)
                                         .scalingPolicy(ScalingPolicy.fixed(1))
                                         .build();
         }
 
-        return FutureHelpers.getAndHandleExceptions(controller.alterStream(StreamConfiguration.builder()
-                                                                                              .scope(scopeName)
-                                                                                              .streamName(streamName)
-                                                                                              .scalingPolicy(config.getScalingPolicy())
-                                                                                              .build()),
+        return Futures.getAndHandleExceptions(controller.updateStream(scopeName, streamName, config), RuntimeException::new);
+    }
+
+    @Override
+    public boolean truncateStream(String scopeName, String streamName, StreamCut streamCut) {
+        Preconditions.checkNotNull(streamCut);
+
+        return Futures.getAndHandleExceptions(controller.truncateStream(scopeName, streamName, streamCut),
                 RuntimeException::new);
     }
 
     private Stream createStreamHelper(String streamName, StreamConfiguration config) {
-        FutureHelpers.getAndHandleExceptions(controller.createStream(StreamConfiguration.builder()
-                                                                                        .scope(scope)
-                                                                                        .streamName(streamName)
-                                                                                        .scalingPolicy(config.getScalingPolicy())
-                                                                                        .build()),
+        Futures.getAndHandleExceptions(controller.createStream(scope, streamName, config),
                 RuntimeException::new);
         return new StreamImpl(scope, streamName);
     }
 
     @Override
     public boolean sealStream(String scopeName, String streamName) {
-        return FutureHelpers.getAndHandleExceptions(controller.sealStream(scopeName, streamName), RuntimeException::new);
+        return Futures.getAndHandleExceptions(controller.sealStream(scopeName, streamName), RuntimeException::new);
     }
 
     @Override
@@ -117,38 +149,41 @@ public class MockStreamManager implements StreamManager, ReaderGroupManager {
     }
 
     @Override
-    public ReaderGroup createReaderGroup(String groupName, ReaderGroupConfig config, Set<String> streamNames) {
+    public void createReaderGroup(String groupName, ReaderGroupConfig config) {
         NameUtils.validateReaderGroupName(groupName);
         createStreamHelper(NameUtils.getStreamForReaderGroup(groupName),
-                           StreamConfiguration.builder()
-                                              .scope(scope)
-                                              .streamName(NameUtils.getStreamForReaderGroup(groupName))
-                                              .scalingPolicy(ScalingPolicy.fixed(1)).build());
-        SynchronizerConfig synchronizerConfig = SynchronizerConfig.builder().build();
-        ReaderGroupImpl result = new ReaderGroupImpl(scope,
-                                                     groupName,
-                                                     synchronizerConfig,
-                                                     new JavaSerializer<>(),
-                                                     new JavaSerializer<>(),
-                                                     clientFactory,
-                                                     controller);
-        result.initializeGroup(config, streamNames);
-        return result;
+                StreamConfiguration.builder()
+                                   .scalingPolicy(ScalingPolicy.fixed(1)).build());
+        @Cleanup
+        StateSynchronizer<ReaderGroupState> synchronizer = clientFactory.createStateSynchronizer(NameUtils.getStreamForReaderGroup(groupName),
+                                              new ReaderGroupStateUpdatesSerializer(), new ReaderGroupStateInitSerializer(), SynchronizerConfig.builder().build());
+        Map<SegmentWithRange, Long> segments = ReaderGroupImpl.getSegmentsForStreams(controller, config);
+
+        synchronizer.initialize(new ReaderGroupState.ReaderGroupStateInit(config, segments, getEndSegmentsForStreams(config)));
     }
 
     public Position getInitialPosition(String stream) {
-        return new PositionImpl(controller.getSegmentsForStream(new StreamImpl(scope, stream))
+        return new PositionImpl(controller.getSegmentsWithRanges(new StreamImpl(scope, stream))
                                           .stream()
                                           .collect(Collectors.toMap(segment -> segment, segment -> 0L)));
     }
 
     @Override
     public ReaderGroup getReaderGroup(String groupName) {
-        throw new NotImplementedException();
+        SynchronizerConfig synchronizerConfig = SynchronizerConfig.builder().build();
+        return new ReaderGroupImpl(scope, groupName, synchronizerConfig, new ReaderGroupStateInitSerializer(),
+                                   new ReaderGroupStateUpdatesSerializer(), clientFactory, controller,
+                                   connectionFactory);
     }
 
     @Override
     public boolean deleteStream(String scopeName, String toDelete) {
-        throw new NotImplementedException();
+        return Futures.getAndHandleExceptions(controller.deleteStream(scopeName, toDelete), RuntimeException::new);
+    }
+
+    @Override
+    public void deleteReaderGroup(String groupName) {
+        Futures.getAndHandleExceptions(controller.deleteStream(scope, NameUtils.getStreamForReaderGroup(groupName)),
+                                       RuntimeException::new);
     }
 }
